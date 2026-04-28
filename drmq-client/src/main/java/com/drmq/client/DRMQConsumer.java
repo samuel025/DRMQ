@@ -29,9 +29,16 @@ public class DRMQConsumer implements AutoCloseable {
     private static final String DEFAULT_CONSUMER_GROUP = "default";
     private static final long DEFAULT_POLL_TIMEOUT_MS = 1000;
     private static final int MAX_RETRIES = 5;
+    private static final long RECONNECT_DELAY_MS = 500;  // Brief pause between retries to allow leader election
 
     private String host;
     private int port;
+    /**
+     * Consumer Identifier used for offset tracking on the broker
+     * Note: Unlike existing queues like kafka, DRMQ does not support multiple
+     * consumers per consumer group. Each group name should be used by a single consumer
+     * instance to avoid offset conflicts.
+     */
     private final String consumerGroup;
     private final List<String[]> bootstrapServers;
     private int currentServerIndex = 0;
@@ -128,7 +135,7 @@ public class DRMQConsumer implements AutoCloseable {
                         host, port, attempt + 1, MAX_RETRIES, e.getMessage());
                 lastException = e;
                 rotateToNextServer();
-                try { Thread.sleep(500); } catch (InterruptedException ie) {
+                try { Thread.sleep(RECONNECT_DELAY_MS); } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
                     throw new IOException("Interrupted during reconnect", ie);
                 }
@@ -292,7 +299,6 @@ public class DRMQConsumer implements AutoCloseable {
         }
 
         long offset = response.getOffset();
-        // -1 means no committed offset yet → start from 0
         return offset < 0 ? 0L : offset;
     }
 

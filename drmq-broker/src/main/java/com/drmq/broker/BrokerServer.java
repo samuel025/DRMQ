@@ -59,6 +59,7 @@ public class BrokerServer {
                     config.getPort(),
                     config.getPeers(),
                     messageStore,
+                    offsetManager,
                     Paths.get(config.getDataDir())
             );
 

@@ -10,7 +10,13 @@ import java.net.Socket;
 
 /**
  * Handles a single client connection to the broker.
- * Reads length-prefixed protobuf messages, processes them, and sends responses.
+ *
+ * Wire protocol: [4-byte big-endian length][MessageEnvelope protobuf bytes]
+ * Both client traffic (produce/consume) and Raft peer RPCs (RequestVote,
+ * AppendEntries) use this same framing on the same TCP port.
+ *
+ * The handler reads one envelope at a time, dispatches to the appropriate
+ * handler based on MessageType, and writes back a response envelope.
  */
 public class ClientHandler implements Runnable {
     private static final Logger logger = LoggerFactory.getLogger(ClientHandler.class);
@@ -43,7 +49,8 @@ public class ClientHandler implements Runnable {
 
             while (running && !socket.isClosed()) {
                 try {
-                    // Read message length (4 bytes, big-endian)
+                    // Read message length prefix (4 bytes, big-endian)
+                    // This tells us exactly how many bytes to read for the envelope
                     int length = in.readInt();
                     if (length <= 0 || length > 10 * 1024 * 1024) { // Max 10MB message
                         logger.warn("Invalid message length: {}", length);
@@ -146,8 +153,8 @@ public class ClientHandler implements Runnable {
 
     /**
      * Handle a consume request - fetch messages from the specified offset.
-     * If timeout_ms > 0, uses long-polling: waits up to that duration for
-     * messages to arrive before returning an empty response.
+     * If timeout_ms > 0, uses long-polling: waits efficiently via wait()/notifyAll()
+     * until messages arrive or the timeout expires.
      */
     private MessageEnvelope handleConsumeRequest(MessageEnvelope envelope) throws IOException {
         try {
@@ -158,25 +165,13 @@ public class ClientHandler implements Runnable {
             int maxMessages   = request.getMaxMessages();
             long timeoutMs    = request.getTimeoutMs(); // 0 = short poll
 
-            // Fetch messages — if timeout > 0, wait up to timeoutMs for messages
-            var messages = messageStore.getMessages(topic, fromOffset, maxMessages);
+            // Fetch messages — uses efficient wait/notify for long-polling (no thread sleep-loop)
+            var messages = (timeoutMs > 0)
+                    ? messageStore.waitForMessages(topic, fromOffset, maxMessages, timeoutMs)
+                    : messageStore.getMessages(topic, fromOffset, maxMessages);
 
-            if (messages.isEmpty() && timeoutMs > 0) {
-                long deadline = System.currentTimeMillis() + timeoutMs;
-                while (messages.isEmpty() && System.currentTimeMillis() < deadline) {
-                    try {
-                        Thread.sleep(50); // check every 50ms
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        break;
-                    }
-                    messages = messageStore.getMessages(topic, fromOffset, maxMessages);
-                }
-                logger.debug("Long-poll finished: topic={}, fromOffset={}, messages={}, waited={}ms",
-                        topic, fromOffset, messages.size(), timeoutMs - Math.max(0, deadline - System.currentTimeMillis()));
-            } else {
-                logger.debug("Consumed {} messages: topic={}, fromOffset={}", messages.size(), topic, fromOffset);
-            }
+            logger.debug("Consumed {} messages: topic={}, fromOffset={}, longPoll={}",
+                    messages.size(), topic, fromOffset, timeoutMs > 0);
 
             ConsumeResponse response = ConsumeResponse.newBuilder()
                     .setSuccess(true)
@@ -226,6 +221,9 @@ public class ClientHandler implements Runnable {
 
     /**
      * Handle a commit offset request - store the consumer group offset on the broker.
+     *
+     * In cluster mode, offset commits are routed through Raft consensus to ensure
+     * they survive leader failover. In single-node mode, offsets are persisted locally.
      */
     private MessageEnvelope handleCommitOffsetRequest(MessageEnvelope envelope) throws IOException {
         try {
@@ -235,7 +233,26 @@ public class ClientHandler implements Runnable {
             String topic = request.getTopic();
             long offset  = request.getOffset();
 
-            offsetManager.commit(group, topic, offset);
+            if (raftNode != null) {
+                // Cluster mode: replicate offset commit through Raft consensus
+                if (!raftNode.isLeader()) {
+                    String leaderAddr = raftNode.getLeaderAddress();
+                    CommitOffsetResponse response = CommitOffsetResponse.newBuilder()
+                            .setSuccess(false)
+                            .setErrorMessage("NOT_LEADER:" +
+                                    (leaderAddr != null ? leaderAddr : "UNKNOWN"))
+                            .build();
+                    return MessageEnvelope.newBuilder()
+                            .setType(MessageType.COMMIT_OFFSET_RESPONSE)
+                            .setPayload(response.toByteString())
+                            .build();
+                }
+                // Leader: propose offset commit via Raft — blocks until committed to majority
+                raftNode.proposeOffsetCommit(group, topic, offset);
+            } else {
+                // Single-node mode: persist locally
+                offsetManager.commit(group, topic, offset);
+            }
 
             logger.debug("Committed offset: group={}, topic={}, offset={}", group, topic, offset);
 

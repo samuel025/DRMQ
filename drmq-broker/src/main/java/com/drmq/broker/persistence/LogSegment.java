@@ -11,8 +11,17 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 
 /**
- * Manages a single log file for a topic.
- * Uses FileChannel for efficient I/O and ensures durability with fsync.
+ * A single log file (WAL segment) for one topic.
+ *
+ * Each topic's messages are persisted to disk as a write-ahead log (WAL)
+ * before being indexed in memory. This ensures durability: even if the broker
+ * crashes, messages can be recovered by replaying the log file.
+ *
+ * File format: [4-byte message length][StoredMessage protobuf bytes] repeated.
+ * All writes are followed by fsync (FileChannel.force) for crash safety.
+ *
+ * Uses FileChannel for efficient I/O and position-based reads (no seeking needed
+ * for concurrent access).
  */
 public class LogSegment implements AutoCloseable {
     private static final Logger logger = LoggerFactory.getLogger(LogSegment.class);

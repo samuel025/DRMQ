@@ -121,6 +121,7 @@ To design and implement a **lightweight**, distributed, fault-tolerant message q
 | 5   | A Thorough Evaluation of Message Queue Services — Maharjan et al.         | 2023 | Benchmarks Kafka, RabbitMQ, NATS across throughput and latency   | Grounds DRMQ's benchmarking methodology; identifies gap in single-partition comparisons |
 | 6   | Towards Message Brokers for Generative AI — Dustdar et al.                | 2024 | Survey of message broker evolution in cloud-native architectures | Confirms message queue design remains an active, evolving research area                 |
 | 7   | DRaft: A Double-Layer Raft Consensus Structure — Shang et al.             | 2025 | Proposes improvements to Raft's strong-leader bottleneck         | Shows Raft is still actively researched; contextualises DRMQ within current work        |
+| 8   | Evaluating Apache Kafka Performance: ZooKeeper vs KRaft — Ramesh V.       | 2025 | Benchmarks ZooKeeper against Kafka's new Raft-based (KRaft) mode | Contextualises DRMQ's design; demonstrates the industry shift towards Raft-based brokers|
 
 ---
 
@@ -304,10 +305,18 @@ The system will utilise a binary write-ahead log (WAL) for message storage and a
 
    > **Significance:** Recent work proposing improvements to Raft's strong-leader bottleneck, demonstrating that Raft-based systems remain an active area of optimization research. Contextualizes DRMQ within current distributed systems work.
 
-8. Google. (2023). _Protocol Buffers documentation_. https://protobuf.dev/
+8. Ramesh, V. (2025). _Evaluating Apache Kafka Performance and Operational Efficiency: A Comparative Study of ZooKeeper and KRaft Architectures_. International Journal of Computer Applications. https://doi.org/10.5120/ijca2025925770
+
+   > **Significance:** A recent 2025 comparative study benchmarking legacy ZooKeeper architecture against Kafka's newer Raft-based (KRaft) metadata mode. It perfectly contextualizes DRMQ by demonstrating the modern industry transition toward embedding Raft inside message brokers.
+
+9. Google. (2023). _Protocol Buffers documentation_. https://protobuf.dev/
 
    > **Significance:** Protocol Buffers is the binary serialisation format used for all DRMQ message framing. Cited as the primary technical reference for DRMQ's protocol layer.
 
-9. Apache Software Foundation. (2023). _Apache Kafka documentation_. https://kafka.apache.org/documentation/
+10. Apache Software Foundation. (2023). _Apache Kafka documentation_. https://kafka.apache.org/documentation/
 
    > **Significance:** The official Kafka documentation was consulted for understanding the consumer group protocol, offset management semantics, and fetch request design — all of which informed DRMQ's equivalent mechanisms.
+
+11. Christudas, B., & Telang, T. (2025). _Practical microservices architectural patterns: Build highly  scalable distributed applications with Spring Boot 3 and Spring Cloud_. Springer Nature.
+
+   > **Significance:** This book provides a comprehensive guide to building distributed systems using Spring Boot 3 and Spring Cloud. It covers various architectural patterns, including message-driven architectures, and demonstrates how to implement them in a production environment. This book was consulted for understanding the design and implementation of distributed systems, particularly in the context of microservices and message-driven architectures.

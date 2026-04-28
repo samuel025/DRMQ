@@ -22,6 +22,7 @@ import java.util.List;
 public class DRMQProducer implements AutoCloseable {
     private static final Logger logger = LoggerFactory.getLogger(DRMQProducer.class);
     private static final int MAX_RETRIES = 5;
+    private static final long RECONNECT_DELAY_MS = 500;  // Brief pause between retries to allow leader election
 
     private String host;
     private int port;
@@ -137,7 +138,6 @@ public class DRMQProducer implements AutoCloseable {
         // Retry loop: handles broken connections, tries other bootstrap servers
         IOException lastException = null;
         for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-            // Ensure we have a live connection
             if (!connected) {
                 try {
                     connect();
@@ -147,7 +147,7 @@ public class DRMQProducer implements AutoCloseable {
                     lastException = e;
                     // Try the next bootstrap server
                     rotateToNextServer();
-                    try { Thread.sleep(500); } catch (InterruptedException ie) {
+                    try { Thread.sleep(RECONNECT_DELAY_MS); } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
                         throw new IOException("Interrupted during reconnect", ie);
                     }

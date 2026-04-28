@@ -21,7 +21,7 @@ message ProduceResponse {
     string error_message = 3; // Error details if failed
 }
 
-// Internal message representation stored in the broker
+// Internal message representation stored in  the broker
 message StoredMessage {
     int64 offset = 1;
     string topic = 2;
@@ -78,6 +78,12 @@ message MessageEnvelope {
     bytes payload = 2;  // Serialized inner message
 }
 
+// --- Raft command types (for multiplexing different operations on the Raft log) ---
+enum RaftCommandType {
+    MESSAGE = 0;        // Normal message append (default)
+    OFFSET_COMMIT = 1;  // Consumer offset commit (replicated for durability)
+}
+
 // --- Raft log entry (wraps a user message for Raft replication) ---
 message RaftEntry {
     int64 term = 1;           // Term in which the entry was created
@@ -86,6 +92,9 @@ message RaftEntry {
     bytes payload = 4;        // Message payload
     optional string key = 5;  // Optional message key
     int64 timestamp = 6;      // Client-side timestamp
+    RaftCommandType command_type = 7;        // Type of command (default: MESSAGE)
+    optional string consumer_group = 8;      // Consumer group (for OFFSET_COMMIT)
+    optional int64 offset_value = 9;         // Offset value (for OFFSET_COMMIT)
 }
 
 // --- Raft leader election ---

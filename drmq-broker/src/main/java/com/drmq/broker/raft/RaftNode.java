@@ -2,6 +2,7 @@ package com.drmq.broker.raft;
 
 import com.drmq.broker.BrokerConfig.PeerAddress;
 import com.drmq.broker.MessageStore;
+import com.drmq.broker.OffsetManager;
 import com.drmq.protocol.DRMQProtocol.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -25,14 +26,24 @@ import java.util.function.Function;
  * - At most one leader per term
  * - A committed entry is never overwritten
  * - If two logs contain an entry with the same index and term, all preceding entries are identical
+ *
+ * Threading model:
+ * - A ReentrantLock guards all mutable state (term, votedFor, commitIndex, etc.)
+ * - RPC handlers (handleRequestVote, handleAppendEntries) acquire the lock per call
+ * - Heartbeats and elections run on a ScheduledExecutorService
+ * - Client proposals block on a CompletableFuture until the entry is committed
+ *   (the future is created in propose() and completed in applyCommitted())
  */
 public class RaftNode {
     private static final Logger logger = LoggerFactory.getLogger(RaftNode.class);
 
-    // Raft timing constants (§5.2)
+    // Raft timing constants (§5.2) — randomized election timeout prevents split votes
     private static final long ELECTION_TIMEOUT_MIN_MS = 150;
     private static final long ELECTION_TIMEOUT_MAX_MS = 300;
     private static final long HEARTBEAT_INTERVAL_MS = 75;
+
+    // Proposal timeout — how long a client blocks waiting for Raft commitment
+    private static final long PROPOSAL_TIMEOUT_SECONDS = 5;
 
     // --- Persistent state (survives restart) ---
     private long currentTerm;
@@ -54,6 +65,7 @@ public class RaftNode {
     private final int port;
     private final List<PeerAddress> peers;
     private final MessageStore messageStore;
+    private final OffsetManager offsetManager;  // For applying replicated offset commits
     private final Path stateFilePath;
 
     // --- Peer connections (set externally after construction) ---
@@ -68,14 +80,16 @@ public class RaftNode {
     private volatile boolean running = false;
 
     // --- Proposal waiting: clients block until their entry is committed ---
+    // Flow: propose() creates a future here → applyCommitted() completes it when majority ACK
     private final Map<Long, CompletableFuture<Long>> pendingProposals = new ConcurrentHashMap<>();
 
     public RaftNode(String nodeId, int port, List<PeerAddress> peers,
-                    MessageStore messageStore, Path dataDir) throws IOException {
+                    MessageStore messageStore, OffsetManager offsetManager, Path dataDir) throws IOException {
         this.nodeId = nodeId;
         this.port = port;
         this.peers = peers;
         this.messageStore = messageStore;
+        this.offsetManager = offsetManager;
         this.raftLog = new RaftLog(dataDir);
         this.state = RaftState.FOLLOWER;
         this.commitIndex = 0;
@@ -358,22 +372,30 @@ public class RaftNode {
     }
 
     /**
-     * Leader: advance commitIndex to the highest N such that a majority of matchIndex[i] >= N
-     * and log[N].term == currentTerm (Raft §5.3/§5.4).
+     * Raft §5.3/§5.4 — Leader advances commitIndex.
+     *
+     * Finds the highest N such that:
+     *   1. A majority of matchIndex[i] >= N (entry replicated to most nodes)
+     *   2. log[N].term == currentTerm (only commit entries from current term)
+     *
+     * Condition (2) is the Raft safety rule: a leader never commits entries
+     * from a previous term by counting replicas — it only commits its own
+     * entries, and earlier entries are committed indirectly.
      */
     private void advanceCommitIndex() {
         long lastIndex = raftLog.getLastIndex();
         for (long n = lastIndex; n > commitIndex; n--) {
             if (raftLog.getTermAt(n) != currentTerm) continue;
 
-            // Count how many peers (including self) have replicated this entry
-            int replicaCount = 1; // self
+            // Count how many nodes (including self) have replicated this entry
+            int replicaCount = 1; // leader always has it
             for (PeerAddress peer : peers) {
                 if (matchIndex.getOrDefault(peer.id(), 0L) >= n) {
                     replicaCount++;
                 }
             }
 
+            // Majority = floor(clusterSize/2) + 1 (e.g., 3-node cluster needs 2)
             int majority = (peers.size() + 1) / 2 + 1;
             if (replicaCount >= majority) {
                 commitIndex = n;
@@ -389,8 +411,14 @@ public class RaftNode {
     // ===========================
 
     /**
-     * Apply committed but unapplied entries to the MessageStore.
-     * This is where Raft log entries become visible to consumers.
+     * Raft §5.3 — Apply committed but unapplied entries to the state machine.
+     *
+     * Routes entries to the appropriate handler based on command type:
+     * - MESSAGE: appended to MessageStore (visible to consumers)
+     * - OFFSET_COMMIT: applied to OffsetManager (consumer group offset)
+     *
+     * Also completes the CompletableFuture created in propose(), which
+     * unblocks the client thread that is waiting for Raft commitment.
      */
     private void applyCommitted() {
         while (lastApplied < commitIndex) {
@@ -401,21 +429,38 @@ public class RaftNode {
                 break;
             }
 
-            // Apply to MessageStore — this makes the message visible to consumers
             try {
-                messageStore.append(
-                        entry.getTopic(),
-                        entry.getPayload().toByteArray(),
-                        entry.hasKey() ? entry.getKey() : null,
-                        entry.getTimestamp()
-                );
-                logger.debug("[{}] Applied raft entry {} to MessageStore (topic={})",
-                        nodeId, lastApplied, entry.getTopic());
+                switch (entry.getCommandType()) {
+                    case OFFSET_COMMIT -> {
+                        // Apply offset commit to OffsetManager
+                        if (offsetManager != null && entry.hasConsumerGroup() && entry.hasOffsetValue()) {
+                            offsetManager.commit(
+                                    entry.getConsumerGroup(),
+                                    entry.getTopic(),
+                                    entry.getOffsetValue()
+                            );
+                            logger.debug("[{}] Applied offset commit: group={}, topic={}, offset={}",
+                                    nodeId, entry.getConsumerGroup(), entry.getTopic(), entry.getOffsetValue());
+                        }
+                    }
+                    default -> {
+                        // MESSAGE (default): apply to MessageStore
+                        messageStore.append(
+                                entry.getTopic(),
+                                entry.getPayload().toByteArray(),
+                                entry.hasKey() ? entry.getKey() : null,
+                                entry.getTimestamp()
+                        );
+                        logger.debug("[{}] Applied raft entry {} to MessageStore (topic={})",
+                                nodeId, lastApplied, entry.getTopic());
+                    }
+                }
             } catch (Exception e) {
-                logger.error("[{}] Failed to apply entry {} to MessageStore", nodeId, lastApplied, e);
+                logger.error("[{}] Failed to apply entry {} (type={})",
+                        nodeId, lastApplied, entry.getCommandType(), e);
             }
 
-            // Complete the pending proposal future (if this node proposed it)
+            // Complete the future that propose() is blocking on — this unblocks the client thread
             CompletableFuture<Long> future = pendingProposals.remove(lastApplied);
             if (future != null) {
                 future.complete(lastApplied);
@@ -450,7 +495,8 @@ public class RaftNode {
                     .setIndex(index)
                     .setTopic(topic)
                     .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
-                    .setTimestamp(timestamp);
+                    .setTimestamp(timestamp)
+                    .setCommandType(RaftCommandType.MESSAGE);
 
             if (key != null && !key.isEmpty()) {
                 entryBuilder.setKey(key);
@@ -459,7 +505,8 @@ public class RaftNode {
             RaftEntry entry = entryBuilder.build();
             raftLog.append(entry);
 
-            // Create a future that will complete when the entry is committed
+            // Create a future that blocks until applyCommitted() processes this index
+            // (see applyCommitted() — it calls future.complete() when majority ACK)
             future = new CompletableFuture<>();
             pendingProposals.put(index, future);
 
@@ -472,7 +519,7 @@ public class RaftNode {
 
         // Wait for commitment (with timeout)
         try {
-            return future.get(5, TimeUnit.SECONDS);
+            return future.get(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         } catch (TimeoutException e) {
             pendingProposals.remove(index);
             throw new IOException("Raft proposal timed out (index=" + index + ")");
@@ -484,12 +531,66 @@ public class RaftNode {
         }
     }
 
+    /**
+     * Propose a consumer offset commit to be replicated via Raft.
+     * Ensures offset durability across leader failover.
+     *
+     * @param consumerGroup the consumer group
+     * @param topic         the topic
+     * @param offset        the next offset to read (last processed + 1)
+     * @return the committed Raft log index
+     * @throws IOException if not leader, or commitment fails
+     */
+    public long proposeOffsetCommit(String consumerGroup, String topic, long offset) throws IOException {
+        lock.lock();
+        long index;
+        CompletableFuture<Long> future;
+        try {
+            if (state != RaftState.LEADER) {
+                throw new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
+            }
+
+            index = raftLog.getLastIndex() + 1;
+
+            RaftEntry entry = RaftEntry.newBuilder()
+                    .setTerm(currentTerm)
+                    .setIndex(index)
+                    .setTopic(topic)
+                    .setCommandType(RaftCommandType.OFFSET_COMMIT)
+                    .setConsumerGroup(consumerGroup)
+                    .setOffsetValue(offset)
+                    .build();
+
+            raftLog.append(entry);
+
+            future = new CompletableFuture<>();
+            pendingProposals.put(index, future);
+
+        } finally {
+            lock.unlock();
+        }
+
+        sendHeartbeats();
+
+        try {
+            return future.get(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            pendingProposals.remove(index);
+            throw new IOException("Raft offset commit timed out (index=" + index + ")");
+        } catch (ExecutionException e) {
+            throw new IOException("Raft offset commit failed: " + e.getCause().getMessage());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Raft offset commit interrupted");
+        }
+    }
+
     // ===========================
     //  Handling incoming RPCs
     // ===========================
 
     /**
-     * Handle an incoming RequestVote RPC (§5.2).
+     * Raft §5.2 — Handle an incoming RequestVote RPC from a candidate.
      */
     public RequestVoteResponse handleRequestVote(RequestVoteRequest request) {
         lock.lock();
@@ -528,7 +629,8 @@ public class RaftNode {
     }
 
     /**
-     * Handle an incoming AppendEntries RPC (§5.3).
+     * Raft §5.3 — Handle an incoming AppendEntries RPC from the leader.
+     * Also serves as heartbeat when entries list is empty.
      */
     public AppendEntriesResponse handleAppendEntries(AppendEntriesRequest request) {
         lock.lock();
@@ -620,8 +722,11 @@ public class RaftNode {
     // ===========================
 
     /**
-     * Returns true if the candidate's log is at least as up-to-date as this node's log.
-     * Compared by: (1) higher last term wins, then (2) longer log wins.
+     * Raft §5.4.1 — Election restriction: only vote for candidates whose log
+     * is at least as up-to-date as ours.
+     *
+     * Comparison rule: (1) higher last term wins, then (2) longer log wins.
+     * This ensures the leader always has all committed entries.
      */
     private boolean isLogUpToDate(long candidateLastIndex, long candidateLastTerm) {
         long myLastTerm = raftLog.getLastTerm();
@@ -642,8 +747,9 @@ public class RaftNode {
             Properties props = new Properties();
             props.setProperty("currentTerm", String.valueOf(currentTerm));
             props.setProperty("votedFor", votedFor != null ? votedFor : "");
-            try (OutputStream out = new FileOutputStream(stateFilePath.toFile())) {
-                props.store(out, "Raft persistent state");
+            try (FileOutputStream fos = new FileOutputStream(stateFilePath.toFile())) {
+                props.store(fos, "Raft persistent state");
+                fos.getFD().sync();  // CRITICAL: fsync to ensure durability before returning
             }
         } catch (IOException e) {
             logger.error("[{}] Failed to save persistent state", nodeId, e);

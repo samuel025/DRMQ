@@ -12,20 +12,30 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * Persistent Raft log — stores RaftEntry records as length-prefixed protobuf on disk.
+ * Persistent Raft log — the ordered sequence of commands that all nodes agree on.
  *
- * The Raft log is 1-indexed (index 0 is a sentinel). All entries are appended
- * sequentially and can be truncated from a given index to resolve conflicts
- * (Raft safety property §5.3, Ongaro et al., 2014).
+ * Every proposed message or offset commit is first appended here as a RaftEntry,
+ * then replicated to followers. Once a majority of nodes have the entry, it is
+ * considered "committed" and applied to the state machine (MessageStore/OffsetManager).
  *
- * File format: [4-byte length][serialized RaftEntry][4-byte length][serialized RaftEntry]...
- * Same framing convention as the existing WAL (LogSegment).
+ * Indexing: The Raft log is 1-indexed (index 0 is a sentinel meaning "no entry").
+ * Internally, entries are stored in a 0-indexed ArrayList, so raft index N maps
+ * to list index N-1.
+ *
+ * File format: [4-byte length][serialized RaftEntry protobuf] repeated.
+ * Same length-prefixed framing as the message WAL (LogSegment).
+ *
+ * Crash safety:
+ * - Every append is followed by fsync (durability before returning)
+ * - Truncation uses setLength() to the byte offset of the first removed entry,
+ *   which is atomic on most filesystems (Raft §5.3)
  */
 public class RaftLog {
     private static final Logger logger = LoggerFactory.getLogger(RaftLog.class);
 
     private final Path logPath;
-    private final List<RaftEntry> entries;  // In-memory copy; 0-indexed (entry at index i has raft index i+1)
+    private final List<RaftEntry> entries;       // In-memory copy; 0-indexed (entry at list index i has raft index i+1)
+    private final List<Long> filePositions;      // Byte offset of each entry in the file (parallel to entries)
     private RandomAccessFile raf;
 
     public RaftLog(Path dataDir) throws IOException {
@@ -33,6 +43,7 @@ public class RaftLog {
         Files.createDirectories(raftDir);
         this.logPath = raftDir.resolve("raft.log");
         this.entries = new ArrayList<>();
+        this.filePositions = new ArrayList<>();
         this.raf = new RandomAccessFile(logPath.toFile(), "rw");
         recover();
     }
@@ -50,21 +61,23 @@ public class RaftLog {
         raf.seek(0);
         int count = 0;
         while (raf.getFilePointer() < fileLength) {
+            long entryStart = raf.getFilePointer();
             try {
                 int length = raf.readInt();
                 if (length <= 0 || length > 10 * 1024 * 1024) {
-                    logger.warn("Corrupt entry at pos {}, truncating", raf.getFilePointer() - 4);
-                    raf.setLength(raf.getFilePointer() - 4);
+                    logger.warn("Corrupt entry at pos {}, truncating", entryStart);
+                    raf.setLength(entryStart);
                     break;
                 }
                 byte[] data = new byte[length];
                 raf.readFully(data);
                 RaftEntry entry = RaftEntry.parseFrom(data);
                 entries.add(entry);
+                filePositions.add(entryStart);
                 count++;
             } catch (EOFException e) {
                 logger.warn("Unexpected EOF during raft log recovery, truncating");
-                raf.setLength(raf.getFilePointer());
+                raf.setLength(entryStart);
                 break;
             }
         }
@@ -76,11 +89,14 @@ public class RaftLog {
      * Append an entry to the log. Writes to disk immediately.
      */
     public synchronized void append(RaftEntry entry) throws IOException {
+        long entryStart = raf.length();
+        raf.seek(entryStart);
         byte[] data = entry.toByteArray();
         raf.writeInt(data.length);
         raf.write(data);
         raf.getFD().sync();  // Durability: fsync after every append
         entries.add(entry);
+        filePositions.add(entryStart);
         logger.debug("Appended raft entry: index={}, term={}", entry.getIndex(), entry.getTerm());
     }
 
@@ -142,7 +158,8 @@ public class RaftLog {
      * Truncate all entries from the given index onwards (inclusive).
      * Used when a follower detects conflicting entries from a new leader (Raft §5.3).
      *
-     * This rewrites the log file up to (but not including) the given index.
+     * Crash-safe: uses setLength() to truncate the file to the byte position
+     * of the first removed entry, which is atomic on most filesystems.
      */
     public synchronized void truncateFrom(long fromIndex) throws IOException {
         if (fromIndex < 1 || fromIndex > entries.size()) {
@@ -150,23 +167,19 @@ public class RaftLog {
         }
 
         int removeFromListIndex = (int) (fromIndex - 1);
-        logger.warn("Truncating raft log from index {} (removing {} entries)",
-                fromIndex, entries.size() - removeFromListIndex);
+        long truncateToPosition = filePositions.get(removeFromListIndex);
 
-        // Remove from in-memory list
-        entries.subList(removeFromListIndex, entries.size()).clear();
+        logger.warn("Truncating raft log from index {} (removing {} entries, truncating file to byte {})",
+                fromIndex, entries.size() - removeFromListIndex, truncateToPosition);
 
-        // Rewrite disk file with remaining entries
-        raf.close();
-        raf = new RandomAccessFile(logPath.toFile(), "rw");
-        raf.setLength(0);  // Clear file
-
-        for (RaftEntry entry : entries) {
-            byte[] data = entry.toByteArray();
-            raf.writeInt(data.length);
-            raf.write(data);
-        }
+        // Truncate the file to the byte offset of the first removed entry.
+        // This is atomic on most filesystems — no data is rewritten.
+        raf.setLength(truncateToPosition);
         raf.getFD().sync();
+
+        // Remove from in-memory lists
+        entries.subList(removeFromListIndex, entries.size()).clear();
+        filePositions.subList(removeFromListIndex, filePositions.size()).clear();
     }
 
     /**
@@ -178,3 +191,4 @@ public class RaftLog {
         }
     }
 }
+

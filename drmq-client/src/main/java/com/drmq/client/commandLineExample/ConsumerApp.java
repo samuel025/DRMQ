@@ -22,7 +22,7 @@ public class ConsumerApp {
         String consumerGroup = args.length > 1 ? args[1] : "default";
 
         System.out.println("╔════════════════════════════════════════╗");
-        System.out.println("║     DRMQ Interactive Consumer CLI     ║");
+        System.out.println("║     DRMQ Interactive Consumer CLI      ║");
         System.out.println("╚════════════════════════════════════════╝");
         System.out.printf( "  Consumer Group: %-23s\n", "[" + consumerGroup + "]");
         System.out.printf( "  Servers: %-30s\n\n", bootstrapServers);
