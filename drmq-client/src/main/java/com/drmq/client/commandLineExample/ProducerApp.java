@@ -8,18 +8,25 @@ import com.drmq.client.DRMQProducer;
 /**
  * Interactive Producer CLI - allows sending messages via command line.
  * Type topic and message interactively.
+ *
+ * Usage:
+ *   mvn exec:java -Dexec.mainClass="com.drmq.client.commandLineExample.ProducerApp"
+ *   mvn exec:java -Dexec.mainClass="com.drmq.client.commandLineExample.ProducerApp" -Dexec.args="localhost:9092,localhost:9093,localhost:9094"
  */
 public class ProducerApp {
     public static void main(String[] args) {
         System.out.println("╔════════════════════════════════════════╗");
         System.out.println("║     DRMQ Interactive Producer CLI     ║");
         System.out.println("╚════════════════════════════════════════╝\n");
-        
-        try (DRMQProducer producer = new DRMQProducer();
+
+        // Accept bootstrap servers as first argument (e.g. "localhost:9092,localhost:9093,localhost:9094")
+        String bootstrapServers = args.length > 0 ? args[0] : "localhost:9092";
+
+        try (DRMQProducer producer = new DRMQProducer(bootstrapServers);
              Scanner scanner = new Scanner(System.in)) {
             
             producer.connect();
-            System.out.println("✓ Connected to broker at localhost:9092\n");
+            System.out.println("✓ Connected to broker (servers: " + bootstrapServers + ")\n");
             System.out.println("Commands:");
             System.out.println("  send <topic> <message>  - Send a message to a topic");
             System.out.println("  exit                    - Quit the application");
@@ -92,3 +99,4 @@ public class ProducerApp {
         }
     }
 }
+

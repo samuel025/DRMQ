@@ -1,0 +1,158 @@
+package com.drmq.broker.raft;
+
+import com.drmq.broker.BrokerConfig.PeerAddress;
+import com.drmq.protocol.DRMQProtocol.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.*;
+import java.net.Socket;
+
+/**
+ * Manages a TCP connection to a single remote Raft peer.
+ *
+ * Sends RequestVote and AppendEntries RPCs using the same length-prefixed
+ * protobuf MessageEnvelope framing as client traffic. This is a deliberate
+ * design choice: Raft peer connections reuse the existing ClientHandler on
+ * the remote broker, so no separate port or server is needed for peer
+ * communication.
+ *
+ * Connection lifecycle:
+ * - Lazy connect: ensureConnected() opens a TCP socket on first use
+ * - Auto-reconnect: if a send fails, the connection is closed and retried next call
+ * - Thread-safe: all sends are synchronized on a lock object
+ */
+public class RaftPeer {
+    private static final Logger logger = LoggerFactory.getLogger(RaftPeer.class);
+    private static final int CONNECT_TIMEOUT_MS = 1000;
+    private static final int READ_TIMEOUT_MS = 2000;
+
+    private final PeerAddress address;
+    private Socket socket;
+    private DataInputStream in;
+    private DataOutputStream out;
+    private final Object lock = new Object();
+
+    public RaftPeer(PeerAddress address) {
+        this.address = address;
+    }
+
+    /**
+     * Ensure we have an active connection, reconnecting if needed.
+     */
+    private void ensureConnected() throws IOException {
+        if (socket != null && !socket.isClosed() && socket.isConnected()) {
+            return;
+        }
+
+        close(); // Clean up any partial state
+        socket = new Socket();
+        socket.connect(new java.net.InetSocketAddress(address.host(), address.port()), CONNECT_TIMEOUT_MS);
+        socket.setSoTimeout(READ_TIMEOUT_MS);
+        in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
+        out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+        logger.debug("Connected to peer {}", address);
+    }
+
+    /**
+     * Send a RequestVote RPC and wait for the response.
+     */
+    public RequestVoteResponse sendRequestVote(RequestVoteRequest request) {
+        synchronized (lock) {
+            try {
+                ensureConnected();
+
+                MessageEnvelope envelope = MessageEnvelope.newBuilder()
+                        .setType(MessageType.REQUEST_VOTE_REQUEST)
+                        .setPayload(request.toByteString())
+                        .build();
+
+                sendEnvelope(envelope);
+                MessageEnvelope response = receiveEnvelope();
+
+                return RequestVoteResponse.parseFrom(response.getPayload());
+
+            } catch (Exception e) {
+                logger.debug("RequestVote to {} failed: {}", address, e.getMessage());
+                close();
+                return RequestVoteResponse.newBuilder()
+                        .setTerm(0)
+                        .setVoteGranted(false)
+                        .build();
+            }
+        }
+    }
+
+    /**
+     * Send an AppendEntries RPC and wait for the response.
+     */
+    public AppendEntriesResponse sendAppendEntries(AppendEntriesRequest request) {
+        synchronized (lock) {
+            try {
+                ensureConnected();
+
+                MessageEnvelope envelope = MessageEnvelope.newBuilder()
+                        .setType(MessageType.APPEND_ENTRIES_REQUEST)
+                        .setPayload(request.toByteString())
+                        .build();
+
+                sendEnvelope(envelope);
+                MessageEnvelope response = receiveEnvelope();
+
+                return AppendEntriesResponse.parseFrom(response.getPayload());
+
+            } catch (Exception e) {
+                logger.debug("AppendEntries to {} failed: {}", address, e.getMessage());
+                close();
+                return AppendEntriesResponse.newBuilder()
+                        .setTerm(0)
+                        .setSuccess(false)
+                        .setMatchIndex(0)
+                        .build();
+            }
+        }
+    }
+
+    /**
+     * Send a length-prefixed envelope.
+     */
+    private void sendEnvelope(MessageEnvelope envelope) throws IOException {
+        byte[] data = envelope.toByteArray();
+        out.writeInt(data.length);
+        out.write(data);
+        out.flush();
+    }
+
+    /**
+     * Receive a length-prefixed envelope.
+     */
+    private MessageEnvelope receiveEnvelope() throws IOException {
+        int length = in.readInt();
+        if (length <= 0 || length > 10 * 1024 * 1024) {
+            throw new IOException("Invalid response length: " + length);
+        }
+        byte[] data = new byte[length];
+        in.readFully(data);
+        return MessageEnvelope.parseFrom(data);
+    }
+
+    /**
+     * Close the connection to the peer.
+     */
+    public void close() {
+        try {
+            if (in != null) in.close();
+        } catch (IOException ignored) {}
+        try {
+            if (out != null) out.close();
+        } catch (IOException ignored) {}
+        try {
+            if (socket != null && !socket.isClosed()) socket.close();
+        } catch (IOException ignored) {}
+        socket = null;
+        in = null;
+        out = null;
+    }
+
+    public PeerAddress getAddress() { return address; }
+}

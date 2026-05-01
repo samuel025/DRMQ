@@ -99,20 +99,47 @@ class ConsumerIntegrationTest {
             producer.send("shared-topic", "Shared Message 2".getBytes());
         }
 
-        // Consumer 1 reads all
-        try (DRMQConsumer consumer1 = new DRMQConsumer("localhost", TEST_PORT)) {
+        // Consumer 1 (group-a) reads all messages
+        try (DRMQConsumer consumer1 = new DRMQConsumer("localhost", TEST_PORT, "group-a")) {
             consumer1.connect();
             consumer1.subscribe("shared-topic");
             List<DRMQConsumer.ConsumedMessage> messages1 = consumer1.poll();
             assertEquals(2, messages1.size());
         }
 
-        // Consumer 2 also reads all (independent)
-        try (DRMQConsumer consumer2 = new DRMQConsumer("localhost", TEST_PORT)) {
+        // Consumer 2 (group-b) also reads all messages independently
+        // (different group = independent offset tracking)
+        try (DRMQConsumer consumer2 = new DRMQConsumer("localhost", TEST_PORT, "group-b")) {
             consumer2.connect();
             consumer2.subscribe("shared-topic");
             List<DRMQConsumer.ConsumedMessage> messages2 = consumer2.poll();
             assertEquals(2, messages2.size());
+        }
+    }
+
+    @Test
+    void sameGroupDoesNotReReadMessages() throws Exception {
+        // Produce messages
+        try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
+            producer.connect();
+            producer.send("group-topic", "Message 1".getBytes());
+            producer.send("group-topic", "Message 2".getBytes());
+        }
+
+        // Consumer reads and commits offset
+        try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT, "my-service")) {
+            consumer.connect();
+            consumer.subscribe("group-topic");
+            List<DRMQConsumer.ConsumedMessage> messages = consumer.poll();
+            assertEquals(2, messages.size());
+        } // offset 2 committed to broker on close
+
+        // Same group restarted — should NOT re-read already consumed messages
+        try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT, "my-service")) {
+            consumer.connect();
+            consumer.subscribe("group-topic"); // broker returns offset 2
+            List<DRMQConsumer.ConsumedMessage> messages = consumer.poll();
+            assertEquals(0, messages.size(), "Same group should not re-read committed messages");
         }
     }
 

@@ -8,59 +8,52 @@ import com.drmq.client.DRMQConsumer;
 
 /**
  * Interactive Consumer CLI - allows subscribing and polling via command line.
- * Subscribe to topics and poll for messages interactively.
+ *
+ * Usage:
+ *   mvn exec:java -Dexec.mainClass="com.drmq.client.commandLineExample.ConsumerApp"
+ *   mvn exec:java -Dexec.mainClass="com.drmq.client.commandLineExample.ConsumerApp" -Dexec.args="localhost:9092,localhost:9093,localhost:9094"
+ *   mvn exec:java -Dexec.mainClass="com.drmq.client.commandLineExample.ConsumerApp" -Dexec.args="localhost:9092,localhost:9093,localhost:9094 my-service"
  */
 public class ConsumerApp {
     public static void main(String[] args) {
+        // First arg: bootstrap servers (default: localhost:9092)
+        // Second arg: consumer group (default: "default")
+        String bootstrapServers = args.length > 0 ? args[0] : "localhost:9092";
+        String consumerGroup = args.length > 1 ? args[1] : "default";
+
         System.out.println("╔════════════════════════════════════════╗");
-        System.out.println("║     DRMQ Interactive Consumer CLI     ║");
-        System.out.println("╚════════════════════════════════════════╝\n");
-        
-        try (DRMQConsumer consumer = new DRMQConsumer();
+        System.out.println("║     DRMQ Interactive Consumer CLI      ║");
+        System.out.println("╚════════════════════════════════════════╝");
+        System.out.printf( "  Consumer Group: %-23s\n", "[" + consumerGroup + "]");
+        System.out.printf( "  Servers: %-30s\n\n", bootstrapServers);
+
+        try (DRMQConsumer consumer = new DRMQConsumer(bootstrapServers, consumerGroup);
              Scanner scanner = new Scanner(System.in)) {
-            
+
             consumer.connect();
-            System.out.println("✓ Connected to broker at localhost:9092\n");
-            System.out.println("Commands:");
-            System.out.println("  subscribe <topic>       - Subscribe to a topic");
-            System.out.println("  subscribe <topic> <offset> - Subscribe from specific offset");
-            System.out.println("  poll [max_messages]     - Poll for messages (default: 100)");
-            System.out.println("  status                  - Show subscribed topics and offsets");
-            System.out.println("  exit                    - Quit the application");
-            System.out.println("  help                    - Show this help\n");
-            System.out.println("Examples:");
-            System.out.println("  subscribe orders");
-            System.out.println("  subscribe payments 5");
-            System.out.println("  poll");
-            System.out.println("  poll 10\n");
-            System.out.println("─────────────────────────────────────────\n");
+            System.out.println("✓ Connected to broker");
+            System.out.printf( "✓ Offsets tracked by broker for group '%s'\n\n", consumerGroup);
+
+            printHelp();
 
             // Interactive loop
             while (true) {
-                System.out.print("consumer> ");
+                System.out.printf("consumer[%s]> ", consumerGroup);
                 String input = scanner.nextLine().trim();
-                
-                if (input.isEmpty()) {
-                    continue;
-                }
-                
+
+                if (input.isEmpty()) continue;
+
                 String[] parts = input.split("\\s+");
                 String command = parts[0].toLowerCase();
-                
+
                 switch (command) {
                     case "exit", "quit" -> {
                         System.out.println("\n✓ Goodbye!");
                         return;
                     }
-                    
-                    case "help" -> {
-                        System.out.println("\nCommands:");
-                        System.out.println("  subscribe <topic> [offset] - Subscribe to topic");
-                        System.out.println("  poll [max_messages]        - Poll for messages");
-                        System.out.println("  exit                       - Quit");
-                        System.out.println("  help                       - Show help\n");
-                    }
-                    
+
+                    case "help" -> printHelp();
+
                     case "subscribe", "sub" -> {
                         if (parts.length < 2) {
                             System.out.println("❌ Usage: subscribe <topic> [offset]");
@@ -68,26 +61,36 @@ public class ConsumerApp {
                             System.out.println("   Example: subscribe payments 5\n");
                             continue;
                         }
-                        
+
                         String topic = parts[1];
-                        long offset = 0;
-                        
-                        if (parts.length >= 3) {
-                            try {
-                                offset = Long.parseLong(parts[2]);
-                            } catch (NumberFormatException e) {
-                                System.out.println("❌ Invalid offset: " + parts[2] + "\n");
-                                continue;
+
+                        try {
+                            if (parts.length >= 3) {
+                                // Explicit offset override
+                                long offset;
+                                try {
+                                    offset = Long.parseLong(parts[2]);
+                                } catch (NumberFormatException e) {
+                                    System.out.println("❌ Invalid offset: " + parts[2] + "\n");
+                                    continue;
+                                }
+                                consumer.subscribe(topic, offset);
+                                System.out.printf("✓ Subscribed to [%s] from explicit offset %d\n\n", topic, offset);
+                            } else {
+                                // Let broker decide the starting offset
+                                consumer.subscribe(topic);
+                                System.out.printf("✓ Subscribed to [%s] (resuming from broker offset %d)\n\n",
+                                        topic, consumer.getCurrentOffset(topic));
                             }
+                        } catch (IOException e) {
+                            System.out.printf("❌ Subscribe failed: %s\n\n", e.getMessage());
                         }
-                        
-                        consumer.subscribe(topic, offset);
-                        System.out.printf("✓ Subscribed to [%s] from offset %d\n\n", topic, offset);
                     }
-                    
+
                     case "poll" -> {
                         int maxMessages = 100;
-                        
+                        long timeoutMs = 1000; // default: 1s long-poll
+
                         if (parts.length >= 2) {
                             try {
                                 maxMessages = Integer.parseInt(parts[1]);
@@ -96,16 +99,27 @@ public class ConsumerApp {
                                 continue;
                             }
                         }
-                        
+                        if (parts.length >= 3) {
+                            try {
+                                timeoutMs = Long.parseLong(parts[2]);
+                            } catch (NumberFormatException e) {
+                                System.out.println("❌ Invalid timeout_ms: " + parts[2] + "\n");
+                                continue;
+                            }
+                        }
+
                         try {
-                            System.out.println("Polling for messages...");
-                            List<DRMQConsumer.ConsumedMessage> messages = consumer.poll(maxMessages);
-                            
+                            if (timeoutMs > 0) {
+                                System.out.printf("Long-polling (waiting up to %dms for messages)...%n", timeoutMs);
+                            } else {
+                                System.out.println("Polling for messages...");
+                            }
+                            List<DRMQConsumer.ConsumedMessage> messages = consumer.poll(maxMessages, timeoutMs);
+
                             if (messages.isEmpty()) {
                                 System.out.println("  No new messages\n");
                             } else {
                                 System.out.printf("  Received %d message(s):\n\n", messages.size());
-                                
                                 for (DRMQConsumer.ConsumedMessage msg : messages) {
                                     System.out.printf("  ┌─ [%s] Offset: %d\n", msg.topic(), msg.offset());
                                     System.out.printf("  │  Message: %s\n", msg.payloadAsString());
@@ -116,24 +130,84 @@ public class ConsumerApp {
                                     System.out.println("  └─");
                                 }
                                 System.out.println();
+                                System.out.println("  ✓ Offsets committed to broker automatically\n");
                             }
                         } catch (IOException e) {
                             System.out.printf("❌ Error polling: %s\n\n", e.getMessage());
                         }
                     }
-                    
-                    
+
+                    case "stream" -> {
+                        // Continuous mode: keep long-polling until Ctrl+C
+                        long streamTimeout = 2000; // 2s long-poll per iteration
+                        if (parts.length >= 2) {
+                            try {
+                                streamTimeout = Long.parseLong(parts[1]);
+                            } catch (NumberFormatException e) {
+                                System.out.println("❌ Invalid timeout_ms: " + parts[1] + "\n");
+                                continue;
+                            }
+                        }
+                        System.out.println("📡 Streaming... (press Ctrl+C to stop)\n");
+                        try {
+                            while (true) {
+                                List<DRMQConsumer.ConsumedMessage> messages = consumer.poll(100, streamTimeout);
+                                for (DRMQConsumer.ConsumedMessage msg : messages) {
+                                    System.out.printf("  ┌─ [%s] Offset: %d\n", msg.topic(), msg.offset());
+                                    System.out.printf("  │  Message: %s\n", msg.payloadAsString());
+                                    if (msg.key() != null) {
+                                        System.out.printf("  │  Key: %s\n", msg.key());
+                                    }
+                                    System.out.printf("  │  Timestamp: %d\n", msg.timestamp());
+                                    System.out.println("  └─");
+                                }
+                            }
+                        } catch (IOException e) {
+                            System.out.printf("❌ Stream error: %s\n\n", e.getMessage());
+                        }
+                    }
+
+                    case "status" -> {
+                        System.out.printf("\nGroup: %s\n", consumerGroup);
+                        System.out.println("─────────────────────────────");
+                        System.out.println("  (Use 'subscribe <topic>' to add subscriptions)");
+                        System.out.println("  Tip: Offsets persist on the broker — restart anytime and resume!\n");
+                    }
+
                     default -> {
                         System.out.printf("❌ Unknown command: %s\n", command);
                         System.out.println("   Type 'help' for available commands\n");
                     }
                 }
             }
-            
+
         } catch (IOException e) {
             System.err.println("\n❌ Failed to connect to broker: " + e.getMessage());
             System.err.println("\nMake sure the broker is running:");
             System.err.println("  cd drmq-broker && mvn exec:java\n");
         }
     }
+
+    private static void printHelp() {
+        System.out.println("\nCommands:");
+        System.out.println("  subscribe <topic>                    - Resume from broker-committed offset");
+        System.out.println("  subscribe <topic> <offset>           - Override to a specific offset");
+        System.out.println("  poll [max] [timeout_ms]              - One-shot fetch (long-poll if timeout_ms>0)");
+        System.out.println("    timeout_ms=0 → short poll (return immediately if empty)");
+        System.out.println("    timeout_ms>0 → long poll (broker waits up to N ms for messages)");
+        System.out.println("  stream [timeout_ms]                  - Continuous mode: auto-polls forever");
+        System.out.println("    (press Ctrl+C to stop streaming)");
+        System.out.println("  status                               - Show group info");
+        System.out.println("  exit                                 - Quit");
+        System.out.println("  help                                 - Show this help");
+        System.out.println("\nExamples:");
+        System.out.println("  subscribe orders       (resume from last offset)");
+        System.out.println("  subscribe payments 5   (seek to offset 5)");
+        System.out.println("  poll                   (long-poll, 1s timeout)");
+        System.out.println("  poll 50 2000           (up to 50 msgs, wait 2s)");
+        System.out.println("  poll 100 0             (short poll)");
+        System.out.println();
+        System.out.println("─────────────────────────────────────────\n");
+    }
 }
+

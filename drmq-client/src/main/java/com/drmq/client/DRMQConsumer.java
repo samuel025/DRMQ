@@ -13,36 +13,93 @@ import java.util.Map;
 
 /**
  * DRMQ Consumer client for reading messages from topics.
- * Thread-safe for single-threaded use (one poll at a time).
+ *
+ * Supports bootstrap servers: provide multiple broker addresses so the consumer
+ * can automatically failover to another broker if the current one dies.
+ *
+ * Offsets are stored on the broker per consumer group.
+ * On subscribe(), the consumer fetches its last committed offset from the
+ * broker and resumes from there. After each poll(), the new offset is
+ * automatically committed back to the broker.
  */
 public class DRMQConsumer implements AutoCloseable {
     private static final Logger logger = LoggerFactory.getLogger(DRMQConsumer.class);
     private static final int DEFAULT_PORT = 9092;
     private static final int DEFAULT_MAX_MESSAGES = 100;
+    private static final String DEFAULT_CONSUMER_GROUP = "default";
+    private static final long DEFAULT_POLL_TIMEOUT_MS = 1000;
+    private static final int MAX_RETRIES = 5;
+    private static final long RECONNECT_DELAY_MS = 500;  // Brief pause between retries to allow leader election
 
-    private final String host;
-    private final int port;
+    private String host;
+    private int port;
+    /**
+     * Consumer Identifier used for offset tracking on the broker
+     * Note: Unlike existing queues like kafka, DRMQ does not support multiple
+     * consumers per consumer group. Each group name should be used by a single consumer
+     * instance to avoid offset conflicts.
+     */
+    private final String consumerGroup;
+    private final List<String[]> bootstrapServers;
+    private int currentServerIndex = 0;
+
     private Socket socket;
     private DataInputStream inputStream;
     private DataOutputStream outputStream;
-    private boolean connected = false;
+    private volatile boolean connected = false;
 
-    // Track current offset per topic
+    // Local cache of current offset per topic (source of truth is the broker)
     private final Map<String, Long> topicOffsets = new HashMap<>();
     private final Object pollLock = new Object();
 
+    // -------------------------------------------------------------------------
+    // Constructors
+    // -------------------------------------------------------------------------
+
     public DRMQConsumer() {
-        this("localhost", DEFAULT_PORT);
+        this("localhost", DEFAULT_PORT, DEFAULT_CONSUMER_GROUP);
+    }
+
+    public DRMQConsumer(String consumerGroup) {
+        this("localhost", DEFAULT_PORT, consumerGroup);
     }
 
     public DRMQConsumer(String host, int port) {
+        this(host, port, DEFAULT_CONSUMER_GROUP);
+    }
+
+    public DRMQConsumer(String host, int port, String consumerGroup) {
         this.host = host;
         this.port = port;
+        this.consumerGroup = consumerGroup;
+        this.bootstrapServers = new ArrayList<>();
+        this.bootstrapServers.add(new String[]{host, String.valueOf(port)});
     }
 
     /**
-     * Connect to the broker.
+     * Create a consumer with multiple bootstrap servers for failover.
+     * Format: "host1:port1,host2:port2,host3:port3"
      */
+    public DRMQConsumer(String bootstrapServersStr, String consumerGroup) {
+        this.consumerGroup = consumerGroup;
+        this.bootstrapServers = new ArrayList<>();
+        for (String server : bootstrapServersStr.split(",")) {
+            String[] parts = server.trim().split(":");
+            if (parts.length == 2) {
+                bootstrapServers.add(parts);
+            }
+        }
+        if (bootstrapServers.isEmpty()) {
+            throw new IllegalArgumentException("No valid bootstrap servers: " + bootstrapServersStr);
+        }
+        this.host = bootstrapServers.get(0)[0];
+        this.port = Integer.parseInt(bootstrapServers.get(0)[1]);
+    }
+
+    // -------------------------------------------------------------------------
+    // Connection
+    // -------------------------------------------------------------------------
+
     public void connect() throws IOException {
         if (connected) {
             return;
@@ -53,70 +110,239 @@ public class DRMQConsumer implements AutoCloseable {
         outputStream = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
         connected = true;
 
-        logger.info("Connected to DRMQ broker at {}:{}", host, port);
+        logger.info("Connected to DRMQ broker at {}:{} as group '{}'", host, port, consumerGroup);
     }
 
     /**
-     * Subscribe to a topic starting from offset 0.
+     * Close and reopen the connection, cycling to the next bootstrap server.
      */
-    public void subscribe(String topic) {
-        subscribe(topic, 0);
-    }
-
-    /**
-     * Subscribe to a topic starting from a specific offset.
-     */
-    public void subscribe(String topic, long fromOffset) {
-        topicOffsets.put(topic, fromOffset);
-        logger.info("Subscribed to topic '{}' from offset {}", topic, fromOffset);
-    }
-
-    /**
-     * Poll for messages from all subscribed topics.
-     * Returns messages and updates internal offset tracking.
-     */
-    public List<ConsumedMessage> poll() throws IOException {
-        return poll(DEFAULT_MAX_MESSAGES);
-    }
-
-    /**
-     * Poll for messages with a specific max count.
-     */
-    public List<ConsumedMessage> poll(int maxMessages) throws IOException {
-        if (!connected) {
-            connect();
-        }
-
-        synchronized (pollLock) {
-            List<ConsumedMessage> allMessages = new ArrayList<>();
-
-            for (Map.Entry<String, Long> entry : topicOffsets.entrySet()) {
-                String topic = entry.getKey();
-                long fromOffset = entry.getValue();
-
-                List<ConsumedMessage> messages = fetchMessages(topic, fromOffset, maxMessages);
-                allMessages.addAll(messages);
-
-                // Update offset to the next message after the last one fetched
-                if (!messages.isEmpty()) {
-                    long lastOffset = messages.get(messages.size() - 1).offset();
-                    topicOffsets.put(topic, lastOffset + 1);
+    private void reconnect() throws IOException {
+        closeConnection();
+        rotateToNextServer();
+        // Try each server up to MAX_RETRIES times
+        IOException lastException = null;
+        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+            try {
+                connect();
+                // Re-subscribe to all topics on the new broker
+                for (Map.Entry<String, Long> entry : topicOffsets.entrySet()) {
+                    logger.info("Re-subscribing to topic '{}' at offset {} on new broker",
+                            entry.getKey(), entry.getValue());
+                }
+                return;
+            } catch (IOException e) {
+                logger.warn("Reconnect to {}:{} failed (attempt {}/{}): {}",
+                        host, port, attempt + 1, MAX_RETRIES, e.getMessage());
+                lastException = e;
+                rotateToNextServer();
+                try { Thread.sleep(RECONNECT_DELAY_MS); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted during reconnect", ie);
                 }
             }
-
-            return allMessages;
         }
+        throw new IOException("Failed to reconnect after " + MAX_RETRIES + " attempts: " +
+                (lastException != null ? lastException.getMessage() : "unknown error"));
     }
 
     /**
-     * Fetch messages from a specific topic and offset.
+     * Rotate to the next bootstrap server in the list.
      */
+    private void rotateToNextServer() {
+        if (bootstrapServers.size() <= 1) return;
+        currentServerIndex = (currentServerIndex + 1) % bootstrapServers.size();
+        String[] next = bootstrapServers.get(currentServerIndex);
+        this.host = next[0];
+        this.port = Integer.parseInt(next[1]);
+        logger.info("Switching to next broker: {}:{}", host, port);
+    }
+
+    /**
+     * Close the current connection without closing the consumer.
+     */
+    private void closeConnection() {
+        connected = false;
+        try { if (inputStream != null) inputStream.close(); } catch (IOException ignored) {}
+        try { if (outputStream != null) outputStream.close(); } catch (IOException ignored) {}
+        try { if (socket != null && !socket.isClosed()) socket.close(); } catch (IOException ignored) {}
+    }
+
+    // -------------------------------------------------------------------------
+    // Subscribe (now fetches offset from broker)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Subscribe to a topic. Resumes from the broker-committed offset automatically.
+     * If no offset has been committed yet, starts from offset 0.
+     */
+    public void subscribe(String topic) throws IOException {
+        if (!connected) connect();
+        long offset = fetchOffsetFromBroker(topic);
+        topicOffsets.put(topic, offset);
+        logger.info("Subscribed to topic '{}' from offset {} (group='{}')", topic, offset, consumerGroup);
+    }
+
+    /**
+     * Subscribe to a topic, overriding to a specific offset.
+     * Useful for replaying or skipping messages.
+     */
+    public void subscribe(String topic, long fromOffset) throws IOException {
+        if (!connected) connect();
+        topicOffsets.put(topic, fromOffset);
+        logger.info("Subscribed to topic '{}' from explicit offset {} (group='{}')", topic, fromOffset, consumerGroup);
+    }
+
+    // -------------------------------------------------------------------------
+    // Poll (auto-commits offset after fetching, with reconnect on failure)
+    // -------------------------------------------------------------------------
+
+    public List<ConsumedMessage> poll() throws IOException {
+        return poll(DEFAULT_MAX_MESSAGES, DEFAULT_POLL_TIMEOUT_MS);
+    }
+
+    public List<ConsumedMessage> poll(int maxMessages) throws IOException {
+        return poll(maxMessages, DEFAULT_POLL_TIMEOUT_MS);
+    }
+
+    /**
+     * Poll for messages with a specific max count and long-poll timeout.
+     * Automatically reconnects to another broker if the connection is lost.
+     *
+     * @param maxMessages maximum number of messages to fetch per topic
+     * @param timeoutMs   how long the broker should wait for messages before
+     *                    returning empty (0 = return immediately / short poll)
+     */
+    public List<ConsumedMessage> poll(int maxMessages, long timeoutMs) throws IOException {
+        if (!connected) connect();
+
+        synchronized (pollLock) {
+            try {
+                return doPoll(maxMessages, timeoutMs);
+            } catch (IOException e) {
+                // Connection broken — reconnect and retry once
+                logger.warn("Poll failed ({}), reconnecting to another broker...", e.getMessage());
+                reconnect();
+                return doPoll(maxMessages, timeoutMs);
+            }
+        }
+    }
+
+    private List<ConsumedMessage> doPoll(int maxMessages, long timeoutMs) throws IOException {
+        List<ConsumedMessage> allMessages = new ArrayList<>();
+
+        for (Map.Entry<String, Long> entry : topicOffsets.entrySet()) {
+            String topic = entry.getKey();
+            long fromOffset = entry.getValue();
+
+            List<ConsumedMessage> messages = fetchMessages(topic, fromOffset, maxMessages, timeoutMs);
+            allMessages.addAll(messages);
+
+            if (!messages.isEmpty()) {
+                long nextOffset = messages.get(messages.size() - 1).offset() + 1;
+                topicOffsets.put(topic, nextOffset);
+                commitOffsetToBroker(topic, nextOffset);
+            }
+        }
+
+        return allMessages;
+    }
+
+    // -------------------------------------------------------------------------
+    // Manual commit / offset management
+    // -------------------------------------------------------------------------
+
+    /**
+     * Manually commit a specific offset to the broker.
+     */
+    public void commit(String topic, long offset) throws IOException {
+        if (!connected) connect();
+        topicOffsets.put(topic, offset);
+        commitOffsetToBroker(topic, offset);
+        logger.debug("Manually committed offset {} for topic '{}'", offset, topic);
+    }
+
+    public long getCurrentOffset(String topic) {
+        return topicOffsets.getOrDefault(topic, 0L);
+    }
+
+    public String getConsumerGroup() {
+        return consumerGroup;
+    }
+
+    // -------------------------------------------------------------------------
+    // Broker offset protocol
+    // -------------------------------------------------------------------------
+
+    /**
+     * Ask the broker for the last committed offset for this group/topic.
+     * Returns 0 if no offset has been committed yet.
+     */
+    private long fetchOffsetFromBroker(String topic) throws IOException {
+        FetchOffsetRequest request = FetchOffsetRequest.newBuilder()
+                .setConsumerGroup(consumerGroup)
+                .setTopic(topic)
+                .build();
+
+        MessageEnvelope envelope = MessageEnvelope.newBuilder()
+                .setType(MessageType.FETCH_OFFSET_REQUEST)
+                .setPayload(request.toByteString())
+                .build();
+
+        sendEnvelope(envelope);
+
+        MessageEnvelope responseEnvelope = receiveEnvelope();
+        FetchOffsetResponse response = FetchOffsetResponse.parseFrom(responseEnvelope.getPayload());
+
+        if (!response.getSuccess()) {
+            logger.warn("Failed to fetch offset from broker for topic '{}': {}", topic, response.getErrorMessage());
+            return 0L;
+        }
+
+        long offset = response.getOffset();
+        return offset < 0 ? 0L : offset;
+    }
+
+    /**
+     * Push the current offset for this group/topic to the broker.
+     */
+    private void commitOffsetToBroker(String topic, long offset) throws IOException {
+        CommitOffsetRequest request = CommitOffsetRequest.newBuilder()
+                .setConsumerGroup(consumerGroup)
+                .setTopic(topic)
+                .setOffset(offset)
+                .build();
+
+        MessageEnvelope envelope = MessageEnvelope.newBuilder()
+                .setType(MessageType.COMMIT_OFFSET_REQUEST)
+                .setPayload(request.toByteString())
+                .build();
+
+        sendEnvelope(envelope);
+
+        MessageEnvelope responseEnvelope = receiveEnvelope();
+        CommitOffsetResponse response = CommitOffsetResponse.parseFrom(responseEnvelope.getPayload());
+
+        if (!response.getSuccess()) {
+            logger.warn("Failed to commit offset {} for topic '{}': {}", offset, topic, response.getErrorMessage());
+        } else {
+            logger.debug("Committed offset {} for topic '{}' to broker", offset, topic);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Message fetching
+    // -------------------------------------------------------------------------
+
     private List<ConsumedMessage> fetchMessages(String topic, long fromOffset, int maxMessages) throws IOException {
-        // Build consume request
+        return fetchMessages(topic, fromOffset, maxMessages, 0);
+    }
+
+    private List<ConsumedMessage> fetchMessages(String topic, long fromOffset, int maxMessages, long timeoutMs) throws IOException {
         ConsumeRequest request = ConsumeRequest.newBuilder()
                 .setTopic(topic)
                 .setFromOffset(fromOffset)
                 .setMaxMessages(maxMessages)
+                .setTimeoutMs(timeoutMs)
                 .build();
 
         MessageEnvelope envelope = MessageEnvelope.newBuilder()
@@ -124,25 +350,15 @@ public class DRMQConsumer implements AutoCloseable {
                 .setPayload(request.toByteString())
                 .build();
 
-        // Send request
-        byte[] envelopeBytes = envelope.toByteArray();
-        outputStream.writeInt(envelopeBytes.length);
-        outputStream.write(envelopeBytes);
-        outputStream.flush();
+        sendEnvelope(envelope);
 
-        // Read response
-        int responseLength = inputStream.readInt();
-        byte[] responseBytes = new byte[responseLength];
-        inputStream.readFully(responseBytes);
-
-        MessageEnvelope responseEnvelope = MessageEnvelope.parseFrom(responseBytes);
+        MessageEnvelope responseEnvelope = receiveEnvelope();
         ConsumeResponse response = ConsumeResponse.parseFrom(responseEnvelope.getPayload());
 
         if (!response.getSuccess()) {
             throw new IOException("Consume failed: " + response.getErrorMessage());
         }
 
-        // Convert to ConsumedMessage records
         List<ConsumedMessage> messages = new ArrayList<>();
         for (StoredMessage msg : response.getMessagesList()) {
             messages.add(new ConsumedMessage(
@@ -155,26 +371,31 @@ public class DRMQConsumer implements AutoCloseable {
             ));
         }
 
-        logger.debug("Fetched {} messages from topic '{}' starting at offset {}", 
-                messages.size(), topic, fromOffset);
-
+        logger.debug("Fetched {} messages from topic '{}' starting at offset {}", messages.size(), topic, fromOffset);
         return messages;
     }
 
-    /**
-     * Manually commit the current offset for a topic.
-     */
-    public void commit(String topic, long offset) {
-        topicOffsets.put(topic, offset);
-        logger.debug("Committed offset {} for topic '{}'", offset, topic);
+    // -------------------------------------------------------------------------
+    // Low-level transport helpers
+    // -------------------------------------------------------------------------
+
+    private void sendEnvelope(MessageEnvelope envelope) throws IOException {
+        byte[] bytes = envelope.toByteArray();
+        outputStream.writeInt(bytes.length);
+        outputStream.write(bytes);
+        outputStream.flush();
     }
 
-    /**
-     * Get the current offset for a topic.
-     */
-    public long getCurrentOffset(String topic) {
-        return topicOffsets.getOrDefault(topic, 0L);
+    private MessageEnvelope receiveEnvelope() throws IOException {
+        int length = inputStream.readInt();
+        byte[] bytes = new byte[length];
+        inputStream.readFully(bytes);
+        return MessageEnvelope.parseFrom(bytes);
     }
+
+    // -------------------------------------------------------------------------
+    // Lifecycle
+    // -------------------------------------------------------------------------
 
     @Override
     public void close() throws IOException {
@@ -190,9 +411,10 @@ public class DRMQConsumer implements AutoCloseable {
         }
     }
 
-    /**
-     * Record representing a consumed message.
-     */
+    // -------------------------------------------------------------------------
+    // ConsumedMessage record
+    // -------------------------------------------------------------------------
+
     public record ConsumedMessage(
             long offset,
             String topic,

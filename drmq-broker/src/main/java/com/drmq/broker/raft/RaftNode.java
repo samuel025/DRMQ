@@ -1,0 +1,806 @@
+package com.drmq.broker.raft;
+
+import com.drmq.broker.BrokerConfig.PeerAddress;
+import com.drmq.broker.MessageStore;
+import com.drmq.broker.OffsetManager;
+import com.drmq.protocol.DRMQProtocol.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Function;
+
+/**
+ * Core Raft consensus state machine.
+ *
+ * Implements leader election, log replication, and commitment as described in
+ * "In Search of an Understandable Consensus Algorithm" (Ongaro et al., 2014).
+ *
+ * Key invariants:
+ * - At most one leader per term
+ * - A committed entry is never overwritten
+ * - If two logs contain an entry with the same index and term, all preceding entries are identical
+ *
+ * Threading model:
+ * - A ReentrantLock guards all mutable state (term, votedFor, commitIndex, etc.)
+ * - RPC handlers (handleRequestVote, handleAppendEntries) acquire the lock per call
+ * - Heartbeats and elections run on a ScheduledExecutorService
+ * - Client proposals block on a CompletableFuture until the entry is committed
+ *   (the future is created in propose() and completed in applyCommitted())
+ */
+public class RaftNode {
+    private static final Logger logger = LoggerFactory.getLogger(RaftNode.class);
+
+    // Raft timing constants (§5.2) — randomized election timeout prevents split votes
+    private static final long ELECTION_TIMEOUT_MIN_MS = 150;
+    private static final long ELECTION_TIMEOUT_MAX_MS = 300;
+    private static final long HEARTBEAT_INTERVAL_MS = 75;
+
+    // Proposal timeout — how long a client blocks waiting for Raft commitment
+    private static final long PROPOSAL_TIMEOUT_SECONDS = 5;
+
+    // --- Persistent state (survives restart) ---
+    private long currentTerm;
+    private String votedFor;    // null if not voted in current term
+    private final RaftLog raftLog;
+
+    // --- Volatile state ---
+    private RaftState state;
+    private long commitIndex;   // Highest log index known to be committed
+    private long lastApplied;   // Highest log index applied to state machine
+    private String leaderId;    // Who we think the current leader is
+
+    // --- Leader-only volatile state ---
+    private final Map<String, Long> nextIndex;   // For each peer: next log entry to send
+    private final Map<String, Long> matchIndex;  // For each peer: highest replicated log entry
+
+    // --- Node identity and cluster ---
+    private final String nodeId;
+    private final int port;
+    private final List<PeerAddress> peers;
+    private final MessageStore messageStore;
+    private final OffsetManager offsetManager;  // For applying replicated offset commits
+    private final Path stateFilePath;
+
+    // --- Peer connections (set externally after construction) ---
+    private final Map<String, Function<RequestVoteRequest, RequestVoteResponse>> voteRpcHandlers = new ConcurrentHashMap<>();
+    private final Map<String, Function<AppendEntriesRequest, AppendEntriesResponse>> appendRpcHandlers = new ConcurrentHashMap<>();
+
+    // --- Threading ---
+    private final ReentrantLock lock = new ReentrantLock();
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
+    private ScheduledFuture<?> electionTimer;
+    private ScheduledFuture<?> heartbeatTimer;
+    private volatile boolean running = false;
+
+    // --- Proposal waiting: clients block until their entry is committed ---
+    // Flow: propose() creates a future here → applyCommitted() completes it when majority ACK
+    private final Map<Long, CompletableFuture<Long>> pendingProposals = new ConcurrentHashMap<>();
+
+    public RaftNode(String nodeId, int port, List<PeerAddress> peers,
+                    MessageStore messageStore, OffsetManager offsetManager, Path dataDir) throws IOException {
+        this.nodeId = nodeId;
+        this.port = port;
+        this.peers = peers;
+        this.messageStore = messageStore;
+        this.offsetManager = offsetManager;
+        this.raftLog = new RaftLog(dataDir);
+        this.state = RaftState.FOLLOWER;
+        this.commitIndex = 0;
+        this.lastApplied = 0;
+        this.nextIndex = new ConcurrentHashMap<>();
+        this.matchIndex = new ConcurrentHashMap<>();
+
+        // Persistent state file for currentTerm and votedFor
+        Path raftDir = dataDir.resolve("raft");
+        Files.createDirectories(raftDir);
+        this.stateFilePath = raftDir.resolve("state.properties");
+        loadPersistentState();
+    }
+
+    // ===========================
+    //  Lifecycle
+    // ===========================
+
+    /**
+     * Start the Raft node — begin as FOLLOWER with an election timer.
+     */
+    public void start() {
+        running = true;
+        resetElectionTimer();
+        logger.info("[{}] Raft node started (term={}, state=FOLLOWER, peers={})",
+                nodeId, currentTerm, peers.size());
+    }
+
+    /**
+     * Stop the Raft node — cancel all timers.
+     */
+    public void stop() {
+        running = false;
+        if (electionTimer != null) electionTimer.cancel(false);
+        if (heartbeatTimer != null) heartbeatTimer.cancel(false);
+        scheduler.shutdownNow();
+
+        // Fail all pending proposals
+        pendingProposals.values().forEach(f -> f.completeExceptionally(
+                new IOException("Raft node shutting down")));
+        pendingProposals.clear();
+
+        try {
+            raftLog.close();
+        } catch (IOException e) {
+            logger.error("[{}] Error closing raft log", nodeId, e);
+        }
+        logger.info("[{}] Raft node stopped", nodeId);
+    }
+
+    // ===========================
+    //  Peer RPC Registration
+    // ===========================
+
+    /**
+     * Register an RPC handler for sending RequestVote to a peer.
+     */
+    public void registerVoteHandler(String peerId, Function<RequestVoteRequest, RequestVoteResponse> handler) {
+        voteRpcHandlers.put(peerId, handler);
+    }
+
+    /**
+     * Register an RPC handler for sending AppendEntries to a peer.
+     */
+    public void registerAppendHandler(String peerId, Function<AppendEntriesRequest, AppendEntriesResponse> handler) {
+        appendRpcHandlers.put(peerId, handler);
+    }
+
+    // ===========================
+    //  Election (§5.2)
+    // ===========================
+
+    /**
+     * Reset the election timer with a random timeout (150–300ms).
+     * If the timer fires, the node starts an election.
+     */
+    private void resetElectionTimer() {
+        if (electionTimer != null) {
+            electionTimer.cancel(false);
+        }
+        long timeout = ELECTION_TIMEOUT_MIN_MS +
+                ThreadLocalRandom.current().nextLong(ELECTION_TIMEOUT_MAX_MS - ELECTION_TIMEOUT_MIN_MS);
+        electionTimer = scheduler.schedule(this::startElection, timeout, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Start an election: transition to CANDIDATE, vote for self, request votes from peers.
+     */
+    private void startElection() {
+        lock.lock();
+        try {
+            if (!running) return;
+
+            currentTerm++;
+            state = RaftState.CANDIDATE;
+            votedFor = nodeId;
+            leaderId = null;
+            savePersistentState();
+
+            logger.info("[{}] Starting election for term {}", nodeId, currentTerm);
+
+            long lastLogIndex = raftLog.getLastIndex();
+            long lastLogTerm = raftLog.getLastTerm();
+
+            RequestVoteRequest request = RequestVoteRequest.newBuilder()
+                    .setTerm(currentTerm)
+                    .setCandidateId(nodeId)
+                    .setLastLogIndex(lastLogIndex)
+                    .setLastLogTerm(lastLogTerm)
+                    .build();
+
+            long myTerm = currentTerm;
+            int votesNeeded = (peers.size() + 1) / 2 + 1;  // majority of total cluster
+            AtomicLong votesReceived = new AtomicLong(1);   // self-vote
+
+            // Send RequestVote to all peers asynchronously
+            for (PeerAddress peer : peers) {
+                CompletableFuture.supplyAsync(() -> {
+                    Function<RequestVoteRequest, RequestVoteResponse> handler = voteRpcHandlers.get(peer.id());
+                    if (handler == null) return null;
+                    try {
+                        return handler.apply(request);
+                    } catch (Exception e) {
+                        logger.debug("[{}] Failed to send RequestVote to {}: {}", nodeId, peer.id(), e.getMessage());
+                        return null;
+                    }
+                }).thenAccept(response -> {
+                    if (response == null) return;
+                    lock.lock();
+                    try {
+                        if (currentTerm != myTerm || state != RaftState.CANDIDATE) return;
+
+                        if (response.getTerm() > currentTerm) {
+                            stepDown(response.getTerm());
+                            return;
+                        }
+
+                        if (response.getVoteGranted()) {
+                            long votes = votesReceived.incrementAndGet();
+                            logger.info("[{}] Received vote from {} ({}/{})", nodeId, peer.id(), votes, votesNeeded);
+                            if (votes >= votesNeeded) {
+                                becomeLeader();
+                            }
+                        }
+                    } finally {
+                        lock.unlock();
+                    }
+                });
+            }
+
+        } finally {
+            lock.unlock();
+        }
+
+        // If still candidate after timeout, try again
+        resetElectionTimer();
+    }
+
+    /**
+     * Transition to LEADER: reset peer tracking, start heartbeats.
+     */
+    private void becomeLeader() {
+        state = RaftState.LEADER;
+        leaderId = nodeId;
+
+        // Initialize nextIndex and matchIndex for all peers (§5.3)
+        long lastLogIndex = raftLog.getLastIndex();
+        for (PeerAddress peer : peers) {
+            nextIndex.put(peer.id(), lastLogIndex + 1);
+            matchIndex.put(peer.id(), 0L);
+        }
+
+        if (electionTimer != null) electionTimer.cancel(false);
+
+        logger.info("[{}] ★ Became LEADER for term {} (lastLogIndex={})", nodeId, currentTerm, lastLogIndex);
+
+        // Send initial heartbeat immediately
+        sendHeartbeats();
+
+        // Start periodic heartbeats
+        heartbeatTimer = scheduler.scheduleAtFixedRate(
+                this::sendHeartbeats, HEARTBEAT_INTERVAL_MS, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Step down to FOLLOWER upon discovering a higher term.
+     */
+    private void stepDown(long newTerm) {
+        logger.info("[{}] Stepping down: term {} → {}", nodeId, currentTerm, newTerm);
+        currentTerm = newTerm;
+        state = RaftState.FOLLOWER;
+        votedFor = null;
+        leaderId = null;
+        savePersistentState();
+
+        if (heartbeatTimer != null) heartbeatTimer.cancel(false);
+        resetElectionTimer();
+    }
+
+    // ===========================
+    //  Heartbeats & Replication (§5.3)
+    // ===========================
+
+    /**
+     * Leader sends AppendEntries (heartbeat or data) to all peers.
+     */
+    private void sendHeartbeats() {
+        if (state != RaftState.LEADER || !running) return;
+
+        for (PeerAddress peer : peers) {
+            CompletableFuture.runAsync(() -> replicateTo(peer));
+        }
+    }
+
+    /**
+     * Replicate log entries to a single peer.
+     */
+    private void replicateTo(PeerAddress peer) {
+        lock.lock();
+        AppendEntriesRequest request;
+        try {
+            if (state != RaftState.LEADER) return;
+
+            long peerNextIndex = nextIndex.getOrDefault(peer.id(), raftLog.getLastIndex() + 1);
+            long prevLogIndex = peerNextIndex - 1;
+            long prevLogTerm = raftLog.getTermAt(prevLogIndex);
+
+            List<RaftEntry> entries = raftLog.getEntriesFrom(peerNextIndex);
+
+            request = AppendEntriesRequest.newBuilder()
+                    .setTerm(currentTerm)
+                    .setLeaderId(nodeId)
+                    .setPrevLogIndex(prevLogIndex)
+                    .setPrevLogTerm(prevLogTerm)
+                    .addAllEntries(entries)
+                    .setLeaderCommit(commitIndex)
+                    .build();
+        } finally {
+            lock.unlock();
+        }
+
+        // Send RPC (outside lock to avoid blocking)
+        Function<AppendEntriesRequest, AppendEntriesResponse> handler = appendRpcHandlers.get(peer.id());
+        if (handler == null) return;
+
+        AppendEntriesResponse response;
+        try {
+            response = handler.apply(request);
+        } catch (Exception e) {
+            logger.debug("[{}] AppendEntries to {} failed: {}", nodeId, peer.id(), e.getMessage());
+            return;
+        }
+
+        lock.lock();
+        try {
+            if (state != RaftState.LEADER) return;
+
+            if (response.getTerm() > currentTerm) {
+                stepDown(response.getTerm());
+                return;
+            }
+
+            if (response.getSuccess()) {
+                // Update tracking for this peer
+                matchIndex.put(peer.id(), response.getMatchIndex());
+                nextIndex.put(peer.id(), response.getMatchIndex() + 1);
+
+                // Try to advance commitIndex
+                advanceCommitIndex();
+            } else {
+                // Decrement nextIndex and retry (§5.3 — log consistency check)
+                long current = nextIndex.getOrDefault(peer.id(), 1L);
+                nextIndex.put(peer.id(), Math.max(1, current - 1));
+                logger.debug("[{}] AppendEntries to {} failed, backing nextIndex to {}",
+                        nodeId, peer.id(), nextIndex.get(peer.id()));
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Raft §5.3/§5.4 — Leader advances commitIndex.
+     *
+     * Finds the highest N such that:
+     *   1. A majority of matchIndex[i] >= N (entry replicated to most nodes)
+     *   2. log[N].term == currentTerm (only commit entries from current term)
+     *
+     * Condition (2) is the Raft safety rule: a leader never commits entries
+     * from a previous term by counting replicas — it only commits its own
+     * entries, and earlier entries are committed indirectly.
+     */
+    private void advanceCommitIndex() {
+        long lastIndex = raftLog.getLastIndex();
+        for (long n = lastIndex; n > commitIndex; n--) {
+            if (raftLog.getTermAt(n) != currentTerm) continue;
+
+            // Count how many nodes (including self) have replicated this entry
+            int replicaCount = 1; // leader always has it
+            for (PeerAddress peer : peers) {
+                if (matchIndex.getOrDefault(peer.id(), 0L) >= n) {
+                    replicaCount++;
+                }
+            }
+
+            // Majority = floor(clusterSize/2) + 1 (e.g., 3-node cluster needs 2)
+            int majority = (peers.size() + 1) / 2 + 1;
+            if (replicaCount >= majority) {
+                commitIndex = n;
+                logger.info("[{}] Advanced commitIndex to {}", nodeId, commitIndex);
+                applyCommitted();
+                return;
+            }
+        }
+    }
+
+    // ===========================
+    //  Applying committed entries
+    // ===========================
+
+    /**
+     * Raft §5.3 — Apply committed but unapplied entries to the state machine.
+     *
+     * Routes entries to the appropriate handler based on command type:
+     * - MESSAGE: appended to MessageStore (visible to consumers)
+     * - OFFSET_COMMIT: applied to OffsetManager (consumer group offset)
+     *
+     * Also completes the CompletableFuture created in propose(), which
+     * unblocks the client thread that is waiting for Raft commitment.
+     */
+    private void applyCommitted() {
+        while (lastApplied < commitIndex) {
+            lastApplied++;
+            RaftEntry entry = raftLog.getEntry(lastApplied);
+            if (entry == null) {
+                logger.error("[{}] Missing raft entry at index {} during apply", nodeId, lastApplied);
+                break;
+            }
+
+            try {
+                switch (entry.getCommandType()) {
+                    case OFFSET_COMMIT -> {
+                        // Apply offset commit to OffsetManager
+                        if (offsetManager != null && entry.hasConsumerGroup() && entry.hasOffsetValue()) {
+                            offsetManager.commit(
+                                    entry.getConsumerGroup(),
+                                    entry.getTopic(),
+                                    entry.getOffsetValue()
+                            );
+                            logger.debug("[{}] Applied offset commit: group={}, topic={}, offset={}",
+                                    nodeId, entry.getConsumerGroup(), entry.getTopic(), entry.getOffsetValue());
+                        }
+                    }
+                    default -> {
+                        // MESSAGE (default): apply to MessageStore
+                        messageStore.append(
+                                entry.getTopic(),
+                                entry.getPayload().toByteArray(),
+                                entry.hasKey() ? entry.getKey() : null,
+                                entry.getTimestamp()
+                        );
+                        logger.debug("[{}] Applied raft entry {} to MessageStore (topic={})",
+                                nodeId, lastApplied, entry.getTopic());
+                    }
+                }
+            } catch (Exception e) {
+                logger.error("[{}] Failed to apply entry {} (type={})",
+                        nodeId, lastApplied, entry.getCommandType(), e);
+            }
+
+            // Complete the future that propose() is blocking on — this unblocks the client thread
+            CompletableFuture<Long> future = pendingProposals.remove(lastApplied);
+            if (future != null) {
+                future.complete(lastApplied);
+            }
+        }
+    }
+
+    // ===========================
+    //  Client Proposals (Leader only)
+    // ===========================
+
+    /**
+     * Propose a new message to be replicated via Raft.
+     * Blocks until the entry is committed (majority ACK) or fails.
+     *
+     * @return the committed Raft log index
+     * @throws IOException if not leader, or commitment fails
+     */
+    public long propose(String topic, byte[] payload, String key, long timestamp) throws IOException {
+        lock.lock();
+        long index;
+        CompletableFuture<Long> future;
+        try {
+            if (state != RaftState.LEADER) {
+                throw new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
+            }
+
+            index = raftLog.getLastIndex() + 1;
+
+            RaftEntry.Builder entryBuilder = RaftEntry.newBuilder()
+                    .setTerm(currentTerm)
+                    .setIndex(index)
+                    .setTopic(topic)
+                    .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
+                    .setTimestamp(timestamp)
+                    .setCommandType(RaftCommandType.MESSAGE);
+
+            if (key != null && !key.isEmpty()) {
+                entryBuilder.setKey(key);
+            }
+
+            RaftEntry entry = entryBuilder.build();
+            raftLog.append(entry);
+
+            // Create a future that blocks until applyCommitted() processes this index
+            // (see applyCommitted() — it calls future.complete() when majority ACK)
+            future = new CompletableFuture<>();
+            pendingProposals.put(index, future);
+
+        } finally {
+            lock.unlock();
+        }
+
+        // Trigger immediate replication to peers
+        sendHeartbeats();
+
+        // Wait for commitment (with timeout)
+        try {
+            return future.get(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            pendingProposals.remove(index);
+            throw new IOException("Raft proposal timed out (index=" + index + ")");
+        } catch (ExecutionException e) {
+            throw new IOException("Raft proposal failed: " + e.getCause().getMessage());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Raft proposal interrupted");
+        }
+    }
+
+    /**
+     * Propose a consumer offset commit to be replicated via Raft.
+     * Ensures offset durability across leader failover.
+     *
+     * @param consumerGroup the consumer group
+     * @param topic         the topic
+     * @param offset        the next offset to read (last processed + 1)
+     * @return the committed Raft log index
+     * @throws IOException if not leader, or commitment fails
+     */
+    public long proposeOffsetCommit(String consumerGroup, String topic, long offset) throws IOException {
+        lock.lock();
+        long index;
+        CompletableFuture<Long> future;
+        try {
+            if (state != RaftState.LEADER) {
+                throw new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
+            }
+
+            index = raftLog.getLastIndex() + 1;
+
+            RaftEntry entry = RaftEntry.newBuilder()
+                    .setTerm(currentTerm)
+                    .setIndex(index)
+                    .setTopic(topic)
+                    .setCommandType(RaftCommandType.OFFSET_COMMIT)
+                    .setConsumerGroup(consumerGroup)
+                    .setOffsetValue(offset)
+                    .build();
+
+            raftLog.append(entry);
+
+            future = new CompletableFuture<>();
+            pendingProposals.put(index, future);
+
+        } finally {
+            lock.unlock();
+        }
+
+        sendHeartbeats();
+
+        try {
+            return future.get(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            pendingProposals.remove(index);
+            throw new IOException("Raft offset commit timed out (index=" + index + ")");
+        } catch (ExecutionException e) {
+            throw new IOException("Raft offset commit failed: " + e.getCause().getMessage());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Raft offset commit interrupted");
+        }
+    }
+
+    // ===========================
+    //  Handling incoming RPCs
+    // ===========================
+
+    /**
+     * Raft §5.2 — Handle an incoming RequestVote RPC from a candidate.
+     */
+    public RequestVoteResponse handleRequestVote(RequestVoteRequest request) {
+        lock.lock();
+        try {
+            // If request term is higher, step down
+            if (request.getTerm() > currentTerm) {
+                stepDown(request.getTerm());
+            }
+
+            boolean voteGranted = false;
+
+            if (request.getTerm() >= currentTerm) {
+                // Grant vote if we haven't voted yet (or voted for same candidate)
+                // AND candidate's log is at least as up-to-date as ours (§5.4.1)
+                boolean canVote = (votedFor == null || votedFor.equals(request.getCandidateId()));
+                boolean logOk = isLogUpToDate(request.getLastLogIndex(), request.getLastLogTerm());
+
+                if (canVote && logOk) {
+                    votedFor = request.getCandidateId();
+                    savePersistentState();
+                    resetElectionTimer(); // Reset timer when granting vote
+                    voteGranted = true;
+                    logger.info("[{}] Granted vote to {} for term {}",
+                            nodeId, request.getCandidateId(), request.getTerm());
+                }
+            }
+
+            return RequestVoteResponse.newBuilder()
+                    .setTerm(currentTerm)
+                    .setVoteGranted(voteGranted)
+                    .build();
+
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Raft §5.3 — Handle an incoming AppendEntries RPC from the leader.
+     * Also serves as heartbeat when entries list is empty.
+     */
+    public AppendEntriesResponse handleAppendEntries(AppendEntriesRequest request) {
+        lock.lock();
+        try {
+            // If request term is higher, step down
+            if (request.getTerm() > currentTerm) {
+                stepDown(request.getTerm());
+            }
+
+            // Reject if stale term
+            if (request.getTerm() < currentTerm) {
+                return AppendEntriesResponse.newBuilder()
+                        .setTerm(currentTerm)
+                        .setSuccess(false)
+                        .setMatchIndex(raftLog.getLastIndex())
+                        .build();
+            }
+
+            // Valid AppendEntries from current leader — reset election timer
+            state = RaftState.FOLLOWER;
+            leaderId = request.getLeaderId();
+            resetElectionTimer();
+
+            // Log consistency check (§5.3)
+            if (request.getPrevLogIndex() > 0) {
+                long prevTerm = raftLog.getTermAt(request.getPrevLogIndex());
+                if (request.getPrevLogIndex() > raftLog.getLastIndex() || prevTerm != request.getPrevLogTerm()) {
+                    return AppendEntriesResponse.newBuilder()
+                            .setTerm(currentTerm)
+                            .setSuccess(false)
+                            .setMatchIndex(raftLog.getLastIndex())
+                            .build();
+                }
+            }
+
+            // Append new entries (handling conflicts by truncation)
+            if (!request.getEntriesList().isEmpty()) {
+                for (RaftEntry entry : request.getEntriesList()) {
+                    long existingTerm = raftLog.getTermAt(entry.getIndex());
+                    if (existingTerm != 0 && existingTerm != entry.getTerm()) {
+                        // Conflict: truncate from this point (§5.3 step 3)
+                        try {
+                            raftLog.truncateFrom(entry.getIndex());
+                        } catch (IOException e) {
+                            logger.error("[{}] Failed to truncate raft log at {}", nodeId, entry.getIndex(), e);
+                            return AppendEntriesResponse.newBuilder()
+                                    .setTerm(currentTerm)
+                                    .setSuccess(false)
+                                    .setMatchIndex(raftLog.getLastIndex())
+                                    .build();
+                        }
+                    }
+
+                    // Append if new
+                    if (entry.getIndex() > raftLog.getLastIndex()) {
+                        try {
+                            raftLog.append(entry);
+                        } catch (IOException e) {
+                            logger.error("[{}] Failed to append raft entry at index {}", nodeId, entry.getIndex(), e);
+                            return AppendEntriesResponse.newBuilder()
+                                    .setTerm(currentTerm)
+                                    .setSuccess(false)
+                                    .setMatchIndex(raftLog.getLastIndex())
+                                    .build();
+                        }
+                    }
+                }
+            }
+
+            // Update commitIndex (§5.3 step 5)
+            if (request.getLeaderCommit() > commitIndex) {
+                commitIndex = Math.min(request.getLeaderCommit(), raftLog.getLastIndex());
+                applyCommitted();
+            }
+
+            return AppendEntriesResponse.newBuilder()
+                    .setTerm(currentTerm)
+                    .setSuccess(true)
+                    .setMatchIndex(raftLog.getLastIndex())
+                    .build();
+
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // ===========================
+    //  Raft safety: log comparison (§5.4.1)
+    // ===========================
+
+    /**
+     * Raft §5.4.1 — Election restriction: only vote for candidates whose log
+     * is at least as up-to-date as ours.
+     *
+     * Comparison rule: (1) higher last term wins, then (2) longer log wins.
+     * This ensures the leader always has all committed entries.
+     */
+    private boolean isLogUpToDate(long candidateLastIndex, long candidateLastTerm) {
+        long myLastTerm = raftLog.getLastTerm();
+        long myLastIndex = raftLog.getLastIndex();
+
+        if (candidateLastTerm != myLastTerm) {
+            return candidateLastTerm > myLastTerm;
+        }
+        return candidateLastIndex >= myLastIndex;
+    }
+
+    // ===========================
+    //  Persistent state management
+    // ===========================
+
+    private void savePersistentState() {
+        try {
+            Properties props = new Properties();
+            props.setProperty("currentTerm", String.valueOf(currentTerm));
+            props.setProperty("votedFor", votedFor != null ? votedFor : "");
+            try (FileOutputStream fos = new FileOutputStream(stateFilePath.toFile())) {
+                props.store(fos, "Raft persistent state");
+                fos.getFD().sync();  // CRITICAL: fsync to ensure durability before returning
+            }
+        } catch (IOException e) {
+            logger.error("[{}] Failed to save persistent state", nodeId, e);
+        }
+    }
+
+    private void loadPersistentState() {
+        if (!Files.exists(stateFilePath)) {
+            currentTerm = 0;
+            votedFor = null;
+            return;
+        }
+        try {
+            Properties props = new Properties();
+            try (InputStream in = new FileInputStream(stateFilePath.toFile())) {
+                props.load(in);
+            }
+            currentTerm = Long.parseLong(props.getProperty("currentTerm", "0"));
+            String vf = props.getProperty("votedFor", "");
+            votedFor = vf.isEmpty() ? null : vf;
+            logger.info("[{}] Loaded persistent state: term={}, votedFor={}", nodeId, currentTerm, votedFor);
+        } catch (IOException e) {
+            logger.error("[{}] Failed to load persistent state, starting fresh", nodeId, e);
+            currentTerm = 0;
+            votedFor = null;
+        }
+    }
+
+    // ===========================
+    //  Getters
+    // ===========================
+
+    public RaftState getState() { return state; }
+    public long getCurrentTerm() { return currentTerm; }
+    public String getNodeId() { return nodeId; }
+    public String getLeaderId() { return leaderId; }
+    public long getCommitIndex() { return commitIndex; }
+    public long getLastApplied() { return lastApplied; }
+    public boolean isLeader() { return state == RaftState.LEADER; }
+
+    /**
+     * Get the leader's address as "host:port" for client redirection.
+     */
+    public String getLeaderAddress() {
+        if (leaderId == null) return null;
+        if (leaderId.equals(nodeId)) return "localhost:" + port;
+        for (PeerAddress peer : peers) {
+            if (peer.id().equals(leaderId)) {
+                return peer.address();
+            }
+        }
+        return null;
+    }
+}

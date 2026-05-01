@@ -34,6 +34,9 @@ public class MessageStore {
     // Maximum number of messages to keep in memory per topic
     private static final int MAX_CACHE_SIZE_PER_TOPIC = 1000;
 
+    // Monitor for long-poll notification — consumers wait() on this, append() calls notifyAll()
+    private final Object messageMonitor = new Object();
+
     public MessageStore(LogManager logManager) {
         this.logManager = logManager;
     }
@@ -53,7 +56,6 @@ public class MessageStore {
             try (LogSegment segment = new LogSegment(logPath)) {
                 long position = 0;
                 long segmentSize = segment.getSize();
-                
                 while (position < segmentSize) {
                     StoredMessage message = segment.read(position);
                     long offset = message.getOffset();
@@ -125,6 +127,11 @@ public class MessageStore {
         } catch (IOException e) {
             logger.error("Failed to persist message for topic {}: {}", topic, e.getMessage());
             throw new RuntimeException("Persistence failure", e);
+        }
+
+        // 4. Wake any long-polling consumers waiting for new messages
+        synchronized (messageMonitor) {
+            messageMonitor.notifyAll();
         }
 
         return offset;
@@ -212,6 +219,45 @@ public class MessageStore {
         }
         
         return result;
+    }
+
+    /**
+     * Wait for messages to arrive on a topic, blocking until messages are available
+     * or the timeout expires. Uses Object.wait()/notifyAll() for efficient blocking
+     * instead of polling with Thread.sleep().
+     *
+     * This solves the long-poll thread exhaustion problem: waiting threads release
+     * their CPU time slice and are woken immediately when a message is appended.
+     *
+     * @param topic       the topic to wait for messages on
+     * @param fromOffset  starting offset (inclusive)
+     * @param maxCount    maximum messages to return
+     * @param timeoutMs   maximum time to wait (0 = return immediately)
+     * @return messages found (may be empty if timeout expires)
+     */
+    public List<StoredMessage> waitForMessages(String topic, long fromOffset, int maxCount, long timeoutMs) {
+        // Fast path: check if messages are already available
+        List<StoredMessage> messages = getMessages(topic, fromOffset, maxCount);
+        if (!messages.isEmpty() || timeoutMs <= 0) {
+            return messages;
+        }
+
+        // Slow path: wait for notification from append()
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        synchronized (messageMonitor) {
+            while (messages.isEmpty()) {
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) break;
+                try {
+                    messageMonitor.wait(remaining);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                messages = getMessages(topic, fromOffset, maxCount);
+            }
+        }
+        return messages;
     }
 
     public long getCurrentOffset() {
