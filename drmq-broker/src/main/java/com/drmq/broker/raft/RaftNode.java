@@ -37,7 +37,7 @@ import java.util.function.Function;
 public class RaftNode {
     private static final Logger logger = LoggerFactory.getLogger(RaftNode.class);
 
-    // Raft timing constants (§5.2) — randomized election timeout prevents split votes
+    // Raft timing constants — randomized election timeout prevents split votes
     private static final long ELECTION_TIMEOUT_MIN_MS = 150;
     private static final long ELECTION_TIMEOUT_MAX_MS = 300;
     private static final long HEARTBEAT_INTERVAL_MS = 75;
@@ -47,18 +47,18 @@ public class RaftNode {
 
     // --- Persistent state (survives restart) ---
     private long currentTerm;
-    private String votedFor;    // null if not voted in current term
+    private String votedFor;    
     private final RaftLog raftLog;
 
     // --- Volatile state ---
     private RaftState state;
-    private long commitIndex;   // Highest log index known to be committed
-    private long lastApplied;   // Highest log index applied to state machine
-    private String leaderId;    // Who we think the current leader is
+    private long commitIndex; 
+    private long lastApplied;   
+    private String leaderId;  
 
     // --- Leader-only volatile state ---
-    private final Map<String, Long> nextIndex;   // For each peer: next log entry to send
-    private final Map<String, Long> matchIndex;  // For each peer: highest replicated log entry
+    private final Map<String, Long> nextIndex;   
+    private final Map<String, Long> matchIndex; 
 
     // --- Node identity and cluster ---
     private final String nodeId;
@@ -83,6 +83,10 @@ public class RaftNode {
     // Flow: propose() creates a future here → applyCommitted() completes it when majority ACK
     private final Map<Long, CompletableFuture<Long>> pendingProposals = new ConcurrentHashMap<>();
 
+    // --- Rate limiting for debug logs to prevent spam during failures (max 1 log per second per peer) ---
+    private final Map<String, Long> lastLogTime = new ConcurrentHashMap<>();
+    private static final long LOG_RATE_LIMIT_MS = 1000;  // 1 second per peer/failure type
+
     public RaftNode(String nodeId, int port, List<PeerAddress> peers,
                     MessageStore messageStore, OffsetManager offsetManager, Path dataDir) throws IOException {
         this.nodeId = nodeId;
@@ -97,11 +101,28 @@ public class RaftNode {
         this.nextIndex = new ConcurrentHashMap<>();
         this.matchIndex = new ConcurrentHashMap<>();
 
-        // Persistent state file for currentTerm and votedFor
         Path raftDir = dataDir.resolve("raft");
         Files.createDirectories(raftDir);
         this.stateFilePath = raftDir.resolve("state.properties");
         loadPersistentState();
+    }
+
+    // ===========================
+    //  Utility
+    // ===========================
+
+    /**
+     * Rate limit debug logging to max 1 log per second per key.
+     * Returns true if enough time has passed since last log for this key.
+     */
+    private boolean shouldLog(String key) {
+        long now = System.currentTimeMillis();
+        Long lastTime = lastLogTime.get(key);
+        if (lastTime == null || (now - lastTime) >= LOG_RATE_LIMIT_MS) {
+            lastLogTime.put(key, now);
+            return true;
+        }
+        return false;
     }
 
     // ===========================
@@ -202,8 +223,8 @@ public class RaftNode {
                     .build();
 
             long myTerm = currentTerm;
-            int votesNeeded = (peers.size() + 1) / 2 + 1;  // majority of total cluster
-            AtomicLong votesReceived = new AtomicLong(1);   // self-vote
+            int votesNeeded = (peers.size() + 1) / 2 + 1;  
+            AtomicLong votesReceived = new AtomicLong(1);   
 
             // Send RequestVote to all peers asynchronously
             for (PeerAddress peer : peers) {
@@ -213,7 +234,6 @@ public class RaftNode {
                     try {
                         return handler.apply(request);
                     } catch (Exception e) {
-                        logger.debug("[{}] Failed to send RequestVote to {}: {}", nodeId, peer.id(), e.getMessage());
                         return null;
                     }
                 }).thenAccept(response -> {
@@ -255,7 +275,6 @@ public class RaftNode {
         state = RaftState.LEADER;
         leaderId = nodeId;
 
-        // Initialize nextIndex and matchIndex for all peers (§5.3)
         long lastLogIndex = raftLog.getLastIndex();
         for (PeerAddress peer : peers) {
             nextIndex.put(peer.id(), lastLogIndex + 1);
@@ -289,10 +308,7 @@ public class RaftNode {
         resetElectionTimer();
     }
 
-    // ===========================
-    //  Heartbeats & Replication (§5.3)
-    // ===========================
-
+    //  Heartbeats & Replication 
     /**
      * Leader sends AppendEntries (heartbeat or data) to all peers.
      */
@@ -331,7 +347,6 @@ public class RaftNode {
             lock.unlock();
         }
 
-        // Send RPC (outside lock to avoid blocking)
         Function<AppendEntriesRequest, AppendEntriesResponse> handler = appendRpcHandlers.get(peer.id());
         if (handler == null) return;
 
@@ -339,7 +354,9 @@ public class RaftNode {
         try {
             response = handler.apply(request);
         } catch (Exception e) {
-            logger.debug("[{}] AppendEntries to {} failed: {}", nodeId, peer.id(), e.getMessage());
+            if (shouldLog("append_failure_" + peer.id())) {
+                logger.debug("[{}] AppendEntries to {} failed: {}", nodeId, peer.id(), e.getMessage());
+            }
             return;
         }
 
@@ -353,18 +370,16 @@ public class RaftNode {
             }
 
             if (response.getSuccess()) {
-                // Update tracking for this peer
                 matchIndex.put(peer.id(), response.getMatchIndex());
                 nextIndex.put(peer.id(), response.getMatchIndex() + 1);
-
-                // Try to advance commitIndex
                 advanceCommitIndex();
             } else {
-                // Decrement nextIndex and retry (§5.3 — log consistency check)
                 long current = nextIndex.getOrDefault(peer.id(), 1L);
                 nextIndex.put(peer.id(), Math.max(1, current - 1));
-                logger.debug("[{}] AppendEntries to {} failed, backing nextIndex to {}",
-                        nodeId, peer.id(), nextIndex.get(peer.id()));
+                if (shouldLog("backtrack_" + peer.id())) {
+                    logger.debug("[{}] AppendEntries to {} failed, backing nextIndex to {}",
+                            nodeId, peer.id(), nextIndex.get(peer.id()));
+                }
             }
         } finally {
             lock.unlock();
@@ -372,7 +387,7 @@ public class RaftNode {
     }
 
     /**
-     * Raft §5.3/§5.4 — Leader advances commitIndex.
+     * Leader advances commitIndex.
      *
      * Finds the highest N such that:
      *   1. A majority of matchIndex[i] >= N (entry replicated to most nodes)
@@ -411,7 +426,7 @@ public class RaftNode {
     // ===========================
 
     /**
-     * Raft §5.3 — Apply committed but unapplied entries to the state machine.
+     * Apply committed but unapplied entries to the state machine.
      *
      * Routes entries to the appropriate handler based on command type:
      * - MESSAGE: appended to MessageStore (visible to consumers)
@@ -590,7 +605,7 @@ public class RaftNode {
     // ===========================
 
     /**
-     * Raft §5.2 — Handle an incoming RequestVote RPC from a candidate.
+       Handle an incoming RequestVote RPC from a candidate.
      */
     public RequestVoteResponse handleRequestVote(RequestVoteRequest request) {
         lock.lock();
@@ -635,7 +650,6 @@ public class RaftNode {
     public AppendEntriesResponse handleAppendEntries(AppendEntriesRequest request) {
         lock.lock();
         try {
-            // If request term is higher, step down
             if (request.getTerm() > currentTerm) {
                 stepDown(request.getTerm());
             }
@@ -749,7 +763,7 @@ public class RaftNode {
             props.setProperty("votedFor", votedFor != null ? votedFor : "");
             try (FileOutputStream fos = new FileOutputStream(stateFilePath.toFile())) {
                 props.store(fos, "Raft persistent state");
-                fos.getFD().sync();  // CRITICAL: fsync to ensure durability before returning
+                fos.getFD().sync();  
             }
         } catch (IOException e) {
             logger.error("[{}] Failed to save persistent state", nodeId, e);

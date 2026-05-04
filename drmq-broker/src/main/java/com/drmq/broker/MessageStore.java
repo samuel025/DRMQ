@@ -67,7 +67,7 @@ public class MessageStore {
                         maxOffset = offset;
                     }
                     
-                    // Move to next message: 4 bytes (length) + message size
+                   
                     position += 4 + message.getSerializedSize();
                 }
             } catch (IOException ioe) {
@@ -141,14 +141,12 @@ public class MessageStore {
      * Get a message by topic and offset.
      */
     public StoredMessage getMessage(String topic, long offset) {
-        // First try cache
         BoundedMessageCache cache = messageCache.get(topic);
         if (cache != null) {
             StoredMessage msg = cache.get(offset);
             if (msg != null) return msg;
         }
 
-        // Then try index + disk
         Map<Long, Long> index = topicIndex.get(topic);
         if (index != null && index.containsKey(offset)) {
             try {
@@ -167,7 +165,7 @@ public class MessageStore {
      * Get messages from a topic starting at the given offset.
      * First tries the in-memory cache, then falls back to disk if needed.
      * 
-     * Note: Offsets are global across all topics, so a topic's offsets may be sparse.
+     * Offsets are global across all topics, so a topic's offsets may be sparse.
      * We iterate actual index entries rather than probing consecutive offsets.
      */
     public List<StoredMessage> getMessages(String topic, long fromOffset, int maxCount) {
@@ -187,10 +185,7 @@ public class MessageStore {
         if (index == null) {
             return Collections.emptyList();
         }
-        
         List<StoredMessage> result = new ArrayList<>();
-        
-        // Get segment once outside the loop for efficiency
         LogSegment segment;
         try {
             segment = logManager.getOrCreateSegment(topic);
@@ -199,11 +194,9 @@ public class MessageStore {
             return Collections.emptyList();
         }
         
-        // Iterate actual index entries (sparse offsets) starting from fromOffset
-        // tailMap(fromOffset) returns all entries with key >= fromOffset, already sorted
         for (Map.Entry<Long, Long> entry : index.tailMap(fromOffset).entrySet()) {
             if (result.size() >= maxCount) {
-                break;  // Got enough messages
+                break;  
             }
             
             long offset = entry.getKey();
@@ -214,7 +207,6 @@ public class MessageStore {
                 result.add(message);
             } catch (IOException e) {
                 logger.warn("Error reading message at offset {} from disk: {}", offset, e.getMessage());
-                // Continue to next message
             }
         }
         
@@ -225,24 +217,18 @@ public class MessageStore {
      * Wait for messages to arrive on a topic, blocking until messages are available
      * or the timeout expires. Uses Object.wait()/notifyAll() for efficient blocking
      * instead of polling with Thread.sleep().
-     *
-     * This solves the long-poll thread exhaustion problem: waiting threads release
-     * their CPU time slice and are woken immediately when a message is appended.
-     *
      * @param topic       the topic to wait for messages on
-     * @param fromOffset  starting offset (inclusive)
+     * @param fromOffset  starting offset
      * @param maxCount    maximum messages to return
      * @param timeoutMs   maximum time to wait (0 = return immediately)
-     * @return messages found (may be empty if timeout expires)
+     * @return messages found
      */
     public List<StoredMessage> waitForMessages(String topic, long fromOffset, int maxCount, long timeoutMs) {
-        // Fast path: check if messages are already available
         List<StoredMessage> messages = getMessages(topic, fromOffset, maxCount);
         if (!messages.isEmpty() || timeoutMs <= 0) {
             return messages;
         }
 
-        // Slow path: wait for notification from append()
         long deadline = System.currentTimeMillis() + timeoutMs;
         synchronized (messageMonitor) {
             while (messages.isEmpty()) {
@@ -283,7 +269,6 @@ public class MessageStore {
 
     /**
      * Bounded cache for messages with LRU eviction.
-     * Thread-safe implementation using ArrayDeque with fixed capacity.
      */
     private static class BoundedMessageCache {
         private final int maxSize;
@@ -297,12 +282,10 @@ public class MessageStore {
         public synchronized void add(StoredMessage message) {
             long offset = message.getOffset();
             
-            // If already exists, update it (shouldn't happen in normal operation)
             if (messageMap.containsKey(offset)) {
                 return;
             }
             
-            // Evict oldest if at capacity
             if (offsetQueue.size() >= maxSize) {
                 Long oldestOffset = offsetQueue.pollFirst();
                 if (oldestOffset != null) {
@@ -310,7 +293,6 @@ public class MessageStore {
                 }
             }
             
-            // Add new message
             messageMap.put(offset, message);
             offsetQueue.addLast(offset);
         }

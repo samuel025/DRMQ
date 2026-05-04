@@ -49,29 +49,23 @@ public class ClientHandler implements Runnable {
 
             while (running && !socket.isClosed()) {
                 try {
-                    // Read message length prefix (4 bytes, big-endian)
-                    // This tells us exactly how many bytes to read for the envelope
                     int length = in.readInt();
                     if (length <= 0 || length > 10 * 1024 * 1024) { // Max 10MB message
                         logger.warn("Invalid message length: {}", length);
                         break;
                     }
 
-                    // Read the envelope
                     byte[] envelopeBytes = new byte[length];
                     in.readFully(envelopeBytes);
 
                     MessageEnvelope envelope = MessageEnvelope.parseFrom(envelopeBytes);
                     MessageEnvelope response = handleMessage(envelope);
-
-                    // Send response
                     byte[] responseBytes = response.toByteArray();
                     out.writeInt(responseBytes.length);
                     out.write(responseBytes);
                     out.flush();
 
                 } catch (EOFException e) {
-                    // Client disconnected normally
                     logger.info("Client disconnected: {}", clientAddress);
                     break;
                 }
@@ -95,7 +89,6 @@ public class ClientHandler implements Runnable {
             case CONSUME_REQUEST -> handleConsumeRequest(envelope);
             case COMMIT_OFFSET_REQUEST -> handleCommitOffsetRequest(envelope);
             case FETCH_OFFSET_REQUEST -> handleFetchOffsetRequest(envelope);
-            // Raft RPCs
             case REQUEST_VOTE_REQUEST -> handleRequestVoteRequest(envelope);
             case APPEND_ENTRIES_REQUEST -> handleAppendEntriesRequest(envelope);
             default -> createErrorResponse("Unknown message type: " + envelope.getType());
@@ -116,19 +109,14 @@ public class ClientHandler implements Runnable {
 
             long offset;
             if (raftNode != null) {
-                // Cluster mode: route through Raft consensus
                 if (!raftNode.isLeader()) {
                     String leaderAddr = raftNode.getLeaderAddress();
                     return createProduceErrorResponse("NOT_LEADER:" +
                             (leaderAddr != null ? leaderAddr : "UNKNOWN"));
                 }
-                // Leader: propose via Raft — blocks until committed to majority
                 raftNode.propose(topic, payload, key, timestamp);
-                // After Raft commit, the entry is applied to MessageStore.
-                // Use the MessageStore's current offset as the user-facing offset.
                 offset = messageStore.getCurrentOffset() - 1;
             } else {
-                // Single-node mode: write directly to MessageStore (existing behavior)
                 offset = messageStore.append(topic, payload, key, timestamp);
             }
 
@@ -247,10 +235,8 @@ public class ClientHandler implements Runnable {
                             .setPayload(response.toByteString())
                             .build();
                 }
-                // Leader: propose offset commit via Raft — blocks until committed to majority
                 raftNode.proposeOffsetCommit(group, topic, offset);
             } else {
-                // Single-node mode: persist locally
                 offsetManager.commit(group, topic, offset);
             }
 
