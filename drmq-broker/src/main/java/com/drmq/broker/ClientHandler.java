@@ -114,8 +114,7 @@ public class ClientHandler implements Runnable {
                     return createProduceErrorResponse("NOT_LEADER:" +
                             (leaderAddr != null ? leaderAddr : "UNKNOWN"));
                 }
-                raftNode.propose(topic, payload, key, timestamp);
-                offset = messageStore.getCurrentOffset() - 1;
+                offset = raftNode.propose(topic, payload, key, timestamp);
             } else {
                 offset = messageStore.append(topic, payload, key, timestamp);
             }
@@ -152,6 +151,12 @@ public class ClientHandler implements Runnable {
             long fromOffset   = request.getFromOffset();
             int maxMessages   = request.getMaxMessages();
             long timeoutMs    = request.getTimeoutMs(); // 0 = short poll
+
+            if (raftNode != null && !raftNode.isLeader()) {
+                String leaderAddr = raftNode.getLeaderAddress();
+                return createConsumeErrorResponse("NOT_LEADER:" +
+                        (leaderAddr != null ? leaderAddr : "UNKNOWN"));
+            }
 
             // Fetch messages — uses efficient wait/notify for long-polling (no thread sleep-loop)
             var messages = (timeoutMs > 0)

@@ -26,13 +26,6 @@ import java.util.function.Function;
  * - At most one leader per term
  * - A committed entry is never overwritten
  * - If two logs contain an entry with the same index and term, all preceding entries are identical
- *
- * Threading model:
- * - A ReentrantLock guards all mutable state (term, votedFor, commitIndex, etc.)
- * - RPC handlers (handleRequestVote, handleAppendEntries) acquire the lock per call
- * - Heartbeats and elections run on a ScheduledExecutorService
- * - Client proposals block on a CompletableFuture until the entry is committed
- *   (the future is created in propose() and completed in applyCommitted())
  */
 public class RaftNode {
     private static final Logger logger = LoggerFactory.getLogger(RaftNode.class);
@@ -45,22 +38,21 @@ public class RaftNode {
     // Proposal timeout — how long a client blocks waiting for Raft commitment
     private static final long PROPOSAL_TIMEOUT_SECONDS = 5;
 
-    // --- Persistent state (survives restart) ---
+    //  Persistent state (survives restart) 
     private long currentTerm;
     private String votedFor;    
     private final RaftLog raftLog;
 
-    // --- Volatile state ---
+    //  Volatile state 
     private RaftState state;
     private long commitIndex; 
     private long lastApplied;   
     private String leaderId;  
 
-    // --- Leader-only volatile state ---
+    // Leader-only volatile state 
     private final Map<String, Long> nextIndex;   
     private final Map<String, Long> matchIndex; 
 
-    // --- Node identity and cluster ---
     private final String nodeId;
     private final int port;
     private final List<PeerAddress> peers;
@@ -68,24 +60,20 @@ public class RaftNode {
     private final OffsetManager offsetManager;  // For applying replicated offset commits
     private final Path stateFilePath;
 
-    // --- Peer connections (set externally after construction) ---
     private final Map<String, Function<RequestVoteRequest, RequestVoteResponse>> voteRpcHandlers = new ConcurrentHashMap<>();
     private final Map<String, Function<AppendEntriesRequest, AppendEntriesResponse>> appendRpcHandlers = new ConcurrentHashMap<>();
 
-    // --- Threading ---
     private final ReentrantLock lock = new ReentrantLock();
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
     private ScheduledFuture<?> electionTimer;
     private ScheduledFuture<?> heartbeatTimer;
     private volatile boolean running = false;
 
-    // --- Proposal waiting: clients block until their entry is committed ---
     // Flow: propose() creates a future here → applyCommitted() completes it when majority ACK
     private final Map<Long, CompletableFuture<Long>> pendingProposals = new ConcurrentHashMap<>();
 
-    // --- Rate limiting for debug logs to prevent spam during failures (max 1 log per second per peer) ---
     private final Map<String, Long> lastLogTime = new ConcurrentHashMap<>();
-    private static final long LOG_RATE_LIMIT_MS = 1000;  // 1 second per peer/failure type
+    private static final long LOG_RATE_LIMIT_MS = 1000;  
 
     public RaftNode(String nodeId, int port, List<PeerAddress> peers,
                     MessageStore messageStore, OffsetManager offsetManager, Path dataDir) throws IOException {
@@ -107,14 +95,7 @@ public class RaftNode {
         loadPersistentState();
     }
 
-    // ===========================
-    //  Utility
-    // ===========================
-
-    /**
-     * Rate limit debug logging to max 1 log per second per key.
-     * Returns true if enough time has passed since last log for this key.
-     */
+  
     private boolean shouldLog(String key) {
         long now = System.currentTimeMillis();
         Long lastTime = lastLogTime.get(key);
@@ -125,13 +106,7 @@ public class RaftNode {
         return false;
     }
 
-    // ===========================
-    //  Lifecycle
-    // ===========================
-
-    /**
-     * Start the Raft node — begin as FOLLOWER with an election timer.
-     */
+   
     public void start() {
         running = true;
         resetElectionTimer();
@@ -139,16 +114,13 @@ public class RaftNode {
                 nodeId, currentTerm, peers.size());
     }
 
-    /**
-     * Stop the Raft node — cancel all timers.
-     */
+
     public void stop() {
         running = false;
         if (electionTimer != null) electionTimer.cancel(false);
         if (heartbeatTimer != null) heartbeatTimer.cancel(false);
         scheduler.shutdownNow();
 
-        // Fail all pending proposals
         pendingProposals.values().forEach(f -> f.completeExceptionally(
                 new IOException("Raft node shutting down")));
         pendingProposals.clear();
@@ -161,9 +133,8 @@ public class RaftNode {
         logger.info("[{}] Raft node stopped", nodeId);
     }
 
-    // ===========================
+
     //  Peer RPC Registration
-    // ===========================
 
     /**
      * Register an RPC handler for sending RequestVote to a peer.
@@ -179,9 +150,9 @@ public class RaftNode {
         appendRpcHandlers.put(peerId, handler);
     }
 
-    // ===========================
-    //  Election (§5.2)
-    // ===========================
+    
+    
+    //  Election 
 
     /**
      * Reset the election timer with a random timeout (150–300ms).
@@ -375,7 +346,8 @@ public class RaftNode {
                 advanceCommitIndex();
             } else {
                 long current = nextIndex.getOrDefault(peer.id(), 1L);
-                nextIndex.put(peer.id(), Math.max(1, current - 1));
+                long supposedNextIndex = Math.min(current - 1, response.getMatchIndex() + 1);
+                nextIndex.put(peer.id(), Math.max(1, supposedNextIndex));
                 if (shouldLog("backtrack_" + peer.id())) {
                     logger.debug("[{}] AppendEntries to {} failed, backing nextIndex to {}",
                             nodeId, peer.id(), nextIndex.get(peer.id()));
@@ -386,24 +358,13 @@ public class RaftNode {
         }
     }
 
-    /**
-     * Leader advances commitIndex.
-     *
-     * Finds the highest N such that:
-     *   1. A majority of matchIndex[i] >= N (entry replicated to most nodes)
-     *   2. log[N].term == currentTerm (only commit entries from current term)
-     *
-     * Condition (2) is the Raft safety rule: a leader never commits entries
-     * from a previous term by counting replicas — it only commits its own
-     * entries, and earlier entries are committed indirectly.
-     */
+
     private void advanceCommitIndex() {
         long lastIndex = raftLog.getLastIndex();
         for (long n = lastIndex; n > commitIndex; n--) {
             if (raftLog.getTermAt(n) != currentTerm) continue;
 
-            // Count how many nodes (including self) have replicated this entry
-            int replicaCount = 1; // leader always has it
+            int replicaCount = 1; 
             for (PeerAddress peer : peers) {
                 if (matchIndex.getOrDefault(peer.id(), 0L) >= n) {
                     replicaCount++;
@@ -421,17 +382,10 @@ public class RaftNode {
         }
     }
 
-    // ===========================
-    //  Applying committed entries
-    // ===========================
+
 
     /**
      * Apply committed but unapplied entries to the state machine.
-     *
-     * Routes entries to the appropriate handler based on command type:
-     * - MESSAGE: appended to MessageStore (visible to consumers)
-     * - OFFSET_COMMIT: applied to OffsetManager (consumer group offset)
-     *
      * Also completes the CompletableFuture created in propose(), which
      * unblocks the client thread that is waiting for Raft commitment.
      */
@@ -443,6 +397,8 @@ public class RaftNode {
                 logger.error("[{}] Missing raft entry at index {} during apply", nodeId, lastApplied);
                 break;
             }
+
+            long completionValue = lastApplied;
 
             try {
                 switch (entry.getCommandType()) {
@@ -460,12 +416,13 @@ public class RaftNode {
                     }
                     default -> {
                         // MESSAGE (default): apply to MessageStore
-                        messageStore.append(
+                        long msgOffset = messageStore.append(
                                 entry.getTopic(),
                                 entry.getPayload().toByteArray(),
                                 entry.hasKey() ? entry.getKey() : null,
                                 entry.getTimestamp()
                         );
+                        completionValue = msgOffset;
                         logger.debug("[{}] Applied raft entry {} to MessageStore (topic={})",
                                 nodeId, lastApplied, entry.getTopic());
                     }
@@ -475,17 +432,16 @@ public class RaftNode {
                         nodeId, lastApplied, entry.getCommandType(), e);
             }
 
+            savePersistentState();
+
             // Complete the future that propose() is blocking on — this unblocks the client thread
             CompletableFuture<Long> future = pendingProposals.remove(lastApplied);
             if (future != null) {
-                future.complete(lastApplied);
+                future.complete(completionValue);
             }
         }
     }
 
-    // ===========================
-    //  Client Proposals (Leader only)
-    // ===========================
 
     /**
      * Propose a new message to be replicated via Raft.
@@ -600,9 +556,6 @@ public class RaftNode {
         }
     }
 
-    // ===========================
-    //  Handling incoming RPCs
-    // ===========================
 
     /**
        Handle an incoming RequestVote RPC from a candidate.
@@ -619,7 +572,7 @@ public class RaftNode {
 
             if (request.getTerm() >= currentTerm) {
                 // Grant vote if we haven't voted yet (or voted for same candidate)
-                // AND candidate's log is at least as up-to-date as ours (§5.4.1)
+                // AND candidate's log is at least as up-to-date as ours (
                 boolean canVote = (votedFor == null || votedFor.equals(request.getCandidateId()));
                 boolean logOk = isLogUpToDate(request.getLastLogIndex(), request.getLastLogTerm());
 
@@ -644,7 +597,7 @@ public class RaftNode {
     }
 
     /**
-     * Raft §5.3 — Handle an incoming AppendEntries RPC from the leader.
+     * Handle an incoming AppendEntries RPC from the leader.
      * Also serves as heartbeat when entries list is empty.
      */
     public AppendEntriesResponse handleAppendEntries(AppendEntriesRequest request) {
@@ -668,7 +621,7 @@ public class RaftNode {
             leaderId = request.getLeaderId();
             resetElectionTimer();
 
-            // Log consistency check (§5.3)
+            // Log consistency check
             if (request.getPrevLogIndex() > 0) {
                 long prevTerm = raftLog.getTermAt(request.getPrevLogIndex());
                 if (request.getPrevLogIndex() > raftLog.getLastIndex() || prevTerm != request.getPrevLogTerm()) {
@@ -685,7 +638,6 @@ public class RaftNode {
                 for (RaftEntry entry : request.getEntriesList()) {
                     long existingTerm = raftLog.getTermAt(entry.getIndex());
                     if (existingTerm != 0 && existingTerm != entry.getTerm()) {
-                        // Conflict: truncate from this point (§5.3 step 3)
                         try {
                             raftLog.truncateFrom(entry.getIndex());
                         } catch (IOException e) {
@@ -714,7 +666,7 @@ public class RaftNode {
                 }
             }
 
-            // Update commitIndex (§5.3 step 5)
+            // Update commitIndex
             if (request.getLeaderCommit() > commitIndex) {
                 commitIndex = Math.min(request.getLeaderCommit(), raftLog.getLastIndex());
                 applyCommitted();
@@ -731,16 +683,10 @@ public class RaftNode {
         }
     }
 
-    // ===========================
-    //  Raft safety: log comparison (§5.4.1)
-    // ===========================
 
     /**
-     * Raft §5.4.1 — Election restriction: only vote for candidates whose log
+     Election restriction: only vote for candidates whose log
      * is at least as up-to-date as ours.
-     *
-     * Comparison rule: (1) higher last term wins, then (2) longer log wins.
-     * This ensures the leader always has all committed entries.
      */
     private boolean isLogUpToDate(long candidateLastIndex, long candidateLastTerm) {
         long myLastTerm = raftLog.getLastTerm();
@@ -752,15 +698,13 @@ public class RaftNode {
         return candidateLastIndex >= myLastIndex;
     }
 
-    // ===========================
-    //  Persistent state management
-    // ===========================
 
     private void savePersistentState() {
         try {
             Properties props = new Properties();
             props.setProperty("currentTerm", String.valueOf(currentTerm));
             props.setProperty("votedFor", votedFor != null ? votedFor : "");
+            props.setProperty("lastApplied", String.valueOf(lastApplied));
             try (FileOutputStream fos = new FileOutputStream(stateFilePath.toFile())) {
                 props.store(fos, "Raft persistent state");
                 fos.getFD().sync();  
@@ -784,11 +728,16 @@ public class RaftNode {
             currentTerm = Long.parseLong(props.getProperty("currentTerm", "0"));
             String vf = props.getProperty("votedFor", "");
             votedFor = vf.isEmpty() ? null : vf;
-            logger.info("[{}] Loaded persistent state: term={}, votedFor={}", nodeId, currentTerm, votedFor);
+            lastApplied = Long.parseLong(props.getProperty("lastApplied", "0"));
+            commitIndex = Math.max(commitIndex, lastApplied);
+            logger.info("[{}] Loaded persistent state: term={}, votedFor={}, lastApplied={}",
+                    nodeId, currentTerm, votedFor, lastApplied);
         } catch (IOException e) {
             logger.error("[{}] Failed to load persistent state, starting fresh", nodeId, e);
             currentTerm = 0;
             votedFor = null;
+            lastApplied = 0;
+            commitIndex = Math.max(commitIndex, lastApplied);
         }
     }
 

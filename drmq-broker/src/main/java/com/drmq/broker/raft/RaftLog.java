@@ -20,15 +20,7 @@ import java.util.List;
  *
  * Indexing: The Raft log is 1-indexed (index 0 is a sentinel meaning "no entry").
  * Internally, entries are stored in a 0-indexed ArrayList, so raft index N maps
- * to list index N-1.
- *
- * File format: [4-byte length][serialized RaftEntry protobuf] repeated.
- * Same length-prefixed framing as the message WAL (LogSegment).
- *
- * Crash safety:
- * - Every append is followed by fsync (durability before returning)
- * - Truncation uses setLength() to the byte offset of the first removed entry,
- *   which is atomic on most filesystems 
+ * to list index N-1. 
  */
 public class RaftLog {
     private static final Logger logger = LoggerFactory.getLogger(RaftLog.class);

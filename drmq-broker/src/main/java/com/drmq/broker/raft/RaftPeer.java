@@ -33,7 +33,6 @@ public class RaftPeer {
     private DataInputStream in;
     private DataOutputStream out;
     private final Object lock = new Object();
-    private long lastConnectionLogTime = 0;
     private long lastRequestVoteFailureLogTime = 0;
     private long lastAppendEntriesFailureLogTime = 0;
 
