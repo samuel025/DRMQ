@@ -67,8 +67,6 @@ public class LogSegment implements AutoCloseable {
         while (buffer.hasRemaining()) {
             fileChannel.write(buffer, position + buffer.position());
         }
-        
-        // Ensure durability
         fileChannel.force(true);
         
         currentSize += buffer.limit();

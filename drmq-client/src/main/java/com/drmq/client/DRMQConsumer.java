@@ -167,6 +167,36 @@ public class DRMQConsumer implements AutoCloseable {
         try { if (socket != null && !socket.isClosed()) socket.close(); } catch (IOException ignored) {}
     }
 
+    /**
+     * Redirect to the leader if the broker indicates NOT_LEADER.
+     * Returns true if a reconnect attempt was made.
+     */
+    private boolean tryRedirectToLeader(String errorMessage) throws IOException {
+        if (errorMessage == null || !errorMessage.startsWith("NOT_LEADER:")) {
+            return false;
+        }
+
+        String leader = errorMessage.substring("NOT_LEADER:".length());
+        if (!"UNKNOWN".equals(leader)) {
+            String[] parts = leader.split(":");
+            if (parts.length == 2) {
+                try {
+                    this.host = parts[0];
+                    this.port = Integer.parseInt(parts[1]);
+                    closeConnection();
+                    connect();
+                    logger.info("Redirected to leader {}:{}", host, port);
+                    return true;
+                } catch (NumberFormatException e) {
+                    // Fall through to reconnect cycling.
+                }
+            }
+        }
+
+        reconnect();
+        return true;
+    }
+
     // -------------------------------------------------------------------------
     // Subscribe (now fetches offset from broker)
     // -------------------------------------------------------------------------
@@ -278,6 +308,10 @@ public class DRMQConsumer implements AutoCloseable {
      * Returns 0 if no offset has been committed yet.
      */
     private long fetchOffsetFromBroker(String topic) throws IOException {
+        return fetchOffsetFromBroker(topic, true);
+    }
+
+    private long fetchOffsetFromBroker(String topic, boolean allowRetry) throws IOException {
         FetchOffsetRequest request = FetchOffsetRequest.newBuilder()
                 .setConsumerGroup(consumerGroup)
                 .setTopic(topic)
@@ -294,6 +328,9 @@ public class DRMQConsumer implements AutoCloseable {
         FetchOffsetResponse response = FetchOffsetResponse.parseFrom(responseEnvelope.getPayload());
 
         if (!response.getSuccess()) {
+            if (allowRetry && tryRedirectToLeader(response.getErrorMessage())) {
+                return fetchOffsetFromBroker(topic, false);
+            }
             logger.warn("Failed to fetch offset from broker for topic '{}': {}", topic, response.getErrorMessage());
             return 0L;
         }
@@ -306,6 +343,10 @@ public class DRMQConsumer implements AutoCloseable {
      * Push the current offset for this group/topic to the broker.
      */
     private void commitOffsetToBroker(String topic, long offset) throws IOException {
+        commitOffsetToBroker(topic, offset, true);
+    }
+
+    private void commitOffsetToBroker(String topic, long offset, boolean allowRetry) throws IOException {
         CommitOffsetRequest request = CommitOffsetRequest.newBuilder()
                 .setConsumerGroup(consumerGroup)
                 .setTopic(topic)
@@ -323,6 +364,10 @@ public class DRMQConsumer implements AutoCloseable {
         CommitOffsetResponse response = CommitOffsetResponse.parseFrom(responseEnvelope.getPayload());
 
         if (!response.getSuccess()) {
+            if (allowRetry && tryRedirectToLeader(response.getErrorMessage())) {
+                commitOffsetToBroker(topic, offset, false);
+                return;
+            }
             logger.warn("Failed to commit offset {} for topic '{}': {}", offset, topic, response.getErrorMessage());
         } else {
             logger.debug("Committed offset {} for topic '{}' to broker", offset, topic);
@@ -338,6 +383,11 @@ public class DRMQConsumer implements AutoCloseable {
     }
 
     private List<ConsumedMessage> fetchMessages(String topic, long fromOffset, int maxMessages, long timeoutMs) throws IOException {
+        return fetchMessages(topic, fromOffset, maxMessages, timeoutMs, true);
+    }
+
+    private List<ConsumedMessage> fetchMessages(String topic, long fromOffset, int maxMessages, long timeoutMs,
+                                                boolean allowRetry) throws IOException {
         ConsumeRequest request = ConsumeRequest.newBuilder()
                 .setTopic(topic)
                 .setFromOffset(fromOffset)
@@ -356,6 +406,9 @@ public class DRMQConsumer implements AutoCloseable {
         ConsumeResponse response = ConsumeResponse.parseFrom(responseEnvelope.getPayload());
 
         if (!response.getSuccess()) {
+            if (allowRetry && tryRedirectToLeader(response.getErrorMessage())) {
+                return fetchMessages(topic, fromOffset, maxMessages, timeoutMs, false);
+            }
             throw new IOException("Consume failed: " + response.getErrorMessage());
         }
 

@@ -34,8 +34,8 @@ public class BrokerServer {
     private final MessageStore messageStore;
     private final LogManager logManager;
     private final OffsetManager offsetManager;
-    private final RaftNode raftNode;       // null in single-node mode
-    private final List<RaftPeer> raftPeers; // empty in single-node mode
+    private final RaftNode raftNode;       
+    private final List<RaftPeer> raftPeers; 
     private final List<ClientHandler> activeHandlers = new ArrayList<>();
 
     private ServerSocket serverSocket;

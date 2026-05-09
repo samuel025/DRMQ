@@ -82,12 +82,10 @@ public class OffsetManager {
         logger.info("Loaded {} consumer offset(s) from {}", offsets.size(), offsetsFile);
     }
 
-    /** Flush all offsets to disk atomically (write to tmp then rename). */
     private void persist() throws IOException {
         Properties props = new Properties();
         offsets.forEach((k, v) -> props.setProperty(k, String.valueOf(v)));
 
-        // Write to a temp file first, then atomically rename to avoid corruption
         Path tmp = offsetsFile.resolveSibling(OFFSETS_FILE + ".tmp");
         try (OutputStream out = Files.newOutputStream(tmp,
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {

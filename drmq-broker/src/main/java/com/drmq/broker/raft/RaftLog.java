@@ -20,22 +20,14 @@ import java.util.List;
  *
  * Indexing: The Raft log is 1-indexed (index 0 is a sentinel meaning "no entry").
  * Internally, entries are stored in a 0-indexed ArrayList, so raft index N maps
- * to list index N-1.
- *
- * File format: [4-byte length][serialized RaftEntry protobuf] repeated.
- * Same length-prefixed framing as the message WAL (LogSegment).
- *
- * Crash safety:
- * - Every append is followed by fsync (durability before returning)
- * - Truncation uses setLength() to the byte offset of the first removed entry,
- *   which is atomic on most filesystems (Raft §5.3)
+ * to list index N-1. 
  */
 public class RaftLog {
     private static final Logger logger = LoggerFactory.getLogger(RaftLog.class);
 
     private final Path logPath;
-    private final List<RaftEntry> entries;       // In-memory copy; 0-indexed (entry at list index i has raft index i+1)
-    private final List<Long> filePositions;      // Byte offset of each entry in the file (parallel to entries)
+    private final List<RaftEntry> entries;       
+    private final List<Long> filePositions;     
     private RandomAccessFile raf;
 
     public RaftLog(Path dataDir) throws IOException {
@@ -94,7 +86,7 @@ public class RaftLog {
         byte[] data = entry.toByteArray();
         raf.writeInt(data.length);
         raf.write(data);
-        raf.getFD().sync();  // Durability: fsync after every append
+        raf.getFD().sync(); 
         entries.add(entry);
         filePositions.add(entryStart);
         logger.debug("Appended raft entry: index={}, term={}", entry.getIndex(), entry.getTerm());
@@ -156,14 +148,14 @@ public class RaftLog {
 
     /**
      * Truncate all entries from the given index onwards (inclusive).
-     * Used when a follower detects conflicting entries from a new leader (Raft §5.3).
+     * Used when a follower detects conflicting entries from a new leader .
      *
      * Crash-safe: uses setLength() to truncate the file to the byte position
      * of the first removed entry, which is atomic on most filesystems.
      */
     public synchronized void truncateFrom(long fromIndex) throws IOException {
         if (fromIndex < 1 || fromIndex > entries.size()) {
-            return; // Nothing to truncate
+            return;
         }
 
         int removeFromListIndex = (int) (fromIndex - 1);
@@ -172,12 +164,9 @@ public class RaftLog {
         logger.warn("Truncating raft log from index {} (removing {} entries, truncating file to byte {})",
                 fromIndex, entries.size() - removeFromListIndex, truncateToPosition);
 
-        // Truncate the file to the byte offset of the first removed entry.
-        // This is atomic on most filesystems — no data is rewritten.
         raf.setLength(truncateToPosition);
         raf.getFD().sync();
 
-        // Remove from in-memory lists
         entries.subList(removeFromListIndex, entries.size()).clear();
         filePositions.subList(removeFromListIndex, filePositions.size()).clear();
     }

@@ -26,12 +26,15 @@ public class RaftPeer {
     private static final Logger logger = LoggerFactory.getLogger(RaftPeer.class);
     private static final int CONNECT_TIMEOUT_MS = 1000;
     private static final int READ_TIMEOUT_MS = 2000;
+    private static final long LOG_RATE_LIMIT_MS = 1000;  // Max 1 log per second per failure type
 
     private final PeerAddress address;
     private Socket socket;
     private DataInputStream in;
     private DataOutputStream out;
     private final Object lock = new Object();
+    private long lastRequestVoteFailureLogTime = 0;
+    private long lastAppendEntriesFailureLogTime = 0;
 
     public RaftPeer(PeerAddress address) {
         this.address = address;
@@ -51,7 +54,6 @@ public class RaftPeer {
         socket.setSoTimeout(READ_TIMEOUT_MS);
         in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
         out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
-        logger.debug("Connected to peer {}", address);
     }
 
     /**
@@ -73,8 +75,12 @@ public class RaftPeer {
                 return RequestVoteResponse.parseFrom(response.getPayload());
 
             } catch (Exception e) {
-                logger.debug("RequestVote to {} failed: {}", address, e.getMessage());
                 close();
+                long now = System.currentTimeMillis();
+                if ((now - lastRequestVoteFailureLogTime) >= LOG_RATE_LIMIT_MS) {
+                    logger.debug("RequestVote to {} failed: {}", address, e.getMessage());
+                    lastRequestVoteFailureLogTime = now;
+                }
                 return RequestVoteResponse.newBuilder()
                         .setTerm(0)
                         .setVoteGranted(false)
@@ -102,8 +108,12 @@ public class RaftPeer {
                 return AppendEntriesResponse.parseFrom(response.getPayload());
 
             } catch (Exception e) {
-                logger.debug("AppendEntries to {} failed: {}", address, e.getMessage());
                 close();
+                long now = System.currentTimeMillis();
+                if ((now - lastAppendEntriesFailureLogTime) >= LOG_RATE_LIMIT_MS) {
+                    logger.debug("AppendEntries to {} failed: {}", address, e.getMessage());
+                    lastAppendEntriesFailureLogTime = now;
+                }
                 return AppendEntriesResponse.newBuilder()
                         .setTerm(0)
                         .setSuccess(false)

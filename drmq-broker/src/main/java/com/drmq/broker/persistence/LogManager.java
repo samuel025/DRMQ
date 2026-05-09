@@ -41,7 +41,6 @@ public class LogManager implements AutoCloseable {
      * Get or create a log segment for a topic.
      */
     public LogSegment getOrCreateSegment(String topic) throws IOException {
-        // Validate topic name to prevent path traversal and invalid characters
         if (topic.equals(".") || topic.equals("..")) {
             throw new IllegalArgumentException(
                 "Invalid topic name: '" + topic + "'. Topic names cannot be '.' or '..'");
@@ -58,9 +57,7 @@ public class LogManager implements AutoCloseable {
             return existing;
         }
         
-        // Create new segment (synchronized to avoid race conditions)
         synchronized (this) {
-            // Double-check after acquiring lock
             existing = topicSegments.get(topic);
             if (existing != null) {
                 return existing;
