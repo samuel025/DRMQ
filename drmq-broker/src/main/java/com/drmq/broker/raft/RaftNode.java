@@ -8,8 +8,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.*;
+import java.nio.channels.FileChannel;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
@@ -446,9 +449,6 @@ public class RaftNode {
     /**
      * Propose a new message to be replicated via Raft.
      * Blocks until the entry is committed (majority ACK) or fails.
-     *
-     * @return the committed Raft log index
-     * @throws IOException if not leader, or commitment fails
      */
     public long propose(String topic, byte[] payload, String key, long timestamp) throws IOException {
         lock.lock();
@@ -700,26 +700,51 @@ public class RaftNode {
 
 
     private void savePersistentState() {
+        Path tempPath = null;
         try {
             Properties props = new Properties();
             props.setProperty("currentTerm", String.valueOf(currentTerm));
             props.setProperty("votedFor", votedFor != null ? votedFor : "");
             props.setProperty("lastApplied", String.valueOf(lastApplied));
-            try (FileOutputStream fos = new FileOutputStream(stateFilePath.toFile())) {
+            tempPath = Files.createTempFile(stateFilePath.getParent(), stateFilePath.getFileName().toString(), ".tmp");
+            try (FileOutputStream fos = new FileOutputStream(tempPath.toFile())) {
                 props.store(fos, "Raft persistent state");
                 fos.getFD().sync();  
             }
+
+            try {
+                Files.move(tempPath, stateFilePath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException e) {
+                Files.move(tempPath, stateFilePath, StandardCopyOption.REPLACE_EXISTING);
+            }
+
+            Path parentDir = stateFilePath.getParent();
+            if (parentDir != null) {
+                try (FileChannel dirChannel = FileChannel.open(parentDir, StandardOpenOption.READ)) {
+                    dirChannel.force(true);
+                }
+            }
         } catch (IOException e) {
             logger.error("[{}] Failed to save persistent state", nodeId, e);
+        } finally {
+            if (tempPath != null) {
+                try {
+                    Files.deleteIfExists(tempPath);
+                } catch (IOException ignored) {
+                }
+            }
         }
     }
 
-    private void loadPersistentState() {
+    private void loadPersistentState() throws IOException {
         if (!Files.exists(stateFilePath)) {
             currentTerm = 0;
             votedFor = null;
+            lastApplied = 0;
+            commitIndex = Math.min(raftLog.getLastIndex(), Math.max(commitIndex, lastApplied));
             return;
         }
+
         try {
             Properties props = new Properties();
             try (InputStream in = new FileInputStream(stateFilePath.toFile())) {
@@ -729,15 +754,11 @@ public class RaftNode {
             String vf = props.getProperty("votedFor", "");
             votedFor = vf.isEmpty() ? null : vf;
             lastApplied = Long.parseLong(props.getProperty("lastApplied", "0"));
-            commitIndex = Math.max(commitIndex, lastApplied);
+            commitIndex = Math.min(raftLog.getLastIndex(), Math.max(commitIndex, lastApplied));
             logger.info("[{}] Loaded persistent state: term={}, votedFor={}, lastApplied={}",
                     nodeId, currentTerm, votedFor, lastApplied);
-        } catch (IOException e) {
-            logger.error("[{}] Failed to load persistent state, starting fresh", nodeId, e);
-            currentTerm = 0;
-            votedFor = null;
-            lastApplied = 0;
-            commitIndex = Math.max(commitIndex, lastApplied);
+        } catch (IOException | NumberFormatException e) {
+            throw new IOException("Failed to load persistent state", e);
         }
     }
 
