@@ -39,10 +39,18 @@ public class DRMQProducer implements AutoCloseable {
      * Create a producer targeting a single broker.
      */
     public DRMQProducer(String host, int port) {
-        this.host = host;
-        this.port = port;
-        this.bootstrapServers = new ArrayList<>();
-        this.bootstrapServers.add(new String[]{host, String.valueOf(port)});
+        List<String[]> parsed = host != null && host.contains(",") ? parseBootstrapServers(host) : List.of();
+        if (!parsed.isEmpty()) {
+            this.bootstrapServers = new ArrayList<>(parsed);
+            this.host = bootstrapServers.get(0)[0];
+            this.port = Integer.parseInt(bootstrapServers.get(0)[1]);
+            logger.warn("Comma-separated bootstrap list passed as host; using parsed servers and ignoring port {}", port);
+        } else {
+            this.host = host;
+            this.port = port;
+            this.bootstrapServers = new ArrayList<>();
+            this.bootstrapServers.add(new String[]{host, String.valueOf(port)});
+        }
     }
 
     /**
@@ -53,18 +61,26 @@ public class DRMQProducer implements AutoCloseable {
      * If it connects to a follower, it will auto-redirect to the leader.
      */
     public DRMQProducer(String bootstrapServersStr) {
-        this.bootstrapServers = new ArrayList<>();
-        for (String server : bootstrapServersStr.split(",")) {
-            String[] parts = server.trim().split(":");
-            if (parts.length == 2) {
-                bootstrapServers.add(parts);
-            }
-        }
+        this.bootstrapServers = new ArrayList<>(parseBootstrapServers(bootstrapServersStr));
         if (bootstrapServers.isEmpty()) {
             throw new IllegalArgumentException("No valid bootstrap servers: " + bootstrapServersStr);
         }
         this.host = bootstrapServers.get(0)[0];
         this.port = Integer.parseInt(bootstrapServers.get(0)[1]);
+    }
+
+    private static List<String[]> parseBootstrapServers(String bootstrapServersStr) {
+        List<String[]> parsed = new ArrayList<>();
+        if (bootstrapServersStr == null || bootstrapServersStr.isBlank()) {
+            return parsed;
+        }
+        for (String server : bootstrapServersStr.split(",")) {
+            String[] parts = server.trim().split(":");
+            if (parts.length == 2) {
+                parsed.add(parts);
+            }
+        }
+        return parsed;
     }
 
     /**
@@ -78,8 +94,16 @@ public class DRMQProducer implements AutoCloseable {
      * Connect to the broker.
      */
     public void connect() throws IOException {
-        if (connected) {
+        ensureConnectedWithRetry();
+    }
+
+    private void connectInternal() throws IOException {
+        if (connected && socket != null && !socket.isClosed()) {
             return;
+        }
+        connected = false;
+        if (socket != null && !socket.isClosed()) {
+            closeConnection();
         }
 
         socket = new Socket(host, port);
@@ -89,6 +113,44 @@ public class DRMQProducer implements AutoCloseable {
 
         logger.info("Connected to broker at {}:{}", host, port);
     }
+
+    /**
+     * Ensures connected state with automatic retries across all bootstrap servers.
+     * Tries to connect to the current broker, and if that fails, cycles through
+     * all bootstrap servers before giving up.
+     */
+    private void ensureConnectedWithRetry() throws IOException {
+        if (connected && socket != null && !socket.isClosed()) {
+            return;
+        }
+        if (socket != null && socket.isClosed()) {
+            closeConnection();
+        }
+
+        IOException lastException = null;
+        int totalAttempts = MAX_RETRIES * bootstrapServers.size();
+
+        for (int attempt = 0; attempt < totalAttempts; attempt++) {
+            try {
+                connectInternal();
+                return;  // Success
+            } catch (IOException e) {
+                logger.debug("Connection to {}:{} failed (attempt {}/{}): {}",
+                        host, port, attempt + 1, totalAttempts, e.getMessage());
+                lastException = e;
+                closeConnection();
+                rotateToNextServer();
+                try { Thread.sleep(RECONNECT_DELAY_MS); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted during connection retry", ie);
+                }
+            }
+        }
+
+        throw new IOException("Failed to connect after " + totalAttempts + " attempts: " +
+                (lastException != null ? lastException.getMessage() : "unknown error"));
+    }
+
 
     /**
      * Send a message to the specified topic.
@@ -117,6 +179,10 @@ public class DRMQProducer implements AutoCloseable {
      * @return The result containing the assigned offset or error
      */
     public SendResult send(String topic, byte[] payload, String key) throws IOException {
+        return sendWithRetry(topic, payload, key, MAX_RETRIES);
+    }
+
+    private SendResult sendWithRetry(String topic, byte[] payload, String key, int retriesLeft) throws IOException {
         // Build the produce request
         ProduceRequest.Builder requestBuilder = ProduceRequest.newBuilder()
                 .setTopic(topic)
@@ -135,27 +201,13 @@ public class DRMQProducer implements AutoCloseable {
                 .setPayload(request.toByteString())
                 .build();
 
-        // Retry loop: handles broken connections, tries other bootstrap servers
         IOException lastException = null;
-        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-            if (!connected) {
-                try {
-                    connect();
-                } catch (IOException e) {
-                    logger.warn("Connection to {}:{} failed (attempt {}/{}): {}",
-                            host, port, attempt + 1, MAX_RETRIES, e.getMessage());
-                    lastException = e;
-                    // Try the next bootstrap server
-                    rotateToNextServer();
-                    try { Thread.sleep(RECONNECT_DELAY_MS); } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        throw new IOException("Interrupted during reconnect", ie);
-                    }
-                    continue;
-                }
-            }
+        int totalAttempts = MAX_RETRIES * bootstrapServers.size();
 
+        for (int attempt = 0; attempt < totalAttempts; attempt++) {
             try {
+                ensureConnectedWithRetry();
+
                 // Send and receive (synchronized for thread safety)
                 synchronized (sendLock) {
                     byte[] envelopeBytes = envelope.toByteArray();
@@ -181,7 +233,26 @@ public class DRMQProducer implements AutoCloseable {
                             String leaderAddr = errorMsg.substring("NOT_LEADER:".length());
                             if (!leaderAddr.equals("UNKNOWN")) {
                                 logger.info("Redirected to leader: {}", leaderAddr);
-                                return redirectToLeader(leaderAddr, topic, payload, key);
+                                try {
+                                    redirectToLeader(leaderAddr);
+                                    // Retry the send to the leader
+                                    continue;
+                                } catch (IOException e) {
+                                    logger.warn("Failed to redirect to leader {}: {}", leaderAddr, e.getMessage());
+                                    lastException = e;
+                                    closeConnection();
+                                    rotateToNextServer();
+                                }
+                            } else {
+                                logger.info("Leader unknown, rotating to next bootstrap server");
+                                lastException = new IOException("Leader unknown");
+                                closeConnection();
+                                rotateToNextServer();
+                                try { Thread.sleep(RECONNECT_DELAY_MS); } catch (InterruptedException ie) {
+                                    Thread.currentThread().interrupt();
+                                    throw new IOException("Interrupted during leader-unknown retry", ie);
+                                }
+                                continue;
                             }
                         }
                         logger.warn("Message send failed: {}", errorMsg);
@@ -191,19 +262,20 @@ public class DRMQProducer implements AutoCloseable {
             } catch (IOException e) {
                 // Connection is broken (leader crashed, network issue, etc.)
                 logger.warn("Connection lost to {}:{} (attempt {}/{}): {}",
-                        host, port, attempt + 1, MAX_RETRIES, e.getMessage());
+                        host, port, attempt + 1, totalAttempts, e.getMessage());
                 lastException = e;
                 closeConnection();
                 // Try the next bootstrap server
                 rotateToNextServer();
                 // Brief pause to allow new leader election
-                try { Thread.sleep(500); } catch (InterruptedException ie) {
+                try { Thread.sleep(RECONNECT_DELAY_MS); } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
-                    throw new IOException("Interrupted during reconnect", ie);
+                    throw new IOException("Interrupted during send retry", ie);
                 }
             }
         }
-        throw new IOException("Failed after " + MAX_RETRIES + " attempts: " +
+
+        throw new IOException("Failed to send after " + totalAttempts + " attempts: " +
                 (lastException != null ? lastException.getMessage() : "unknown error"));
     }
 
@@ -219,27 +291,43 @@ public class DRMQProducer implements AutoCloseable {
         logger.info("Switching to next broker: {}:{}", host, port);
     }
 
+    private void syncServerIndexToCurrent() {
+        for (int i = 0; i < bootstrapServers.size(); i++) {
+            String[] server = bootstrapServers.get(i);
+            if (server.length != 2) {
+                continue;
+            }
+            try {
+                int serverPort = Integer.parseInt(server[1]);
+                if (server[0].equals(host) && serverPort == port) {
+                    currentServerIndex = i;
+                    return;
+                }
+            } catch (NumberFormatException ignored) {
+            }
+        }
+    }
+
     /**
-     * Reconnect to the leader broker and retry the produce request.
+     * Reconnect to the leader broker.
      */
-    private SendResult redirectToLeader(String leaderAddr, String topic, byte[] payload, String key) throws IOException {
+    private void redirectToLeader(String leaderAddr) throws IOException {
         String[] parts = leaderAddr.split(":");
         if (parts.length != 2) {
-            return SendResult.failure("Invalid leader address: " + leaderAddr);
+            throw new IOException("Invalid leader address: " + leaderAddr);
         }
 
-        // Close current connection
+        try {
+            int leaderPort = Integer.parseInt(parts[1]);
+            this.host = parts[0];
+            this.port = leaderPort;
+            syncServerIndexToCurrent();
+        } catch (NumberFormatException e) {
+            throw new IOException("Invalid port in leader address: " + leaderAddr, e);
+        }
+
         closeConnection();
-
-        // Reconnect to leader
-        this.host = parts[0];
-        this.port = Integer.parseInt(parts[1]);
-        this.connected = false;
-
-        logger.info("Reconnecting to leader at {}:{}", host, port);
-
-        // Retry
-        return send(topic, payload, key);
+        logger.info("Redirected to leader at {}:{}", host, port);
     }
 
     /**
