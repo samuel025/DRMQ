@@ -130,6 +130,7 @@ class BootstrapServerFailoverTest {
         Thread.sleep(300);
         // Message should exist on at least the leader (and be replicated)
         BrokerServer leader = findLeader();
+        assertNotNull(leader);
         assertTrue(leader.getMessageStore().getMessageCount("bootstrap-test") > 0);
     }
 
@@ -227,6 +228,7 @@ class BootstrapServerFailoverTest {
         startCluster();
 
         BrokerServer leader = findLeader();
+        assertNotNull(leader);
 
         // Produce some messages
         try (DRMQProducer producer = new DRMQProducer("localhost", leader.getPort())) {
@@ -253,6 +255,7 @@ class BootstrapServerFailoverTest {
         startCluster();
 
         BrokerServer leader = findLeader();
+        assertNotNull(leader);
 
         // Produce some messages
         try (DRMQProducer producer = new DRMQProducer("localhost", leader.getPort())) {
@@ -292,6 +295,7 @@ class BootstrapServerFailoverTest {
         startCluster();
 
         BrokerServer leader = findLeader();
+        assertNotNull(leader);
 
         // Produce initial messages
         try (DRMQProducer producer = new DRMQProducer("localhost", leader.getPort())) {
