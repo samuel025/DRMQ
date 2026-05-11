@@ -16,6 +16,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -120,8 +121,13 @@ public class BrokerServer {
                 Socket clientSocket = serverSocket.accept();
                 ClientHandler handler = new ClientHandler(clientSocket, messageStore, offsetManager, raftNode, activeHandlers);
                 activeHandlers.add(handler);
-
-                executor.submit(handler);
+                try {
+                    executor.submit(handler);
+                } catch (RejectedExecutionException e) {
+                    activeHandlers.remove(handler);
+                    handler.stop();
+                    logger.debug("Rejected handler submission during shutdown", e);
+                }
             } catch (IOException e) {
                 if (running) {
                     logger.error("Error accepting connection", e);

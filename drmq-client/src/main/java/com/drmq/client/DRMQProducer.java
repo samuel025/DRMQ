@@ -43,8 +43,9 @@ public class DRMQProducer implements AutoCloseable {
         List<String[]> parsed = host != null && host.contains(",") ? parseBootstrapServers(host) : List.of();
         if (!parsed.isEmpty()) {
             this.bootstrapServers = new ArrayList<>(parsed);
-            this.host = bootstrapServers.get(0)[0];
-            this.port = Integer.parseInt(bootstrapServers.get(0)[1]);
+            this.currentServerIndex = ThreadLocalRandom.current().nextInt(bootstrapServers.size());
+            this.host = bootstrapServers.get(currentServerIndex)[0];
+            this.port = Integer.parseInt(bootstrapServers.get(currentServerIndex)[1]);
             logger.warn("Comma-separated bootstrap list passed as host; using parsed servers and ignoring port {}", port);
         } else {
             this.host = host;
