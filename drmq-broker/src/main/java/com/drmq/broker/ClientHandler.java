@@ -7,6 +7,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.*;
 import java.net.Socket;
+import java.util.Set;
 
 /**
  * Handles a single client connection to the broker.
@@ -25,13 +26,20 @@ public class ClientHandler implements Runnable {
     private final MessageStore messageStore;
     private final OffsetManager offsetManager;
     private final RaftNode raftNode;  // null in single-node mode
+    private final Set<ClientHandler> ownerSet;  // for self-removal on disconnect
     private volatile boolean running = true;
 
-    public ClientHandler(Socket socket, MessageStore messageStore, OffsetManager offsetManager, RaftNode raftNode) {
+    public ClientHandler(Socket socket, MessageStore messageStore, OffsetManager offsetManager,
+                         RaftNode raftNode, Set<ClientHandler> ownerSet) {
         this.socket = socket;
         this.messageStore = messageStore;
         this.offsetManager = offsetManager;
         this.raftNode = raftNode;
+        this.ownerSet = ownerSet;
+    }
+
+    public ClientHandler(Socket socket, MessageStore messageStore, OffsetManager offsetManager, RaftNode raftNode) {
+        this(socket, messageStore, offsetManager, raftNode, null);
     }
 
     /** Backward-compatible constructor for single-node mode */
@@ -76,6 +84,9 @@ public class ClientHandler implements Runnable {
                 logger.error("Error handling client {}: {}", clientAddress, e.getMessage());
             }
         } finally {
+            if (ownerSet != null) {
+                ownerSet.remove(this);
+            }
             closeSocket();
         }
     }
@@ -151,12 +162,6 @@ public class ClientHandler implements Runnable {
             long fromOffset   = request.getFromOffset();
             int maxMessages   = request.getMaxMessages();
             long timeoutMs    = request.getTimeoutMs(); // 0 = short poll
-
-            if (raftNode != null && !raftNode.isLeader()) {
-                String leaderAddr = raftNode.getLeaderAddress();
-                return createConsumeErrorResponse("NOT_LEADER:" +
-                        (leaderAddr != null ? leaderAddr : "UNKNOWN"));
-            }
 
             // Fetch messages — uses efficient wait/notify for long-polling (no thread sleep-loop)
             var messages = (timeoutMs > 0)
