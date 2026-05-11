@@ -68,6 +68,7 @@ public class RaftNode {
 
     private final ReentrantLock lock = new ReentrantLock();
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
+    private final ExecutorService raftExecutor;
     private ScheduledFuture<?> electionTimer;
     private ScheduledFuture<?> heartbeatTimer;
     private volatile boolean running = false;
@@ -91,6 +92,14 @@ public class RaftNode {
         this.lastApplied = 0;
         this.nextIndex = new ConcurrentHashMap<>();
         this.matchIndex = new ConcurrentHashMap<>();
+        // Size the pool to handle concurrent RPCs to all peers + a small buffer
+        this.raftExecutor = Executors.newFixedThreadPool(
+                Math.max(4, peers.size() + 2),
+                r -> {
+                    Thread t = new Thread(r, "raft-rpc-" + nodeId);
+                    t.setDaemon(true);
+                    return t;
+                });
 
         Path raftDir = dataDir.resolve("raft");
         Files.createDirectories(raftDir);
@@ -123,6 +132,7 @@ public class RaftNode {
         if (electionTimer != null) electionTimer.cancel(false);
         if (heartbeatTimer != null) heartbeatTimer.cancel(false);
         scheduler.shutdownNow();
+        raftExecutor.shutdownNow();
 
         pendingProposals.values().forEach(f -> f.completeExceptionally(
                 new IOException("Raft node shutting down")));
@@ -210,7 +220,7 @@ public class RaftNode {
                     } catch (Exception e) {
                         return null;
                     }
-                }).thenAccept(response -> {
+                }, raftExecutor).thenAcceptAsync(response -> {
                     if (response == null) return;
                     lock.lock();
                     try {
@@ -290,7 +300,7 @@ public class RaftNode {
         if (state != RaftState.LEADER || !running) return;
 
         for (PeerAddress peer : peers) {
-            CompletableFuture.runAsync(() -> replicateTo(peer));
+            CompletableFuture.runAsync(() -> replicateTo(peer), raftExecutor);
         }
     }
 
@@ -393,8 +403,11 @@ public class RaftNode {
      * unblocks the client thread that is waiting for Raft commitment.
      */
     private void applyCommitted() {
+        boolean applied = false;
+
         while (lastApplied < commitIndex) {
             lastApplied++;
+            applied = true;
             RaftEntry entry = raftLog.getEntry(lastApplied);
             if (entry == null) {
                 logger.error("[{}] Missing raft entry at index {} during apply", nodeId, lastApplied);
@@ -435,13 +448,14 @@ public class RaftNode {
                         nodeId, lastApplied, entry.getCommandType(), e);
             }
 
-            savePersistentState();
-
-            // Complete the future that propose() is blocking on — this unblocks the client thread
             CompletableFuture<Long> future = pendingProposals.remove(lastApplied);
             if (future != null) {
                 future.complete(completionValue);
             }
+        }
+
+        if (applied) {
+            savePersistentState();
         }
     }
 

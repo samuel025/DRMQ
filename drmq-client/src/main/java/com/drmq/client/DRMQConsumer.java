@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * DRMQ Consumer client for reading messages from topics.
@@ -35,9 +36,7 @@ public class DRMQConsumer implements AutoCloseable {
     private int port;
     /**
      * Consumer Identifier used for offset tracking on the broker
-     * Note: Unlike existing queues like kafka, DRMQ does not support multiple
-     * consumers per consumer group. Each group name should be used by a single consumer
-     * instance to avoid offset conflicts.
+     * Note: DRMQ does not support multiple consumers per consumer group. Each group name should be used by a single consumer instance to avoid offset conflicts.
      */
     private final String consumerGroup;
     private final List<String[]> bootstrapServers;
@@ -48,13 +47,10 @@ public class DRMQConsumer implements AutoCloseable {
     private DataOutputStream outputStream;
     private volatile boolean connected = false;
 
-    // Local cache of current offset per topic (source of truth is the broker)
     private final Map<String, Long> topicOffsets = new HashMap<>();
     private final Object pollLock = new Object();
 
-    // -------------------------------------------------------------------------
-    // Constructors
-    // -------------------------------------------------------------------------
+
 
     public DRMQConsumer() {
         this("localhost", DEFAULT_PORT, DEFAULT_CONSUMER_GROUP);
@@ -73,8 +69,9 @@ public class DRMQConsumer implements AutoCloseable {
         List<String[]> parsed = host != null && host.contains(",") ? parseBootstrapServers(host) : List.of();
         if (!parsed.isEmpty()) {
             this.bootstrapServers = new ArrayList<>(parsed);
-            this.host = bootstrapServers.get(0)[0];
-            this.port = Integer.parseInt(bootstrapServers.get(0)[1]);
+            this.currentServerIndex = ThreadLocalRandom.current().nextInt(bootstrapServers.size());
+            this.host = bootstrapServers.get(currentServerIndex)[0];
+            this.port = Integer.parseInt(bootstrapServers.get(currentServerIndex)[1]);
             logger.warn("Comma-separated bootstrap list passed as host; using parsed servers and ignoring port {}", port);
         } else {
             this.host = host;
@@ -94,8 +91,9 @@ public class DRMQConsumer implements AutoCloseable {
         if (bootstrapServers.isEmpty()) {
             throw new IllegalArgumentException("No valid bootstrap servers: " + bootstrapServersStr);
         }
-        this.host = bootstrapServers.get(0)[0];
-        this.port = Integer.parseInt(bootstrapServers.get(0)[1]);
+        this.currentServerIndex = ThreadLocalRandom.current().nextInt(bootstrapServers.size());
+        this.host = bootstrapServers.get(currentServerIndex)[0];
+        this.port = Integer.parseInt(bootstrapServers.get(currentServerIndex)[1]);
     }
 
     private static List<String[]> parseBootstrapServers(String bootstrapServersStr) {
@@ -111,10 +109,6 @@ public class DRMQConsumer implements AutoCloseable {
         }
         return parsed;
     }
-
-    // -------------------------------------------------------------------------
-    // Connection
-    // -------------------------------------------------------------------------
 
     public void connect() throws IOException {
         ensureConnectedWithRetry();

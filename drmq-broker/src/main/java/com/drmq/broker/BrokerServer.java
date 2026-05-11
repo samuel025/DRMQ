@@ -12,8 +12,11 @@ import java.net.Socket;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -36,7 +39,7 @@ public class BrokerServer {
     private final OffsetManager offsetManager;
     private final RaftNode raftNode;       
     private final List<RaftPeer> raftPeers; 
-    private final List<ClientHandler> activeHandlers = new ArrayList<>();
+    private final Set<ClientHandler> activeHandlers = ConcurrentHashMap.newKeySet();
 
     private ServerSocket serverSocket;
     private volatile boolean running = false;
@@ -116,13 +119,15 @@ public class BrokerServer {
         while (running) {
             try {
                 Socket clientSocket = serverSocket.accept();
-                ClientHandler handler = new ClientHandler(clientSocket, messageStore, offsetManager, raftNode);
-
-                synchronized (activeHandlers) {
-                    activeHandlers.add(handler);
+                ClientHandler handler = new ClientHandler(clientSocket, messageStore, offsetManager, raftNode, activeHandlers);
+                activeHandlers.add(handler);
+                try {
+                    executor.submit(handler);
+                } catch (RejectedExecutionException e) {
+                    activeHandlers.remove(handler);
+                    handler.stop();
+                    logger.debug("Rejected handler submission during shutdown", e);
                 }
-
-                executor.submit(handler);
             } catch (IOException e) {
                 if (running) {
                     logger.error("Error accepting connection", e);
@@ -183,12 +188,10 @@ public class BrokerServer {
         }
 
         // Stop all active handlers
-        synchronized (activeHandlers) {
-            for (ClientHandler handler : activeHandlers) {
-                handler.stop();
-            }
-            activeHandlers.clear();
+        for (ClientHandler handler : activeHandlers) {
+            handler.stop();
         }
+        activeHandlers.clear();
 
         // Close LogManager
         try {
