@@ -281,17 +281,17 @@ public class MessageStore {
         logger.info("Message store memory state cleared");
     }
 
-    /**
-     * Bounded cache for messages with LRU eviction.
-     */
-    private static class BoundedMessageCache {
+
+     // Bounded cache for messages with FIFO eviction.
+        private static class BoundedMessageCache {
         private final int maxSize;
         private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
         private final LinkedHashMap<Long, StoredMessage> cache;
 
         public BoundedMessageCache(int maxSize) {
             this.maxSize = maxSize;
-            this.cache = new LinkedHashMap<Long, StoredMessage>(maxSize, 0.75f, true) {
+            // accessOrder=false: FIFO eviction, get() is NOT a structural modification
+            this.cache = new LinkedHashMap<Long, StoredMessage>(maxSize, 0.75f, false) {
                 @Override
                 protected boolean removeEldestEntry(Map.Entry<Long, StoredMessage> eldest) {
                     return size() > maxSize;
