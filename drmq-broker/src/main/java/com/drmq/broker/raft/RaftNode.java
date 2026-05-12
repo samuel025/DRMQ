@@ -1,6 +1,7 @@
 package com.drmq.broker.raft;
 
 import com.drmq.broker.BrokerConfig.PeerAddress;
+import com.drmq.broker.BrokerMetrics;
 import com.drmq.broker.MessageStore;
 import com.drmq.broker.OffsetManager;
 import com.drmq.protocol.DRMQProtocol.*;
@@ -72,6 +73,7 @@ public class RaftNode {
     private ScheduledFuture<?> electionTimer;
     private ScheduledFuture<?> heartbeatTimer;
     private volatile boolean running = false;
+    private volatile long electionStartNanos;
 
     // Flow: propose() creates a future here → applyCommitted() completes it when majority ACK
     private final Map<Long, CompletableFuture<Long>> pendingProposals = new ConcurrentHashMap<>();
@@ -188,6 +190,7 @@ public class RaftNode {
         try {
             if (!running) return;
 
+            electionStartNanos = System.nanoTime();
             currentTerm++;
             state = RaftState.CANDIDATE;
             votedFor = nodeId;
@@ -259,6 +262,8 @@ public class RaftNode {
         state = RaftState.LEADER;
         leaderId = nodeId;
 
+        long electionDuration = recordElectionDuration(true);
+
         long lastLogIndex = raftLog.getLastIndex();
         for (PeerAddress peer : peers) {
             nextIndex.put(peer.id(), lastLogIndex + 1);
@@ -267,7 +272,8 @@ public class RaftNode {
 
         if (electionTimer != null) electionTimer.cancel(false);
 
-        logger.info("[{}] ★ Became LEADER for term {} (lastLogIndex={})", nodeId, currentTerm, lastLogIndex);
+        logger.info("[{}] ★ Became LEADER for term {} (lastLogIndex={}, electionMs={})",
+            nodeId, currentTerm, lastLogIndex, electionDuration);
 
         // Send initial heartbeat immediately
         sendHeartbeats();
@@ -281,12 +287,17 @@ public class RaftNode {
      * Step down to FOLLOWER upon discovering a higher term.
      */
     private void stepDown(long newTerm) {
+        boolean wasCandidate = state == RaftState.CANDIDATE;
         logger.info("[{}] Stepping down: term {} → {}", nodeId, currentTerm, newTerm);
         currentTerm = newTerm;
         state = RaftState.FOLLOWER;
         votedFor = null;
         leaderId = null;
         savePersistentState();
+
+        if (wasCandidate) {
+            recordElectionDuration(false);
+        }
 
         if (heartbeatTimer != null) heartbeatTimer.cancel(false);
         resetElectionTimer();
@@ -800,5 +811,15 @@ public class RaftNode {
             }
         }
         return null;
+    }
+
+    private long recordElectionDuration(boolean won) {
+        if (electionStartNanos <= 0) {
+            return 0;
+        }
+        long durationNanos = System.nanoTime() - electionStartNanos;
+        electionStartNanos = 0;
+        BrokerMetrics.get().recordRaftElection(won, durationNanos);
+        return TimeUnit.NANOSECONDS.toMillis(durationNanos);
     }
 }

@@ -39,6 +39,7 @@ public class BrokerServer {
     private final OffsetManager offsetManager;
     private final RaftNode raftNode;       
     private final List<RaftPeer> raftPeers; 
+    private final BrokerMetrics metrics;
     private final Set<ClientHandler> activeHandlers = ConcurrentHashMap.newKeySet();
 
     private ServerSocket serverSocket;
@@ -54,6 +55,7 @@ public class BrokerServer {
         this.messageStore = new MessageStore(logManager);
         this.offsetManager = new OffsetManager(config.getDataDir());
         this.raftPeers = new ArrayList<>();
+        this.metrics = BrokerMetrics.init(config);
 
         if (config.isClusterMode()) {
             // Create RaftNode
@@ -79,6 +81,8 @@ public class BrokerServer {
             this.raftNode = null;
             logger.info("Single-node mode (no Raft)");
         }
+
+        metrics.registerBroker(activeHandlers, messageStore, offsetManager, logManager, raftNode);
     }
 
     /** Backward-compatible: single-node mode with port and threadPoolSize */
@@ -107,6 +111,8 @@ public class BrokerServer {
 
         serverSocket = new ServerSocket(config.getPort());
         running = true;
+
+        metrics.start();
 
         // Start Raft if in cluster mode
         if (raftNode != null) {
@@ -214,6 +220,7 @@ public class BrokerServer {
         }
 
         logger.info("Broker shutdown complete");
+        metrics.close();
     }
 
     public boolean isRunning() { return running; }

@@ -259,6 +259,18 @@ public class MessageStore {
         return new ArrayList<>(topicIndex.keySet());
     }
 
+    public int getTopicCount() {
+        return topicIndex.size();
+    }
+
+    public long getCachedMessageCount() {
+        long total = 0;
+        for (BoundedMessageCache cache : messageCache.values()) {
+            total += cache.size();
+        }
+        return total;
+    }
+
     public void clear() {
         topicIndex.clear();
         messageCache.clear();
@@ -316,6 +328,11 @@ public class MessageStore {
             }
             return result;
         }
+
+        public synchronized int size() {
+            return messageMap.size();
+        }
     }
+
 }
 

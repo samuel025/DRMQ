@@ -13,10 +13,8 @@ import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * DRMQ Producer client for sending messages to the broker.
- *
  * Supports bootstrap servers: provide multiple broker addresses so the producer
  * can automatically failover to another broker if the current one dies.
- *
  * Thread-safe: can be used by multiple threads to send messages concurrently.
  * Uses synchronous send with response waiting.
  */

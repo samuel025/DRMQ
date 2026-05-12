@@ -51,6 +51,7 @@ public class ClientHandler implements Runnable {
     public void run() {
         String clientAddress = socket.getRemoteSocketAddress().toString();
         logger.info("Client connected: {}", clientAddress);
+        BrokerMetrics.get().recordConnectionOpened();
 
         try (DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
              DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()))) {
@@ -88,6 +89,7 @@ public class ClientHandler implements Runnable {
                 ownerSet.remove(this);
             }
             closeSocket();
+            BrokerMetrics.get().recordConnectionClosed();
         }
     }
 
@@ -110,11 +112,14 @@ public class ClientHandler implements Runnable {
      * Handle a produce request - store the message and return the assigned offset.
      */
     private MessageEnvelope handleProduceRequest(MessageEnvelope envelope) throws IOException {
+        long startNanos = System.nanoTime();
+        long payloadBytes = 0;
         try {
             ProduceRequest request = ProduceRequest.parseFrom(envelope.getPayload());
 
             String topic = request.getTopic();
             byte[] payload = request.getPayload().toByteArray();
+            payloadBytes = payload.length;
             String key = request.hasKey() ? request.getKey() : null;
             long timestamp = request.getTimestamp();
 
@@ -138,6 +143,9 @@ public class ClientHandler implements Runnable {
                     .setOffset(offset)
                     .build();
 
+                BrokerMetrics.get().recordRequest("produce", true,
+                    System.nanoTime() - startNanos, payloadBytes, 1);
+
             return MessageEnvelope.newBuilder()
                     .setType(MessageType.PRODUCE_RESPONSE)
                     .setPayload(response.toByteString())
@@ -145,6 +153,8 @@ public class ClientHandler implements Runnable {
 
         } catch (Exception e) {
             logger.error("Error processing produce request", e);
+                BrokerMetrics.get().recordRequest("produce", false,
+                    System.nanoTime() - startNanos, payloadBytes, 1);
             return createProduceErrorResponse(e.getMessage());
         }
     }
@@ -155,6 +165,7 @@ public class ClientHandler implements Runnable {
      * until messages arrive or the timeout expires.
      */
     private MessageEnvelope handleConsumeRequest(MessageEnvelope envelope) throws IOException {
+        long startNanos = System.nanoTime();
         try {
             ConsumeRequest request = ConsumeRequest.parseFrom(envelope.getPayload());
 
@@ -176,6 +187,9 @@ public class ClientHandler implements Runnable {
                     .addAllMessages(messages)
                     .build();
 
+                BrokerMetrics.get().recordRequest("consume", true,
+                    System.nanoTime() - startNanos, estimatePayloadBytes(messages), messages.size());
+
             return MessageEnvelope.newBuilder()
                     .setType(MessageType.CONSUME_RESPONSE)
                     .setPayload(response.toByteString())
@@ -183,6 +197,8 @@ public class ClientHandler implements Runnable {
 
         } catch (Exception e) {
             logger.error("Error processing consume request", e);
+                BrokerMetrics.get().recordRequest("consume", false,
+                    System.nanoTime() - startNanos, 0, 0);
             return createConsumeErrorResponse(e.getMessage());
         }
     }
@@ -224,6 +240,7 @@ public class ClientHandler implements Runnable {
      * they survive leader failover. In single-node mode, offsets are persisted locally.
      */
     private MessageEnvelope handleCommitOffsetRequest(MessageEnvelope envelope) throws IOException {
+        long startNanos = System.nanoTime();
         try {
             CommitOffsetRequest request = CommitOffsetRequest.parseFrom(envelope.getPayload());
 
@@ -256,6 +273,9 @@ public class ClientHandler implements Runnable {
                     .setSuccess(true)
                     .build();
 
+                BrokerMetrics.get().recordRequest("commit_offset", true,
+                    System.nanoTime() - startNanos, 0, 0);
+
             return MessageEnvelope.newBuilder()
                     .setType(MessageType.COMMIT_OFFSET_RESPONSE)
                     .setPayload(response.toByteString())
@@ -263,6 +283,8 @@ public class ClientHandler implements Runnable {
 
         } catch (Exception e) {
             logger.error("Error committing offset", e);
+                BrokerMetrics.get().recordRequest("commit_offset", false,
+                    System.nanoTime() - startNanos, 0, 0);
             CommitOffsetResponse response = CommitOffsetResponse.newBuilder()
                     .setSuccess(false)
                     .setErrorMessage(e.getMessage() != null ? e.getMessage() : "Unknown error")
@@ -278,6 +300,7 @@ public class ClientHandler implements Runnable {
      * Handle a fetch offset request - return the committed offset for a consumer group.
      */
     private MessageEnvelope handleFetchOffsetRequest(MessageEnvelope envelope) throws IOException {
+        long startNanos = System.nanoTime();
         try {
             FetchOffsetRequest request = FetchOffsetRequest.parseFrom(envelope.getPayload());
 
@@ -292,6 +315,9 @@ public class ClientHandler implements Runnable {
                     .setOffset(offset)
                     .build();
 
+                BrokerMetrics.get().recordRequest("fetch_offset", true,
+                    System.nanoTime() - startNanos, 0, 0);
+
             return MessageEnvelope.newBuilder()
                     .setType(MessageType.FETCH_OFFSET_RESPONSE)
                     .setPayload(response.toByteString())
@@ -299,6 +325,8 @@ public class ClientHandler implements Runnable {
 
         } catch (Exception e) {
             logger.error("Error fetching offset", e);
+                BrokerMetrics.get().recordRequest("fetch_offset", false,
+                    System.nanoTime() - startNanos, 0, 0);
             FetchOffsetResponse response = FetchOffsetResponse.newBuilder()
                     .setSuccess(false)
                     .setOffset(-1)
@@ -327,11 +355,17 @@ public class ClientHandler implements Runnable {
      * Handle an incoming RequestVote RPC from a Raft candidate.
      */
     private MessageEnvelope handleRequestVoteRequest(MessageEnvelope envelope) throws IOException {
+        long startNanos = System.nanoTime();
         if (raftNode == null) {
+            BrokerMetrics.get().recordRaftRpc("request_vote", false,
+                    System.nanoTime() - startNanos);
             return createErrorResponse("Raft not enabled on this broker");
         }
         RequestVoteRequest request = RequestVoteRequest.parseFrom(envelope.getPayload());
         RequestVoteResponse response = raftNode.handleRequestVote(request);
+
+        BrokerMetrics.get().recordRaftRpc("request_vote", true,
+                System.nanoTime() - startNanos);
 
         return MessageEnvelope.newBuilder()
                 .setType(MessageType.REQUEST_VOTE_RESPONSE)
@@ -343,11 +377,17 @@ public class ClientHandler implements Runnable {
      * Handle an incoming AppendEntries RPC from the Raft leader.
      */
     private MessageEnvelope handleAppendEntriesRequest(MessageEnvelope envelope) throws IOException {
+        long startNanos = System.nanoTime();
         if (raftNode == null) {
+            BrokerMetrics.get().recordRaftRpc("append_entries", false,
+                    System.nanoTime() - startNanos);
             return createErrorResponse("Raft not enabled on this broker");
         }
         AppendEntriesRequest request = AppendEntriesRequest.parseFrom(envelope.getPayload());
         AppendEntriesResponse response = raftNode.handleAppendEntries(request);
+
+        BrokerMetrics.get().recordRaftRpc("append_entries", response.getSuccess(),
+                System.nanoTime() - startNanos);
 
         return MessageEnvelope.newBuilder()
                 .setType(MessageType.APPEND_ENTRIES_RESPONSE)
@@ -371,5 +411,13 @@ public class ClientHandler implements Runnable {
         } catch (IOException e) {
             logger.debug("Error closing socket", e);
         }
+    }
+
+    private static long estimatePayloadBytes(java.util.List<StoredMessage> messages) {
+        long total = 0;
+        for (StoredMessage message : messages) {
+            total += message.getPayload().size();
+        }
+        return total;
     }
 }

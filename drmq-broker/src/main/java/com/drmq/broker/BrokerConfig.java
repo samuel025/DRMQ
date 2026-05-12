@@ -16,23 +16,37 @@ public class BrokerConfig {
     private final int port;
     private final String dataDir;
     private final List<PeerAddress> peers;
+    private final boolean metricsEnabled;
+    private final int metricsPort;
+    private final String metricsPath;
 
-    public BrokerConfig(String nodeId, int port, String dataDir, List<PeerAddress> peers) {
+    public BrokerConfig(String nodeId, int port, String dataDir, List<PeerAddress> peers,
+                        boolean metricsEnabled, int metricsPort, String metricsPath) {
         this.nodeId = nodeId;
         this.port = port;
         this.dataDir = dataDir;
         this.peers = peers != null ? peers : List.of();
+        this.metricsEnabled = metricsEnabled;
+        this.metricsPort = metricsPort;
+        this.metricsPath = metricsPath != null ? metricsPath : "/metrics";
+    }
+
+    public BrokerConfig(String nodeId, int port, String dataDir, List<PeerAddress> peers) {
+        this(nodeId, port, dataDir, peers, true, 9096, "/metrics");
     }
 
     /** Single-node config (backward compatible) */
     public BrokerConfig(int port, String dataDir) {
-        this("standalone", port, dataDir, List.of());
+        this("standalone", port, dataDir, List.of(), true, 9096, "/metrics");
     }
 
     public String getNodeId() { return nodeId; }
     public int getPort() { return port; }
     public String getDataDir() { return dataDir; }
     public List<PeerAddress> getPeers() { return peers; }
+    public boolean isMetricsEnabled() { return metricsEnabled; }
+    public int getMetricsPort() { return metricsPort; }
+    public String getMetricsPath() { return metricsPath; }
 
     /** True if this broker is part of a Raft cluster */
     public boolean isClusterMode() {
@@ -47,12 +61,19 @@ public class BrokerConfig {
      *   --port <port>
      *   --data-dir <path>
      *   --peers <id:host:port,id:host:port,...>
+     *   --metrics-enabled <true|false>
+     *   --metrics-disabled
+     *   --metrics-port <port>
+     *   --metrics-path </metrics>
      */
     public static BrokerConfig fromArgs(String[] args) {
         String nodeId = "standalone";
         int port = BrokerServer.DEFAULT_PORT;
         String dataDir = BrokerServer.DEFAULT_DATA_DIR;
         List<PeerAddress> peers = new ArrayList<>();
+        boolean metricsEnabled = true;
+        int metricsPort = 9096;
+        String metricsPath = "/metrics";
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
@@ -65,6 +86,10 @@ public class BrokerConfig {
                         peers.add(PeerAddress.parse(peerStr));
                     }
                 }
+                case "--metrics-enabled" -> metricsEnabled = Boolean.parseBoolean(args[++i]);
+                case "--metrics-disabled" -> metricsEnabled = false;
+                case "--metrics-port" -> metricsPort = Integer.parseInt(args[++i]);
+                case "--metrics-path" -> metricsPath = args[++i];
                 default -> {
                     // Legacy support: first positional arg = port, second = dataDir
                     if (i == 0) {
@@ -80,7 +105,7 @@ public class BrokerConfig {
             }
         }
 
-        return new BrokerConfig(nodeId, port, dataDir, peers);
+        return new BrokerConfig(nodeId, port, dataDir, peers, metricsEnabled, metricsPort, metricsPath);
     }
 
     /**
