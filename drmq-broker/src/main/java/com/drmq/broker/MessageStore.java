@@ -10,11 +10,13 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Message storage for the broker.
@@ -284,53 +286,63 @@ public class MessageStore {
      */
     private static class BoundedMessageCache {
         private final int maxSize;
-        private final Map<Long, StoredMessage> messageMap = new ConcurrentHashMap<>();
-        private final java.util.Deque<Long> offsetQueue = new java.util.ArrayDeque<>();
+        private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+        private final LinkedHashMap<Long, StoredMessage> cache;
 
         public BoundedMessageCache(int maxSize) {
             this.maxSize = maxSize;
-        }
-
-        public synchronized void add(StoredMessage message) {
-            long offset = message.getOffset();
-            
-            if (messageMap.containsKey(offset)) {
-                return;
-            }
-            
-            if (offsetQueue.size() >= maxSize) {
-                Long oldestOffset = offsetQueue.pollFirst();
-                if (oldestOffset != null) {
-                    messageMap.remove(oldestOffset);
+            this.cache = new LinkedHashMap<Long, StoredMessage>(maxSize, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<Long, StoredMessage> eldest) {
+                    return size() > maxSize;
                 }
+            };
+        }
+
+        public void add(StoredMessage message) {
+            lock.writeLock().lock();
+            try {
+                long offset = message.getOffset();
+                cache.put(offset, message);
+            } finally {
+                lock.writeLock().unlock();
             }
-            
-            messageMap.put(offset, message);
-            offsetQueue.addLast(offset);
         }
 
-        public synchronized StoredMessage get(long offset) {
-            return messageMap.get(offset);
+        public StoredMessage get(long offset) {
+            lock.readLock().lock();
+            try {
+                return cache.get(offset);
+            } finally {
+                lock.readLock().unlock();
+            }
         }
 
-        public synchronized List<StoredMessage> getMessagesFrom(long fromOffset, int maxCount) {
-            List<StoredMessage> result = new ArrayList<>();
-            for (Long offset : offsetQueue) {
-                if (offset >= fromOffset) {
-                    StoredMessage msg = messageMap.get(offset);
-                    if (msg != null) {
-                        result.add(msg);
+        public List<StoredMessage> getMessagesFrom(long fromOffset, int maxCount) {
+            lock.readLock().lock();
+            try {
+                List<StoredMessage> result = new ArrayList<>();
+                for (Map.Entry<Long, StoredMessage> entry : cache.entrySet()) {
+                    if (entry.getKey() >= fromOffset) {
+                        result.add(entry.getValue());
                         if (result.size() >= maxCount) {
                             break;
                         }
                     }
                 }
+                return result;
+            } finally {
+                lock.readLock().unlock();
             }
-            return result;
         }
 
-        public synchronized int size() {
-            return messageMap.size();
+        public int size() {
+            lock.readLock().lock();
+            try {
+                return cache.size();
+            } finally {
+                lock.readLock().unlock();
+            }
         }
     }
 
