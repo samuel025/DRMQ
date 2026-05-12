@@ -243,6 +243,10 @@ public class MessageStore {
      * @return messages found
      */
     public List<StoredMessage> waitForMessages(String topic, long fromOffset, int maxCount, long timeoutMs) {
+        if (maxCount <= 0) {
+            return Collections.emptyList();
+        }
+        
         List<StoredMessage> messages = getMessages(topic, fromOffset, maxCount);
         if (!messages.isEmpty() || timeoutMs <= 0) {
             return messages;
