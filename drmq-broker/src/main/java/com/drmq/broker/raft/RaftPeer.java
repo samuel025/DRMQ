@@ -73,7 +73,7 @@ public class RaftPeer {
 
                 sendEnvelope(envelope);
                 MessageEnvelope response = receiveEnvelope();
-
+                requireResponseType(response, MessageType.REQUEST_VOTE_RESPONSE, "RequestVote");
                 RequestVoteResponse parsed = RequestVoteResponse.parseFrom(response.getPayload());
                 BrokerMetrics.get().recordRaftRpc("request_vote", true,
                         System.nanoTime() - startNanos);
@@ -112,7 +112,7 @@ public class RaftPeer {
 
                 sendEnvelope(envelope);
                 MessageEnvelope response = receiveEnvelope();
-
+                requireResponseType(response, MessageType.APPEND_ENTRIES_RESPONSE, "AppendEntries");
                 AppendEntriesResponse parsed = AppendEntriesResponse.parseFrom(response.getPayload());
                 BrokerMetrics.get().recordRaftRpc("append_entries", true,
                     System.nanoTime() - startNanos);
@@ -157,6 +157,13 @@ public class RaftPeer {
         byte[] data = new byte[length];
         in.readFully(data);
         return MessageEnvelope.parseFrom(data);
+    }
+
+    private static void requireResponseType(MessageEnvelope response, MessageType expectedType,
+                                            String rpcName) throws IOException {
+        if (response.getType() != expectedType) {
+            throw new IOException(rpcName + " expected " + expectedType + " but received " + response.getType());
+        }
     }
 
     /**

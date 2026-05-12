@@ -134,10 +134,20 @@ public class BrokerConfig {
 
     private static String parsePathArg(String[] args, int index, String flag) {
         String value = requireValue(args, index, flag);
-        if (value.isBlank()) {
+        String normalized = value.trim();
+        if (normalized.isBlank()) {
             throw new IllegalArgumentException(flag + " must not be empty");
         }
-        return value;
+        if (normalized.chars().anyMatch(Character::isWhitespace)) {
+            throw new IllegalArgumentException(flag + " must not contain whitespace: " + value);
+        }
+        if (!normalized.startsWith("/")) {
+            normalized = "/" + normalized;
+        }
+        if (normalized.length() > 1 && normalized.endsWith("/")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        return normalized;
     }
 
     private static String requireValue(String[] args, int index, String flag) {
