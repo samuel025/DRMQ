@@ -166,9 +166,7 @@ public class MessageStore {
     /**
      * Get messages from a topic starting at the given offset.
      * First tries the in-memory cache, then falls back to disk if needed.
-     * 
      * Offsets are global across all topics, so a topic's offsets may be sparse.
-     * We iterate actual index entries rather than probing consecutive offsets.
      */
     public List<StoredMessage> getMessages(String topic, long fromOffset, int maxCount) {
         BoundedMessageCache cache = messageCache.get(topic);
@@ -176,8 +174,7 @@ public class MessageStore {
         // Try cache first
         if (cache != null) {
             List<StoredMessage> cachedMessages = cache.getMessagesFrom(fromOffset, maxCount);
-            // If we got enough messages from cache, return them
-            if (cachedMessages.size() >= maxCount) {
+           if (cachedMessages.size() >= maxCount && cachedMessages.get(0).getOffset() == fromOffset) {
                 return cachedMessages;
             }
         }
