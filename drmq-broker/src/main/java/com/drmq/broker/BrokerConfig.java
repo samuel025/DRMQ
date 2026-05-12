@@ -86,10 +86,10 @@ public class BrokerConfig {
                         peers.add(PeerAddress.parse(peerStr));
                     }
                 }
-                case "--metrics-enabled" -> metricsEnabled = Boolean.parseBoolean(args[++i]);
+                case "--metrics-enabled" -> metricsEnabled = parseBooleanArg(args, ++i, "--metrics-enabled");
                 case "--metrics-disabled" -> metricsEnabled = false;
-                case "--metrics-port" -> metricsPort = Integer.parseInt(args[++i]);
-                case "--metrics-path" -> metricsPath = args[++i];
+                case "--metrics-port" -> metricsPort = parsePortArg(args, ++i, "--metrics-port");
+                case "--metrics-path" -> metricsPath = parsePathArg(args, ++i, "--metrics-path");
                 default -> {
                     // Legacy support: first positional arg = port, second = dataDir
                     if (i == 0) {
@@ -106,6 +106,45 @@ public class BrokerConfig {
         }
 
         return new BrokerConfig(nodeId, port, dataDir, peers, metricsEnabled, metricsPort, metricsPath);
+    }
+
+    private static boolean parseBooleanArg(String[] args, int index, String flag) {
+        String value = requireValue(args, index, flag);
+        if ("true".equalsIgnoreCase(value)) {
+            return true;
+        }
+        if ("false".equalsIgnoreCase(value)) {
+            return false;
+        }
+        throw new IllegalArgumentException(flag + " must be true or false, got: " + value);
+    }
+
+    private static int parsePortArg(String[] args, int index, String flag) {
+        String value = requireValue(args, index, flag);
+        try {
+            int port = Integer.parseInt(value);
+            if (port < 1 || port > 65535) {
+                throw new IllegalArgumentException(flag + " must be between 1 and 65535, got: " + value);
+            }
+            return port;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(flag + " must be a valid integer port, got: " + value, e);
+        }
+    }
+
+    private static String parsePathArg(String[] args, int index, String flag) {
+        String value = requireValue(args, index, flag);
+        if (value.isBlank()) {
+            throw new IllegalArgumentException(flag + " must not be empty");
+        }
+        return value;
+    }
+
+    private static String requireValue(String[] args, int index, String flag) {
+        if (index >= args.length) {
+            throw new IllegalArgumentException("Missing value for " + flag);
+        }
+        return args[index];
     }
 
     /**

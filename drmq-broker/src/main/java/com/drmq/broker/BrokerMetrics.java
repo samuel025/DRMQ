@@ -23,6 +23,7 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -220,9 +221,24 @@ public final class BrokerMetrics implements AutoCloseable {
 
     @Override
     public void close() {
+        ExecutorService executorService = null;
         if (httpServer != null) {
+            if (httpServer.getExecutor() instanceof ExecutorService service) {
+                executorService = service;
+            }
             httpServer.stop(0);
             httpServer = null;
+        }
+        if (executorService != null) {
+            executorService.shutdown();
+            try {
+                if (!executorService.awaitTermination(5, TimeUnit.SECONDS)) {
+                    executorService.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                executorService.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
         }
         if (prometheusRegistry != null) {
             prometheusRegistry.close();

@@ -114,8 +114,8 @@ public class RaftPeer {
                 MessageEnvelope response = receiveEnvelope();
 
                 AppendEntriesResponse parsed = AppendEntriesResponse.parseFrom(response.getPayload());
-                BrokerMetrics.get().recordRaftRpc("append_entries", parsed.getSuccess(),
-                        System.nanoTime() - startNanos);
+                BrokerMetrics.get().recordRaftRpc("append_entries", true,
+                    System.nanoTime() - startNanos);
                 return parsed;
 
             } catch (Exception e) {
