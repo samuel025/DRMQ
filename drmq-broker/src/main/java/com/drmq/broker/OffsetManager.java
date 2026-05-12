@@ -44,10 +44,17 @@ public class OffsetManager {
      * @param offset        the NEXT offset to read (i.e. last processed offset + 1)
      */
     public synchronized void commit(String consumerGroup, String topic, long offset) throws IOException {
+        long startNanos = System.nanoTime();
         String key = key(consumerGroup, topic);
-        offsets.put(key, offset);
-        persist();
-        logger.debug("Committed offset: group={}, topic={}, offset={}", consumerGroup, topic, offset);
+        try {
+            offsets.put(key, offset);
+            persist();
+            logger.debug("Committed offset: group={}, topic={}, offset={}", consumerGroup, topic, offset);
+            BrokerMetrics.get().recordOffsetPersist(System.nanoTime() - startNanos, true);
+        } catch (IOException e) {
+            BrokerMetrics.get().recordOffsetPersist(System.nanoTime() - startNanos, false);
+            throw e;
+        }
     }
 
     /**
@@ -57,6 +64,10 @@ public class OffsetManager {
      */
     public long fetch(String consumerGroup, String topic) {
         return offsets.getOrDefault(key(consumerGroup, topic), -1L);
+    }
+
+    public int getOffsetEntryCount() {
+        return offsets.size();
     }
 
     /** Load all offsets from disk on startup. */

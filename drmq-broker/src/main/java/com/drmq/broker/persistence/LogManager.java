@@ -1,5 +1,6 @@
 package com.drmq.broker.persistence;
 
+import com.drmq.broker.BrokerMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -71,6 +72,7 @@ public class LogManager implements AutoCloseable {
             Path logPath = topicDir.resolve("00000000" + LOG_FILE_SUFFIX);
             LogSegment segment = new LogSegment(logPath);
             topicSegments.put(topic, segment);
+            BrokerMetrics.get().registerLogSegment(topic, segment);
             return segment;
         }
     }
@@ -93,6 +95,10 @@ public class LogManager implements AutoCloseable {
             });
         }
         return segments;
+    }
+
+    public int getOpenSegmentCount() {
+        return topicSegments.size();
     }
 
     @Override

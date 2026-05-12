@@ -1,5 +1,6 @@
 package com.drmq.broker.persistence;
 
+import com.drmq.broker.BrokerMetrics;
 import com.drmq.protocol.DRMQProtocol.StoredMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -49,6 +50,7 @@ public class LogSegment implements AutoCloseable {
      * @throws IllegalArgumentException If message exceeds MAX_MESSAGE_SIZE.
      */
     public synchronized long append(StoredMessage message) throws IOException {
+        long startNanos = System.nanoTime();
         byte[] messageBytes = message.toByteArray();
         
         // Validate message size to ensure it can be read back
@@ -70,6 +72,7 @@ public class LogSegment implements AutoCloseable {
         fileChannel.force(true);
         
         currentSize += buffer.limit();
+        BrokerMetrics.get().recordLogAppend(buffer.limit(), System.nanoTime() - startNanos);
         return position;
     }
 
@@ -81,6 +84,7 @@ public class LogSegment implements AutoCloseable {
      * @throws IOException If a read error occurs or data is corrupt.
      */
     public StoredMessage read(long position) throws IOException {
+        long startNanos = System.nanoTime();
         // Read 4-byte length prefix, handling short reads
         ByteBuffer lengthBuffer = ByteBuffer.allocate(4);
         int bytesRead = 0;
@@ -118,7 +122,9 @@ public class LogSegment implements AutoCloseable {
         }
         messageBuffer.flip();
 
-        return StoredMessage.parseFrom(messageBuffer.array());
+        StoredMessage message = StoredMessage.parseFrom(messageBuffer.array());
+        BrokerMetrics.get().recordLogRead(4L + length, System.nanoTime() - startNanos);
+        return message;
     }
 
     public long getSize() {

@@ -251,10 +251,6 @@ public class DRMQConsumer implements AutoCloseable {
         return true;
     }
 
-    // -------------------------------------------------------------------------
-    // Subscribe (now fetches offset from broker)
-    // -------------------------------------------------------------------------
-
     /**
      * Subscribe to a topic. Resumes from the broker-committed offset automatically.
      * If no offset has been committed yet, starts from offset 0.

@@ -1,6 +1,7 @@
 package com.drmq.broker.raft;
 
 import com.drmq.broker.BrokerConfig.PeerAddress;
+import com.drmq.broker.BrokerMetrics;
 import com.drmq.protocol.DRMQProtocol.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -61,6 +62,7 @@ public class RaftPeer {
      */
     public RequestVoteResponse sendRequestVote(RequestVoteRequest request) {
         synchronized (lock) {
+            long startNanos = System.nanoTime();
             try {
                 ensureConnected();
 
@@ -71,8 +73,11 @@ public class RaftPeer {
 
                 sendEnvelope(envelope);
                 MessageEnvelope response = receiveEnvelope();
-
-                return RequestVoteResponse.parseFrom(response.getPayload());
+                requireResponseType(response, MessageType.REQUEST_VOTE_RESPONSE, "RequestVote");
+                RequestVoteResponse parsed = RequestVoteResponse.parseFrom(response.getPayload());
+                BrokerMetrics.get().recordRaftRpc("request_vote", true,
+                        System.nanoTime() - startNanos);
+                return parsed;
 
             } catch (Exception e) {
                 close();
@@ -81,6 +86,8 @@ public class RaftPeer {
                     logger.debug("RequestVote to {} failed: {}", address, e.getMessage());
                     lastRequestVoteFailureLogTime = now;
                 }
+                BrokerMetrics.get().recordRaftRpc("request_vote", false,
+                        System.nanoTime() - startNanos);
                 return RequestVoteResponse.newBuilder()
                         .setTerm(0)
                         .setVoteGranted(false)
@@ -94,6 +101,7 @@ public class RaftPeer {
      */
     public AppendEntriesResponse sendAppendEntries(AppendEntriesRequest request) {
         synchronized (lock) {
+            long startNanos = System.nanoTime();
             try {
                 ensureConnected();
 
@@ -104,8 +112,11 @@ public class RaftPeer {
 
                 sendEnvelope(envelope);
                 MessageEnvelope response = receiveEnvelope();
-
-                return AppendEntriesResponse.parseFrom(response.getPayload());
+                requireResponseType(response, MessageType.APPEND_ENTRIES_RESPONSE, "AppendEntries");
+                AppendEntriesResponse parsed = AppendEntriesResponse.parseFrom(response.getPayload());
+                BrokerMetrics.get().recordRaftRpc("append_entries", true,
+                    System.nanoTime() - startNanos);
+                return parsed;
 
             } catch (Exception e) {
                 close();
@@ -114,6 +125,8 @@ public class RaftPeer {
                     logger.debug("AppendEntries to {} failed: {}", address, e.getMessage());
                     lastAppendEntriesFailureLogTime = now;
                 }
+                BrokerMetrics.get().recordRaftRpc("append_entries", false,
+                        System.nanoTime() - startNanos);
                 return AppendEntriesResponse.newBuilder()
                         .setTerm(0)
                         .setSuccess(false)
@@ -144,6 +157,13 @@ public class RaftPeer {
         byte[] data = new byte[length];
         in.readFully(data);
         return MessageEnvelope.parseFrom(data);
+    }
+
+    private static void requireResponseType(MessageEnvelope response, MessageType expectedType,
+                                            String rpcName) throws IOException {
+        if (response.getType() != expectedType) {
+            throw new IOException(rpcName + " expected " + expectedType + " but received " + response.getType());
+        }
     }
 
     /**
