@@ -10,11 +10,13 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Message storage for the broker.
@@ -164,24 +166,41 @@ public class MessageStore {
     /**
      * Get messages from a topic starting at the given offset.
      * First tries the in-memory cache, then falls back to disk if needed.
-     * 
      * Offsets are global across all topics, so a topic's offsets may be sparse.
-     * We iterate actual index entries rather than probing consecutive offsets.
      */
     public List<StoredMessage> getMessages(String topic, long fromOffset, int maxCount) {
+        // Guard: reject invalid maxCount to prevent accessing empty results
+        if (maxCount <= 0) {
+            return Collections.emptyList();
+        }
+        
         BoundedMessageCache cache = messageCache.get(topic);
+        
+        // Get the index to find the next real offset >= fromOffset (handles sparse topics)
+        ConcurrentSkipListMap<Long, Long> index = topicIndex.get(topic);
+        
+        // For sparse topics, fromOffset may not exist; find the next real offset
+        Long nextRealOffset = null;
+        if (index != null) {
+            nextRealOffset = index.ceilingKey(fromOffset);
+        }
+        
+        // If no messages from that point onward, nothing to return
+        if (nextRealOffset == null) {
+            return Collections.emptyList();
+        }
         
         // Try cache first
         if (cache != null) {
             List<StoredMessage> cachedMessages = cache.getMessagesFrom(fromOffset, maxCount);
-            // If we got enough messages from cache, return them
-            if (cachedMessages.size() >= maxCount) {
+            // Only return cache hit if we got enough messages AND they start at the next real offset
+            // This handles sparse topics correctly and prevents silent message loss
+            if (cachedMessages.size() >= maxCount && cachedMessages.get(0).getOffset() == nextRealOffset) {
                 return cachedMessages;
             }
         }
         
         // Cache miss or partial hit - need to read from disk
-        ConcurrentSkipListMap<Long, Long> index = topicIndex.get(topic);
         if (index == null) {
             return Collections.emptyList();
         }
@@ -224,6 +243,10 @@ public class MessageStore {
      * @return messages found
      */
     public List<StoredMessage> waitForMessages(String topic, long fromOffset, int maxCount, long timeoutMs) {
+        if (maxCount <= 0) {
+            return Collections.emptyList();
+        }
+        
         List<StoredMessage> messages = getMessages(topic, fromOffset, maxCount);
         if (!messages.isEmpty() || timeoutMs <= 0) {
             return messages;
@@ -279,58 +302,68 @@ public class MessageStore {
         logger.info("Message store memory state cleared");
     }
 
-    /**
-     * Bounded cache for messages with LRU eviction.
-     */
-    private static class BoundedMessageCache {
+
+     // Bounded cache for messages with FIFO eviction.
+        private static class BoundedMessageCache {
         private final int maxSize;
-        private final Map<Long, StoredMessage> messageMap = new ConcurrentHashMap<>();
-        private final java.util.Deque<Long> offsetQueue = new java.util.ArrayDeque<>();
+        private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+        private final LinkedHashMap<Long, StoredMessage> cache;
 
         public BoundedMessageCache(int maxSize) {
             this.maxSize = maxSize;
-        }
-
-        public synchronized void add(StoredMessage message) {
-            long offset = message.getOffset();
-            
-            if (messageMap.containsKey(offset)) {
-                return;
-            }
-            
-            if (offsetQueue.size() >= maxSize) {
-                Long oldestOffset = offsetQueue.pollFirst();
-                if (oldestOffset != null) {
-                    messageMap.remove(oldestOffset);
+            // accessOrder=false: FIFO eviction, get() is NOT a structural modification
+            this.cache = new LinkedHashMap<Long, StoredMessage>(maxSize, 0.75f, false) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<Long, StoredMessage> eldest) {
+                    return size() > maxSize;
                 }
+            };
+        }
+
+        public void add(StoredMessage message) {
+            lock.writeLock().lock();
+            try {
+                long offset = message.getOffset();
+                cache.put(offset, message);
+            } finally {
+                lock.writeLock().unlock();
             }
-            
-            messageMap.put(offset, message);
-            offsetQueue.addLast(offset);
         }
 
-        public synchronized StoredMessage get(long offset) {
-            return messageMap.get(offset);
+        public StoredMessage get(long offset) {
+            lock.readLock().lock();
+            try {
+                return cache.get(offset);
+            } finally {
+                lock.readLock().unlock();
+            }
         }
 
-        public synchronized List<StoredMessage> getMessagesFrom(long fromOffset, int maxCount) {
-            List<StoredMessage> result = new ArrayList<>();
-            for (Long offset : offsetQueue) {
-                if (offset >= fromOffset) {
-                    StoredMessage msg = messageMap.get(offset);
-                    if (msg != null) {
-                        result.add(msg);
+        public List<StoredMessage> getMessagesFrom(long fromOffset, int maxCount) {
+            lock.readLock().lock();
+            try {
+                List<StoredMessage> result = new ArrayList<>();
+                for (Map.Entry<Long, StoredMessage> entry : cache.entrySet()) {
+                    if (entry.getKey() >= fromOffset) {
+                        result.add(entry.getValue());
                         if (result.size() >= maxCount) {
                             break;
                         }
                     }
                 }
+                return result;
+            } finally {
+                lock.readLock().unlock();
             }
-            return result;
         }
 
-        public synchronized int size() {
-            return messageMap.size();
+        public int size() {
+            lock.readLock().lock();
+            try {
+                return cache.size();
+            } finally {
+                lock.readLock().unlock();
+            }
         }
     }
 
