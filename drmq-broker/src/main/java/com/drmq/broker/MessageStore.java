@@ -38,6 +38,7 @@ public class MessageStore {
 
     // Monitor for long-poll notification — consumers wait() on this, append() calls notifyAll()
     private final Object messageMonitor = new Object();
+    private final AtomicLong messageSignal = new AtomicLong(0);
 
     public MessageStore(LogManager logManager) {
         this.logManager = logManager;
@@ -133,6 +134,7 @@ public class MessageStore {
 
         // 4. Wake any long-polling consumers waiting for new messages
         synchronized (messageMonitor) {
+            messageSignal.incrementAndGet();
             messageMonitor.notifyAll();
         }
 
@@ -169,7 +171,6 @@ public class MessageStore {
      * Offsets are global across all topics, so a topic's offsets may be sparse.
      */
     public List<StoredMessage> getMessages(String topic, long fromOffset, int maxCount) {
-        // Guard: reject invalid maxCount to prevent accessing empty results
         if (maxCount <= 0) {
             return Collections.emptyList();
         }
@@ -178,14 +179,11 @@ public class MessageStore {
         
         // Get the index to find the next real offset >= fromOffset (handles sparse topics)
         ConcurrentSkipListMap<Long, Long> index = topicIndex.get(topic);
-        
-        // For sparse topics, fromOffset may not exist; find the next real offset
-        Long nextRealOffset = null;
+                Long nextRealOffset = null;
         if (index != null) {
             nextRealOffset = index.ceilingKey(fromOffset);
         }
         
-        // If no messages from that point onward, nothing to return
         if (nextRealOffset == null) {
             return Collections.emptyList();
         }
@@ -193,14 +191,11 @@ public class MessageStore {
         // Try cache first
         if (cache != null) {
             List<StoredMessage> cachedMessages = cache.getMessagesFrom(fromOffset, maxCount);
-            // Only return cache hit if we got enough messages AND they start at the next real offset
-            // This handles sparse topics correctly and prevents silent message loss
             if (cachedMessages.size() >= maxCount && cachedMessages.get(0).getOffset() == nextRealOffset) {
                 return cachedMessages;
             }
         }
         
-        // Cache miss or partial hit - need to read from disk
         if (index == null) {
             return Collections.emptyList();
         }
@@ -253,8 +248,16 @@ public class MessageStore {
         }
 
         long deadline = System.currentTimeMillis() + timeoutMs;
+        long observedSignal = messageSignal.get();
         synchronized (messageMonitor) {
             while (messages.isEmpty()) {
+                long currentSignal = messageSignal.get();
+                if (currentSignal != observedSignal) {
+                    observedSignal = currentSignal;
+                    messages = getMessages(topic, fromOffset, maxCount);
+                    continue;
+                }
+
                 long remaining = deadline - System.currentTimeMillis();
                 if (remaining <= 0) break;
                 try {

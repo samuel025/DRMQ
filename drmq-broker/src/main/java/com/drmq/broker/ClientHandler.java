@@ -8,6 +8,7 @@ import org.slf4j.LoggerFactory;
 import java.io.*;
 import java.net.Socket;
 import java.util.Set;
+import java.util.concurrent.*;
 
 /**
  * Handles a single client connection to the broker.
@@ -28,6 +29,21 @@ public class ClientHandler implements Runnable {
     private final RaftNode raftNode;  // null in single-node mode
     private final Set<ClientHandler> ownerSet;  // for self-removal on disconnect
     private volatile boolean running = true;
+    private static final int RPC_THREAD_COUNT = Math.max(4, Runtime.getRuntime().availableProcessors());
+    private static final int RPC_QUEUE_CAPACITY = 1000;
+
+    private static final ThreadPoolExecutor rpcExecutor = new ThreadPoolExecutor(
+            RPC_THREAD_COUNT,
+            RPC_THREAD_COUNT,
+            0L,
+            TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<>(RPC_QUEUE_CAPACITY),
+            r -> {
+                Thread t = new Thread(r, "raft-rpc-handler");
+                t.setDaemon(true);
+                return t;
+            },
+            new ThreadPoolExecutor.AbortPolicy());
 
     public ClientHandler(Socket socket, MessageStore messageStore, OffsetManager offsetManager,
                          RaftNode raftNode, Set<ClientHandler> ownerSet) {
@@ -233,6 +249,31 @@ public class ClientHandler implements Runnable {
                 .build();
     }
 
+    private MessageEnvelope createCommitOffsetErrorResponse(String errorMessage) {
+        CommitOffsetResponse response = CommitOffsetResponse.newBuilder()
+                .setSuccess(false)
+                .setErrorMessage(errorMessage != null ? errorMessage : "Unknown error")
+                .build();
+
+        return MessageEnvelope.newBuilder()
+                .setType(MessageType.COMMIT_OFFSET_RESPONSE)
+                .setPayload(response.toByteString())
+                .build();
+    }
+
+    private MessageEnvelope createFetchOffsetErrorResponse(String errorMessage) {
+        FetchOffsetResponse response = FetchOffsetResponse.newBuilder()
+                .setSuccess(false)
+                .setOffset(-1)
+                .setErrorMessage(errorMessage != null ? errorMessage : "Unknown error")
+                .build();
+
+        return MessageEnvelope.newBuilder()
+                .setType(MessageType.FETCH_OFFSET_RESPONSE)
+                .setPayload(response.toByteString())
+                .build();
+    }
+
     /**
      * Handle a commit offset request - store the consumer group offset on the broker.
      *
@@ -344,7 +385,44 @@ public class ClientHandler implements Runnable {
      */
     @Deprecated
     private MessageEnvelope createErrorResponse(String errorMessage) {
-        return createProduceErrorResponse(errorMessage);
+        return createErrorResponse(errorMessage, MessageType.PRODUCE_RESPONSE);
+    }
+
+    private MessageEnvelope createErrorResponse(String errorMessage, MessageType messageType) {
+        return switch (messageType) {
+            case REQUEST_VOTE_RESPONSE -> createRequestVoteErrorResponse();
+            case APPEND_ENTRIES_RESPONSE -> createAppendEntriesErrorResponse();
+            case PRODUCE_RESPONSE -> createProduceErrorResponse(errorMessage);
+            case CONSUME_RESPONSE -> createConsumeErrorResponse(errorMessage);
+            case COMMIT_OFFSET_RESPONSE -> createCommitOffsetErrorResponse(errorMessage);
+            case FETCH_OFFSET_RESPONSE -> createFetchOffsetErrorResponse(errorMessage);
+            default -> createProduceErrorResponse(errorMessage);
+        };
+    }
+
+    private MessageEnvelope createRequestVoteErrorResponse() {
+        RequestVoteResponse response = RequestVoteResponse.newBuilder()
+                .setTerm(0)
+                .setVoteGranted(false)
+                .build();
+
+        return MessageEnvelope.newBuilder()
+                .setType(MessageType.REQUEST_VOTE_RESPONSE)
+                .setPayload(response.toByteString())
+                .build();
+    }
+
+    private MessageEnvelope createAppendEntriesErrorResponse() {
+        AppendEntriesResponse response = AppendEntriesResponse.newBuilder()
+                .setTerm(0)
+                .setSuccess(false)
+                .setMatchIndex(0)
+                .build();
+
+        return MessageEnvelope.newBuilder()
+                .setType(MessageType.APPEND_ENTRIES_RESPONSE)
+                .setPayload(response.toByteString())
+                .build();
     }
 
     // ===========================
@@ -359,18 +437,46 @@ public class ClientHandler implements Runnable {
         if (raftNode == null) {
             BrokerMetrics.get().recordRaftRpc("request_vote", false,
                     System.nanoTime() - startNanos);
-            return createErrorResponse("Raft not enabled on this broker");
+            return createRequestVoteErrorResponse();
         }
         RequestVoteRequest request = RequestVoteRequest.parseFrom(envelope.getPayload());
-        RequestVoteResponse response = raftNode.handleRequestVote(request);
 
-        BrokerMetrics.get().recordRaftRpc("request_vote", true,
-                System.nanoTime() - startNanos);
+        // Process synchronously but in a dedicated executor to prevent blocking
+        // the ClientHandler thread while holding RaftNode.lock
+        Future<RequestVoteResponse> future = null;
+        try {
+            future = rpcExecutor.submit(() -> raftNode.handleRequestVote(request));
+            RequestVoteResponse response = future.get(10, TimeUnit.SECONDS);
 
-        return MessageEnvelope.newBuilder()
-                .setType(MessageType.REQUEST_VOTE_RESPONSE)
-                .setPayload(response.toByteString())
-                .build();
+            BrokerMetrics.get().recordRaftRpc("request_vote", true,
+                    System.nanoTime() - startNanos);
+
+            return MessageEnvelope.newBuilder()
+                    .setType(MessageType.REQUEST_VOTE_RESPONSE)
+                    .setPayload(response.toByteString())
+                    .build();
+        } catch (TimeoutException e) {
+            logger.error("RequestVote handler timed out");
+            BrokerMetrics.get().recordRaftRpc("request_vote", false,
+                    System.nanoTime() - startNanos);
+            if (future != null) {
+                future.cancel(true);
+            }
+            return createRequestVoteErrorResponse();
+        } catch (RejectedExecutionException e) {
+            logger.error("RequestVote handler rejected: {}", e.getMessage());
+            BrokerMetrics.get().recordRaftRpc("request_vote", false,
+                    System.nanoTime() - startNanos);
+            return createRequestVoteErrorResponse();
+        } catch (Exception e) {
+            logger.error("RequestVote handler failed: {}", e.getMessage());
+            BrokerMetrics.get().recordRaftRpc("request_vote", false,
+                    System.nanoTime() - startNanos);
+            if (future != null) {
+                future.cancel(true);
+            }
+            return createRequestVoteErrorResponse();
+        }
     }
 
     /**
@@ -381,18 +487,44 @@ public class ClientHandler implements Runnable {
         if (raftNode == null) {
             BrokerMetrics.get().recordRaftRpc("append_entries", false,
                     System.nanoTime() - startNanos);
-            return createErrorResponse("Raft not enabled on this broker");
+            return createAppendEntriesErrorResponse();
         }
+
         AppendEntriesRequest request = AppendEntriesRequest.parseFrom(envelope.getPayload());
-        AppendEntriesResponse response = raftNode.handleAppendEntries(request);
+        Future<AppendEntriesResponse> future = null;
+        try {
+            future = rpcExecutor.submit(() -> raftNode.handleAppendEntries(request));
+            AppendEntriesResponse response = future.get(10, TimeUnit.SECONDS);
 
-        BrokerMetrics.get().recordRaftRpc("append_entries", response.getSuccess(),
-                System.nanoTime() - startNanos);
+            BrokerMetrics.get().recordRaftRpc("append_entries", response.getSuccess(),
+                    System.nanoTime() - startNanos);
 
-        return MessageEnvelope.newBuilder()
-                .setType(MessageType.APPEND_ENTRIES_RESPONSE)
-                .setPayload(response.toByteString())
-                .build();
+            return MessageEnvelope.newBuilder()
+                    .setType(MessageType.APPEND_ENTRIES_RESPONSE)
+                    .setPayload(response.toByteString())
+                    .build();
+        } catch (TimeoutException e) {
+            logger.error("AppendEntries handler timed out");
+            BrokerMetrics.get().recordRaftRpc("append_entries", false,
+                    System.nanoTime() - startNanos);
+            if (future != null) {
+                future.cancel(true);
+            }
+            return createAppendEntriesErrorResponse();
+        } catch (RejectedExecutionException e) {
+            logger.error("AppendEntries handler rejected: {}", e.getMessage());
+            BrokerMetrics.get().recordRaftRpc("append_entries", false,
+                    System.nanoTime() - startNanos);
+            return createAppendEntriesErrorResponse();
+        } catch (Exception e) {
+            logger.error("AppendEntries handler failed: {}", e.getMessage());
+            BrokerMetrics.get().recordRaftRpc("append_entries", false,
+                    System.nanoTime() - startNanos);
+            if (future != null) {
+                future.cancel(true);
+            }
+            return createAppendEntriesErrorResponse();
+        }
     }
 
     /**
