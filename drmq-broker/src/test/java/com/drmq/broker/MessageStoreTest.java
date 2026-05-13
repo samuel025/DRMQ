@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -97,6 +98,25 @@ class MessageStoreTest {
         assertEquals(5, messages.get(0).getOffset());
         assertEquals(6, messages.get(1).getOffset());
         assertEquals(7, messages.get(2).getOffset());
+    }
+
+    @Test
+    void waitForMessagesReturnsAfterAppend() throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> future = executor.submit(() -> store.waitForMessages("test", 0, 1, 1000));
+
+            Thread.sleep(50);
+            store.append("test", "msg".getBytes(), null, System.currentTimeMillis());
+
+            @SuppressWarnings("unchecked")
+            var messages = (java.util.List<com.drmq.protocol.DRMQProtocol.StoredMessage>) future.get(2, TimeUnit.SECONDS);
+
+            assertEquals(1, messages.size());
+            assertEquals(0, messages.get(0).getOffset());
+        } finally {
+            executor.shutdownNow();
+        }
     }
 
     @Test

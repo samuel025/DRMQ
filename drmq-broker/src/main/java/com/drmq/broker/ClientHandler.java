@@ -8,6 +8,7 @@ import org.slf4j.LoggerFactory;
 import java.io.*;
 import java.net.Socket;
 import java.util.Set;
+import java.util.concurrent.*;
 
 /**
  * Handles a single client connection to the broker.
@@ -28,6 +29,15 @@ public class ClientHandler implements Runnable {
     private final RaftNode raftNode;  // null in single-node mode
     private final Set<ClientHandler> ownerSet;  // for self-removal on disconnect
     private volatile boolean running = true;
+    
+  
+    private static final ExecutorService rpcExecutor = Executors.newFixedThreadPool(
+            Math.max(4, Runtime.getRuntime().availableProcessors()),
+            r -> {
+                Thread t = new Thread(r, "raft-rpc-handler");
+                t.setDaemon(true);
+                return t;
+            });
 
     public ClientHandler(Socket socket, MessageStore messageStore, OffsetManager offsetManager,
                          RaftNode raftNode, Set<ClientHandler> ownerSet) {
@@ -362,15 +372,33 @@ public class ClientHandler implements Runnable {
             return createErrorResponse("Raft not enabled on this broker");
         }
         RequestVoteRequest request = RequestVoteRequest.parseFrom(envelope.getPayload());
-        RequestVoteResponse response = raftNode.handleRequestVote(request);
-
-        BrokerMetrics.get().recordRaftRpc("request_vote", true,
-                System.nanoTime() - startNanos);
-
-        return MessageEnvelope.newBuilder()
-                .setType(MessageType.REQUEST_VOTE_RESPONSE)
-                .setPayload(response.toByteString())
-                .build();
+        
+        // Process synchronously but in a dedicated executor to prevent blocking
+        // the ClientHandler thread while holding RaftNode.lock
+        try {
+            RequestVoteResponse response = CompletableFuture.supplyAsync(
+                    () -> raftNode.handleRequestVote(request),
+                    rpcExecutor
+            ).get(10, TimeUnit.SECONDS);
+            
+            BrokerMetrics.get().recordRaftRpc("request_vote", true,
+                    System.nanoTime() - startNanos);
+            
+            return MessageEnvelope.newBuilder()
+                    .setType(MessageType.REQUEST_VOTE_RESPONSE)
+                    .setPayload(response.toByteString())
+                    .build();
+        } catch (TimeoutException e) {
+            logger.error("RequestVote handler timed out");
+            BrokerMetrics.get().recordRaftRpc("request_vote", false,
+                    System.nanoTime() - startNanos);
+            return createErrorResponse("RequestVote timeout");
+        } catch (Exception e) {
+            logger.error("RequestVote handler failed: {}", e.getMessage());
+            BrokerMetrics.get().recordRaftRpc("request_vote", false,
+                    System.nanoTime() - startNanos);
+            return createErrorResponse("RequestVote failed: " + e.getMessage());
+        }
     }
 
     /**
@@ -383,16 +411,32 @@ public class ClientHandler implements Runnable {
                     System.nanoTime() - startNanos);
             return createErrorResponse("Raft not enabled on this broker");
         }
+        
         AppendEntriesRequest request = AppendEntriesRequest.parseFrom(envelope.getPayload());
-        AppendEntriesResponse response = raftNode.handleAppendEntries(request);
-
-        BrokerMetrics.get().recordRaftRpc("append_entries", response.getSuccess(),
-                System.nanoTime() - startNanos);
-
-        return MessageEnvelope.newBuilder()
-                .setType(MessageType.APPEND_ENTRIES_RESPONSE)
-                .setPayload(response.toByteString())
-                .build();
+        try {
+            AppendEntriesResponse response = CompletableFuture.supplyAsync(
+                    () -> raftNode.handleAppendEntries(request),
+                    rpcExecutor
+            ).get(10, TimeUnit.SECONDS);
+            
+            BrokerMetrics.get().recordRaftRpc("append_entries", response.getSuccess(),
+                    System.nanoTime() - startNanos);
+            
+            return MessageEnvelope.newBuilder()
+                    .setType(MessageType.APPEND_ENTRIES_RESPONSE)
+                    .setPayload(response.toByteString())
+                    .build();
+        } catch (TimeoutException e) {
+            logger.error("AppendEntries handler timed out");
+            BrokerMetrics.get().recordRaftRpc("append_entries", false,
+                    System.nanoTime() - startNanos);
+            return createErrorResponse("AppendEntries timeout");
+        } catch (Exception e) {
+            logger.error("AppendEntries handler failed: {}", e.getMessage());
+            BrokerMetrics.get().recordRaftRpc("append_entries", false,
+                    System.nanoTime() - startNanos);
+            return createErrorResponse("AppendEntries failed: " + e.getMessage());
+        }
     }
 
     /**

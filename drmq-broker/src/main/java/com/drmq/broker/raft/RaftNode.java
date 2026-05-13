@@ -25,11 +25,6 @@ import java.util.function.Function;
  *
  * Implements leader election, log replication, and commitment as described in
  * "In Search of an Understandable Consensus Algorithm" (Ongaro et al., 2014).
- *
- * Key invariants:
- * - At most one leader per term
- * - A committed entry is never overwritten
- * - If two logs contain an entry with the same index and term, all preceding entries are identical
  */
 public class RaftNode {
     private static final Logger logger = LoggerFactory.getLogger(RaftNode.class);
@@ -41,6 +36,11 @@ public class RaftNode {
 
     // Proposal timeout — how long a client blocks waiting for Raft commitment
     private static final long PROPOSAL_TIMEOUT_SECONDS = 5;
+    
+
+    private static final long STALE_PROPOSAL_THRESHOLD_MS = 30000;  // 30 seconds
+    private static final long PROPOSAL_CLEANUP_INTERVAL_MS = 5000;  // Check every 5 seconds
+    private static final int MAX_PENDING_PROPOSALS = 10000;  // Safety limit
 
     //  Persistent state (survives restart) 
     private long currentTerm;
@@ -71,12 +71,22 @@ public class RaftNode {
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
     private final ExecutorService raftExecutor;
     private ScheduledFuture<?> electionTimer;
-    private ScheduledFuture<?> heartbeatTimer;
-    private volatile boolean running = false;
+    private ScheduledFuture<?> heartbeatTimer;    private ScheduledFuture<?> proposalCleanupTimer;    private volatile boolean running = false;
     private volatile long electionStartNanos;
 
-    // Flow: propose() creates a future here → applyCommitted() completes it when majority ACK
-    private final Map<Long, CompletableFuture<Long>> pendingProposals = new ConcurrentHashMap<>();
+    private static class ProposalState {
+        final long term;
+        final CompletableFuture<Long> future;
+        final long createdAtNanos;
+        volatile boolean timedOut = false;
+
+        ProposalState(long term, CompletableFuture<Long> future) {
+            this.term = term;
+            this.future = future;
+            this.createdAtNanos = System.nanoTime();
+        }
+    }
+    private final Map<Long, ProposalState> pendingProposals = new ConcurrentHashMap<>();
 
     private final Map<String, Long> lastLogTime = new ConcurrentHashMap<>();
     private static final long LOG_RATE_LIMIT_MS = 1000;  
@@ -124,8 +134,53 @@ public class RaftNode {
     public void start() {
         running = true;
         resetElectionTimer();
+        startProposalCleanupTask();
         logger.info("[{}] Raft node started (term={}, state=FOLLOWER, peers={})",
                 nodeId, currentTerm, peers.size());
+    }
+    
+    /**
+     * Start a periodic task to clean up stale pending proposals.
+     * Prevents unbounded growth of pendingProposals when replication fails.
+     */
+    private void startProposalCleanupTask() {
+        proposalCleanupTimer = scheduler.scheduleAtFixedRate(
+                this::cleanupStaleProposals,
+                PROPOSAL_CLEANUP_INTERVAL_MS,
+                PROPOSAL_CLEANUP_INTERVAL_MS,
+                TimeUnit.MILLISECONDS);
+    }
+    
+    /**
+     * Remove proposals that have been pending for too long.
+     * These are proposals that timed out but were never applied.
+     */
+    private void cleanupStaleProposals() {
+        if (!running) return;
+        
+        long now = System.nanoTime();
+        long staleThresholdNanos = TimeUnit.MILLISECONDS.toNanos(STALE_PROPOSAL_THRESHOLD_MS);
+        int removed = 0;
+        
+        for (var iter = pendingProposals.entrySet().iterator(); iter.hasNext(); ) {
+            var entry = iter.next();
+            ProposalState ps = entry.getValue();
+            long ageNanos = now - ps.createdAtNanos;
+            
+            if (ageNanos > staleThresholdNanos) {
+                // Remove stale proposal and fail the future
+                iter.remove();
+                ps.future.completeExceptionally(
+                        new IOException("Proposal removed: stale after " + 
+                                TimeUnit.NANOSECONDS.toMillis(ageNanos) + "ms"));
+                removed++;
+            }
+        }
+        
+        if (removed > 0) {
+            logger.warn("[{}] Cleaned up {} stale proposals, {} remaining",
+                    nodeId, removed, pendingProposals.size());
+        }
     }
 
 
@@ -133,10 +188,11 @@ public class RaftNode {
         running = false;
         if (electionTimer != null) electionTimer.cancel(false);
         if (heartbeatTimer != null) heartbeatTimer.cancel(false);
+        if (proposalCleanupTimer != null) proposalCleanupTimer.cancel(false);
         scheduler.shutdownNow();
         raftExecutor.shutdownNow();
 
-        pendingProposals.values().forEach(f -> f.completeExceptionally(
+        pendingProposals.values().forEach(ps -> ps.future.completeExceptionally(
                 new IOException("Raft node shutting down")));
         pendingProposals.clear();
 
@@ -285,15 +341,24 @@ public class RaftNode {
 
     /**
      * Step down to FOLLOWER upon discovering a higher term.
+     * Also fail all pending proposals from the old term to prevent data loss.
      */
     private void stepDown(long newTerm) {
         boolean wasCandidate = state == RaftState.CANDIDATE;
-        logger.info("[{}] Stepping down: term {} → {}", nodeId, currentTerm, newTerm);
+        long oldTerm = currentTerm;
+        logger.info("[{}] Stepping down: term {} → {}", nodeId, oldTerm, newTerm);
         currentTerm = newTerm;
         state = RaftState.FOLLOWER;
         votedFor = null;
         leaderId = null;
         savePersistentState();
+
+        // Fail proposals from the old term to prevent cross-term confusion
+        // If we step down, any pending proposals are no longer valid
+        pendingProposals.values().stream()
+                .filter(ps -> ps.term == oldTerm)
+                .forEach(ps -> ps.future.completeExceptionally(
+                        new IOException("Lost leadership at term " + oldTerm + "; stepped down to term " + newTerm)));
 
         if (wasCandidate) {
             recordElectionDuration(false);
@@ -459,9 +524,14 @@ public class RaftNode {
                         nodeId, lastApplied, entry.getCommandType(), e);
             }
 
-            CompletableFuture<Long> future = pendingProposals.remove(lastApplied);
-            if (future != null) {
-                future.complete(completionValue);
+            ProposalState ps = pendingProposals.remove(lastApplied);
+            if (ps != null && ps.term == currentTerm) {
+                ps.future.complete(completionValue);
+                logger.debug("[{}] Completed proposal for entry index {} (term={})",
+                        nodeId, lastApplied, ps.term);
+            } else if (ps != null) {
+                logger.warn("[{}] Discarding future for entry {} (was term {}, now term {})",
+                        nodeId, lastApplied, ps.term, currentTerm);
             }
         }
 
@@ -473,21 +543,24 @@ public class RaftNode {
 
     /**
      * Propose a new message to be replicated via Raft.
-     * Blocks until the entry is committed (majority ACK) or fails.
+     * Blocks until the entry is committed (majority ACK) or times out.
+
      */
     public long propose(String topic, byte[] payload, String key, long timestamp) throws IOException {
         lock.lock();
         long index;
+        long proposalTerm;
         CompletableFuture<Long> future;
         try {
             if (state != RaftState.LEADER) {
                 throw new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
             }
 
+            proposalTerm = currentTerm;
             index = raftLog.getLastIndex() + 1;
 
             RaftEntry.Builder entryBuilder = RaftEntry.newBuilder()
-                    .setTerm(currentTerm)
+                    .setTerm(proposalTerm)
                     .setIndex(index)
                     .setTopic(topic)
                     .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
@@ -500,25 +573,25 @@ public class RaftNode {
 
             RaftEntry entry = entryBuilder.build();
             raftLog.append(entry);
-
-            // Create a future that blocks until applyCommitted() processes this index
-            // (see applyCommitted() — it calls future.complete() when majority ACK)
             future = new CompletableFuture<>();
-            pendingProposals.put(index, future);
+            pendingProposals.put(index, new ProposalState(proposalTerm, future));
 
         } finally {
             lock.unlock();
         }
-
-        // Trigger immediate replication to peers
         sendHeartbeats();
-
-        // Wait for commitment (with timeout)
         try {
             return future.get(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         } catch (TimeoutException e) {
-            pendingProposals.remove(index);
-            throw new IOException("Raft proposal timed out (index=" + index + ")");
+            ProposalState ps = pendingProposals.get(index);
+            if (ps != null) {
+                ps.timedOut = true;
+                if (pendingProposals.size() > MAX_PENDING_PROPOSALS / 2) {
+                    logger.warn("[{}] High number of pending proposals: {} (threshold: {})",
+                            nodeId, pendingProposals.size(), MAX_PENDING_PROPOSALS);
+                }
+            }
+            throw new IOException("Raft proposal timed out (index=" + index + "); entry may still commit");
         } catch (ExecutionException e) {
             throw new IOException("Raft proposal failed: " + e.getCause().getMessage());
         } catch (InterruptedException e) {
@@ -540,16 +613,18 @@ public class RaftNode {
     public long proposeOffsetCommit(String consumerGroup, String topic, long offset) throws IOException {
         lock.lock();
         long index;
+        long proposalTerm;
         CompletableFuture<Long> future;
         try {
             if (state != RaftState.LEADER) {
                 throw new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
             }
 
+            proposalTerm = currentTerm;
             index = raftLog.getLastIndex() + 1;
 
             RaftEntry entry = RaftEntry.newBuilder()
-                    .setTerm(currentTerm)
+                    .setTerm(proposalTerm)
                     .setIndex(index)
                     .setTopic(topic)
                     .setCommandType(RaftCommandType.OFFSET_COMMIT)
@@ -560,7 +635,7 @@ public class RaftNode {
             raftLog.append(entry);
 
             future = new CompletableFuture<>();
-            pendingProposals.put(index, future);
+            pendingProposals.put(index, new ProposalState(proposalTerm, future));
 
         } finally {
             lock.unlock();
@@ -571,8 +646,15 @@ public class RaftNode {
         try {
             return future.get(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         } catch (TimeoutException e) {
-            pendingProposals.remove(index);
-            throw new IOException("Raft offset commit timed out (index=" + index + ")");
+            ProposalState ps = pendingProposals.get(index);
+            if (ps != null) {
+                ps.timedOut = true;
+                if (pendingProposals.size() > MAX_PENDING_PROPOSALS / 2) {
+                    logger.warn("[{}] High number of pending proposals: {} (threshold: {})",
+                            nodeId, pendingProposals.size(), MAX_PENDING_PROPOSALS);
+                }
+            }
+            throw new IOException("Raft offset commit timed out (index=" + index + "); entry may still commit");
         } catch (ExecutionException e) {
             throw new IOException("Raft offset commit failed: " + e.getCause().getMessage());
         } catch (InterruptedException e) {
@@ -596,15 +678,13 @@ public class RaftNode {
             boolean voteGranted = false;
 
             if (request.getTerm() >= currentTerm) {
-                // Grant vote if we haven't voted yet (or voted for same candidate)
-                // AND candidate's log is at least as up-to-date as ours (
                 boolean canVote = (votedFor == null || votedFor.equals(request.getCandidateId()));
                 boolean logOk = isLogUpToDate(request.getLastLogIndex(), request.getLastLogTerm());
 
                 if (canVote && logOk) {
                     votedFor = request.getCandidateId();
                     savePersistentState();
-                    resetElectionTimer(); // Reset timer when granting vote
+                    resetElectionTimer(); 
                     voteGranted = true;
                     logger.info("[{}] Granted vote to {} for term {}",
                             nodeId, request.getCandidateId(), request.getTerm());
