@@ -491,6 +491,8 @@ public class RaftNode {
             }
 
             long completionValue = lastApplied;
+            boolean applySucceeded = true;
+            Exception applyException = null;
 
             try {
                 switch (entry.getCommandType()) {
@@ -520,16 +522,26 @@ public class RaftNode {
                     }
                 }
             } catch (Exception e) {
+                applySucceeded = false;
+                applyException = e;
                 logger.error("[{}] Failed to apply entry {} (type={})",
                         nodeId, lastApplied, entry.getCommandType(), e);
             }
 
-            ProposalState ps = pendingProposals.remove(lastApplied);
+            ProposalState ps = pendingProposals.get(lastApplied);
             if (ps != null && ps.term == currentTerm) {
-                ps.future.complete(completionValue);
-                logger.debug("[{}] Completed proposal for entry index {} (term={})",
-                        nodeId, lastApplied, ps.term);
+                pendingProposals.remove(lastApplied);
+                if (applySucceeded) {
+                    ps.future.complete(completionValue);
+                    logger.debug("[{}] Completed proposal for entry index {} (term={})",
+                            nodeId, lastApplied, ps.term);
+                } else {
+                    ps.future.completeExceptionally(applyException != null
+                            ? applyException
+                            : new IOException("Failed to apply entry " + lastApplied));
+                }
             } else if (ps != null) {
+                pendingProposals.remove(lastApplied);
                 logger.warn("[{}] Discarding future for entry {} (was term {}, now term {})",
                         nodeId, lastApplied, ps.term, currentTerm);
             }
@@ -558,6 +570,11 @@ public class RaftNode {
 
             proposalTerm = currentTerm;
             index = raftLog.getLastIndex() + 1;
+
+            if (pendingProposals.size() >= MAX_PENDING_PROPOSALS) {
+                throw new IOException("Too many pending proposals (" + pendingProposals.size()
+                        + "/" + MAX_PENDING_PROPOSALS + ")");
+            }
 
             RaftEntry.Builder entryBuilder = RaftEntry.newBuilder()
                     .setTerm(proposalTerm)
@@ -622,6 +639,11 @@ public class RaftNode {
 
             proposalTerm = currentTerm;
             index = raftLog.getLastIndex() + 1;
+
+            if (pendingProposals.size() >= MAX_PENDING_PROPOSALS) {
+                throw new IOException("Too many pending proposals (" + pendingProposals.size()
+                        + "/" + MAX_PENDING_PROPOSALS + ")");
+            }
 
             RaftEntry entry = RaftEntry.newBuilder()
                     .setTerm(proposalTerm)
