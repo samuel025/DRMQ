@@ -71,7 +71,9 @@ public class RaftNode {
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
     private final ExecutorService raftExecutor;
     private ScheduledFuture<?> electionTimer;
-    private ScheduledFuture<?> heartbeatTimer;    private ScheduledFuture<?> proposalCleanupTimer;    private volatile boolean running = false;
+    private ScheduledFuture<?> heartbeatTimer;    
+    private ScheduledFuture<?> proposalCleanupTimer;    
+    private volatile boolean running = false;
     private volatile long electionStartNanos;
 
     private static class ProposalState {
@@ -87,7 +89,6 @@ public class RaftNode {
         }
     }
     private final Map<Long, ProposalState> pendingProposals = new ConcurrentHashMap<>();
-
     private final Map<String, Long> lastLogTime = new ConcurrentHashMap<>();
     private static final long LOG_RATE_LIMIT_MS = 1000;  
 
@@ -104,7 +105,6 @@ public class RaftNode {
         this.lastApplied = 0;
         this.nextIndex = new ConcurrentHashMap<>();
         this.matchIndex = new ConcurrentHashMap<>();
-        // Size the pool to handle concurrent RPCs to all peers + a small buffer
         this.raftExecutor = Executors.newFixedThreadPool(
                 Math.max(4, peers.size() + 2),
                 r -> {
@@ -168,7 +168,6 @@ public class RaftNode {
             long ageNanos = now - ps.createdAtNanos;
             
             if (ageNanos > staleThresholdNanos) {
-                // Remove stale proposal and fail the future
                 iter.remove();
                 ps.future.completeExceptionally(
                         new IOException("Proposal removed: stale after " + 
@@ -307,7 +306,6 @@ public class RaftNode {
             lock.unlock();
         }
 
-        // If still candidate after timeout, try again
         resetElectionTimer();
     }
 
@@ -331,10 +329,8 @@ public class RaftNode {
         logger.info("[{}] ★ Became LEADER for term {} (lastLogIndex={}, electionMs={})",
             nodeId, currentTerm, lastLogIndex, electionDuration);
 
-        // Send initial heartbeat immediately
         sendHeartbeats();
 
-        // Start periodic heartbeats
         heartbeatTimer = scheduler.scheduleAtFixedRate(
                 this::sendHeartbeats, HEARTBEAT_INTERVAL_MS, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
@@ -353,8 +349,6 @@ public class RaftNode {
         leaderId = null;
         savePersistentState();
 
-        // Fail proposals from the old term to prevent cross-term confusion
-        // If we step down, any pending proposals are no longer valid
         pendingProposals.values().stream()
                 .filter(ps -> ps.term == oldTerm)
                 .forEach(ps -> ps.future.completeExceptionally(
@@ -460,7 +454,6 @@ public class RaftNode {
                 }
             }
 
-            // Majority = floor(clusterSize/2) + 1 (e.g., 3-node cluster needs 2)
             int majority = (peers.size() + 1) / 2 + 1;
             if (replicaCount >= majority) {
                 commitIndex = n;
@@ -497,7 +490,6 @@ public class RaftNode {
             try {
                 switch (entry.getCommandType()) {
                     case OFFSET_COMMIT -> {
-                        // Apply offset commit to OffsetManager
                         if (offsetManager != null && entry.hasConsumerGroup() && entry.hasOffsetValue()) {
                             offsetManager.commit(
                                     entry.getConsumerGroup(),
@@ -889,9 +881,7 @@ public class RaftNode {
         }
     }
 
-    // ===========================
-    //  Getters
-    // ===========================
+   
 
     public RaftState getState() { return state; }
     public long getCurrentTerm() { return currentTerm; }

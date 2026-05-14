@@ -20,8 +20,8 @@ import java.util.concurrent.ThreadLocalRandom;
  *
  * Offsets are stored on the broker per consumer group.
  * On subscribe(), the consumer fetches its last committed offset from the
- * broker and resumes from there. After each poll(), the new offset is
- * automatically committed back to the broker.
+ * broker and resumes from there. Offsets are only auto-committed after poll()
+ * when auto-commit is enabled.
  */
 public class DRMQConsumer implements AutoCloseable {
     private static final Logger logger = LoggerFactory.getLogger(DRMQConsumer.class);
@@ -49,6 +49,7 @@ public class DRMQConsumer implements AutoCloseable {
 
     private final Map<String, Long> topicOffsets = new HashMap<>();
     private final Object pollLock = new Object();
+    private volatile boolean autoCommit = false;
 
 
 
@@ -94,6 +95,17 @@ public class DRMQConsumer implements AutoCloseable {
         this.currentServerIndex = ThreadLocalRandom.current().nextInt(bootstrapServers.size());
         this.host = bootstrapServers.get(currentServerIndex)[0];
         this.port = Integer.parseInt(bootstrapServers.get(currentServerIndex)[1]);
+    }
+
+    /**
+     * Enable or disable auto-commit after poll(). Default is false.
+     */
+    public void setAutoCommit(boolean autoCommit) {
+        this.autoCommit = autoCommit;
+    }
+
+    public boolean isAutoCommit() {
+        return autoCommit;
     }
 
     private static List<String[]> parseBootstrapServers(String bootstrapServersStr) {
@@ -320,7 +332,9 @@ public class DRMQConsumer implements AutoCloseable {
             if (!messages.isEmpty()) {
                 long nextOffset = messages.get(messages.size() - 1).offset() + 1;
                 topicOffsets.put(topic, nextOffset);
-                commitOffsetToBroker(topic, nextOffset);
+                if (autoCommit) {
+                    commitOffsetToBroker(topic, nextOffset);
+                }
             }
         }
 
