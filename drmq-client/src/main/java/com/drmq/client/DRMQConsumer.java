@@ -284,10 +284,6 @@ public class DRMQConsumer implements AutoCloseable {
         logger.info("Subscribed to topic '{}' from explicit offset {} (group='{}')", topic, fromOffset, consumerGroup);
     }
 
-    // -------------------------------------------------------------------------
-    // Poll (auto-commits offset after fetching, with reconnect on failure)
-    // -------------------------------------------------------------------------
-
     public List<ConsumedMessage> poll() throws IOException {
         return poll(DEFAULT_MAX_MESSAGES, DEFAULT_POLL_TIMEOUT_MS);
     }
