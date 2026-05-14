@@ -30,9 +30,11 @@ public class ConsumerApp {
         try (DRMQConsumer consumer = new DRMQConsumer(bootstrapServers, consumerGroup);
              Scanner scanner = new Scanner(System.in)) {
 
-            consumer.connect();
-            System.out.println("✓ Connected to broker");
+                consumer.connect();
+                System.out.println("✓ Connected to broker");
             System.out.printf( "✓ Offsets tracked by broker for group '%s'\n\n", consumerGroup);
+                System.out.printf("✓ Auto-commit: %s (use 'autocommit on|off')\n\n",
+                    consumer.isAutoCommit() ? "on" : "off");
 
             printHelp();
 
@@ -130,7 +132,11 @@ public class ConsumerApp {
                                     System.out.println("  └─");
                                 }
                                 System.out.println();
-                                System.out.println("  ✓ Offsets committed to broker automatically\n");
+                                if (consumer.isAutoCommit()) {
+                                    System.out.println("  ✓ Offsets committed to broker automatically\n");
+                                } else {
+                                    System.out.println("  ⚠ Offsets NOT committed (auto-commit is off)\n");
+                                }
                             }
                         } catch (IOException e) {
                             System.out.printf("❌ Error polling: %s\n\n", e.getMessage());
@@ -148,7 +154,8 @@ public class ConsumerApp {
                                 continue;
                             }
                         }
-                        System.out.println("📡 Streaming... (press Ctrl+C to stop)\n");
+                        System.out.printf("📡 Streaming... (press Ctrl+C to stop) [auto-commit=%s]\n\n",
+                                consumer.isAutoCommit() ? "on" : "off");
                         try {
                             while (true) {
                                 List<DRMQConsumer.ConsumedMessage> messages = consumer.poll(100, streamTimeout);
@@ -170,8 +177,53 @@ public class ConsumerApp {
                     case "status" -> {
                         System.out.printf("\nGroup: %s\n", consumerGroup);
                         System.out.println("─────────────────────────────");
+                        System.out.printf("Auto-commit: %s\n", consumer.isAutoCommit() ? "on" : "off");
                         System.out.println("  (Use 'subscribe <topic>' to add subscriptions)");
                         System.out.println("  Tip: Offsets persist on the broker — restart anytime and resume!\n");
+                    }
+
+                    case "commit" -> {
+                        if (parts.length < 2) {
+                            System.out.println("❌ Usage: commit <topic> [offset]\n");
+                            continue;
+                        }
+
+                        String topic = parts[1];
+                        long offset;
+                        if (parts.length >= 3) {
+                            try {
+                                offset = Long.parseLong(parts[2]);
+                            } catch (NumberFormatException e) {
+                                System.out.println("❌ Invalid offset: " + parts[2] + "\n");
+                                continue;
+                            }
+                        } else {
+                            offset = consumer.getCurrentOffset(topic);
+                        }
+
+                        try {
+                            consumer.commit(topic, offset);
+                            System.out.printf("✓ Committed offset %d for topic '%s'\n\n", offset, topic);
+                        } catch (IOException e) {
+                            System.out.printf("❌ Commit failed: %s\n\n", e.getMessage());
+                        }
+                    }
+
+                    case "autocommit" -> {
+                        if (parts.length < 2) {
+                            System.out.println("❌ Usage: autocommit on|off\n");
+                            continue;
+                        }
+                        String value = parts[1].toLowerCase();
+                        if ("on".equals(value) || "true".equals(value)) {
+                            consumer.setAutoCommit(true);
+                            System.out.println("✓ Auto-commit enabled\n");
+                        } else if ("off".equals(value) || "false".equals(value)) {
+                            consumer.setAutoCommit(false);
+                            System.out.println("✓ Auto-commit disabled\n");
+                        } else {
+                            System.out.println("❌ Usage: autocommit on|off\n");
+                        }
                     }
 
                     default -> {
@@ -195,6 +247,8 @@ public class ConsumerApp {
         System.out.println("  poll [max] [timeout_ms]              - One-shot fetch (long-poll if timeout_ms>0)");
         System.out.println("    timeout_ms=0 → short poll (return immediately if empty)");
         System.out.println("    timeout_ms>0 → long poll (broker waits up to N ms for messages)");
+        System.out.println("  commit <topic> [offset]              - Commit current or explicit offset");
+        System.out.println("  autocommit on|off                    - Enable/disable auto-commit");
         System.out.println("  stream [timeout_ms]                  - Continuous mode: auto-polls forever");
         System.out.println("    (press Ctrl+C to stop streaming)");
         System.out.println("  status                               - Show group info");

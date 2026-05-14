@@ -16,9 +16,6 @@ import java.util.concurrent.*;
  * Wire protocol: [4-byte big-endian length][MessageEnvelope protobuf bytes]
  * Both client traffic (produce/consume) and Raft peer RPCs (RequestVote,
  * AppendEntries) use this same framing on the same TCP port.
- *
- * The handler reads one envelope at a time, dispatches to the appropriate
- * handler based on MessageType, and writes back a response envelope.
  */
 public class ClientHandler implements Runnable {
     private static final Logger logger = LoggerFactory.getLogger(ClientHandler.class);
@@ -26,8 +23,8 @@ public class ClientHandler implements Runnable {
     private final Socket socket;
     private final MessageStore messageStore;
     private final OffsetManager offsetManager;
-    private final RaftNode raftNode;  // null in single-node mode
-    private final Set<ClientHandler> ownerSet;  // for self-removal on disconnect
+    private final RaftNode raftNode;  
+    private final Set<ClientHandler> ownerSet; 
     private volatile boolean running = true;
     private static final int RPC_THREAD_COUNT = Math.max(4, Runtime.getRuntime().availableProcessors());
     private static final int RPC_QUEUE_CAPACITY = 1000;
@@ -177,8 +174,6 @@ public class ClientHandler implements Runnable {
 
     /**
      * Handle a consume request - fetch messages from the specified offset.
-     * If timeout_ms > 0, uses long-polling: waits efficiently via wait()/notifyAll()
-     * until messages arrive or the timeout expires.
      */
     private MessageEnvelope handleConsumeRequest(MessageEnvelope envelope) throws IOException {
         long startNanos = System.nanoTime();
@@ -188,9 +183,8 @@ public class ClientHandler implements Runnable {
             String topic      = request.getTopic();
             long fromOffset   = request.getFromOffset();
             int maxMessages   = request.getMaxMessages();
-            long timeoutMs    = request.getTimeoutMs(); // 0 = short poll
+            long timeoutMs    = request.getTimeoutMs();
 
-            // Fetch messages — uses efficient wait/notify for long-polling (no thread sleep-loop)
             var messages = (timeoutMs > 0)
                     ? messageStore.waitForMessages(topic, fromOffset, maxMessages, timeoutMs)
                     : messageStore.getMessages(topic, fromOffset, maxMessages);
@@ -219,9 +213,7 @@ public class ClientHandler implements Runnable {
         }
     }
 
-    /**
-     * Create an error response envelope for produce requests.
-     */
+  
     private MessageEnvelope createProduceErrorResponse(String errorMessage) {
         ProduceResponse response = ProduceResponse.newBuilder()
                 .setSuccess(false)
@@ -234,9 +226,6 @@ public class ClientHandler implements Runnable {
                 .build();
     }
 
-    /**
-     * Create an error response envelope for consume requests.
-     */
     private MessageEnvelope createConsumeErrorResponse(String errorMessage) {
         ConsumeResponse response = ConsumeResponse.newBuilder()
                 .setSuccess(false)
@@ -290,7 +279,6 @@ public class ClientHandler implements Runnable {
             long offset  = request.getOffset();
 
             if (raftNode != null) {
-                // Cluster mode: replicate offset commit through Raft consensus
                 if (!raftNode.isLeader()) {
                     String leaderAddr = raftNode.getLeaderAddress();
                     CommitOffsetResponse response = CommitOffsetResponse.newBuilder()
@@ -441,8 +429,6 @@ public class ClientHandler implements Runnable {
         }
         RequestVoteRequest request = RequestVoteRequest.parseFrom(envelope.getPayload());
 
-        // Process synchronously but in a dedicated executor to prevent blocking
-        // the ClientHandler thread while holding RaftNode.lock
         Future<RequestVoteResponse> future = null;
         try {
             future = rpcExecutor.submit(() -> raftNode.handleRequestVote(request));
