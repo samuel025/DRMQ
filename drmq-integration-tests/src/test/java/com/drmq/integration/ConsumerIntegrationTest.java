@@ -128,6 +128,7 @@ class ConsumerIntegrationTest {
 
         // Consumer reads and commits offset
         try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT, "my-service")) {
+            consumer.setAutoCommit(true);
             consumer.connect();
             consumer.subscribe("group-topic");
             List<DRMQConsumer.ConsumedMessage> messages = consumer.poll();

@@ -72,8 +72,10 @@ public class RaftNode {
     private final ExecutorService raftExecutor;
     private ScheduledFuture<?> electionTimer;
     private ScheduledFuture<?> heartbeatTimer;    
-    private ScheduledFuture<?> proposalCleanupTimer;    
+    private ScheduledFuture<?> proposalCleanupTimer;
+    private ScheduledFuture<?> stateSaveTimer;
     private volatile boolean running = false;
+    private volatile boolean stateSaveNeeded = false;
     private volatile long electionStartNanos;
 
     private static class ProposalState {
@@ -135,6 +137,13 @@ public class RaftNode {
         running = true;
         resetElectionTimer();
         startProposalCleanupTask();
+        
+        stateSaveTimer = scheduler.scheduleAtFixedRate(() -> {
+            if (stateSaveNeeded) {
+                savePersistentState();
+            }
+        }, 1, 1, TimeUnit.SECONDS);
+
         logger.info("[{}] Raft node started (term={}, state=FOLLOWER, peers={})",
                 nodeId, currentTerm, peers.size());
     }
@@ -188,6 +197,7 @@ public class RaftNode {
         if (electionTimer != null) electionTimer.cancel(false);
         if (heartbeatTimer != null) heartbeatTimer.cancel(false);
         if (proposalCleanupTimer != null) proposalCleanupTimer.cancel(false);
+        if (stateSaveTimer != null) stateSaveTimer.cancel(false);
         scheduler.shutdownNow();
         raftExecutor.shutdownNow();
 
@@ -540,7 +550,7 @@ public class RaftNode {
         }
 
         if (applied) {
-            savePersistentState();
+            stateSaveNeeded = true;
         }
     }
 
@@ -819,12 +829,26 @@ public class RaftNode {
 
 
     private void savePersistentState() {
+        long term;
+        String voted;
+        long applied;
+        
+        lock.lock();
+        try {
+            term = currentTerm;
+            voted = votedFor;
+            applied = lastApplied;
+            stateSaveNeeded = false;
+        } finally {
+            lock.unlock();
+        }
+
         Path tempPath = null;
         try {
             Properties props = new Properties();
-            props.setProperty("currentTerm", String.valueOf(currentTerm));
-            props.setProperty("votedFor", votedFor != null ? votedFor : "");
-            props.setProperty("lastApplied", String.valueOf(lastApplied));
+            props.setProperty("currentTerm", String.valueOf(term));
+            props.setProperty("votedFor", voted != null ? voted : "");
+            props.setProperty("lastApplied", String.valueOf(applied));
             tempPath = Files.createTempFile(stateFilePath.getParent(), stateFilePath.getFileName().toString(), ".tmp");
             try (FileOutputStream fos = new FileOutputStream(tempPath.toFile())) {
                 props.store(fos, "Raft persistent state");
