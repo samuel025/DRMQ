@@ -17,11 +17,6 @@ import java.net.Socket;
  * design choice: Raft peer connections reuse the existing ClientHandler on
  * the remote broker, so no separate port or server is needed for peer
  * communication.
- *
- * Connection lifecycle:
- * - Lazy connect: ensureConnected() opens a TCP socket on first use
- * - Auto-reconnect: if a send fails, the connection is closed and retried next call
- * - Thread-safe: all sends are synchronized on a lock object
  */
 public class RaftPeer {
     private static final Logger logger = LoggerFactory.getLogger(RaftPeer.class);
@@ -186,3 +181,6 @@ public class RaftPeer {
 
     public PeerAddress getAddress() { return address; }
 }
+
+
+

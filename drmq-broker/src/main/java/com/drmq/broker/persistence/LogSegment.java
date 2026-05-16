@@ -19,7 +19,7 @@ import java.nio.file.StandardOpenOption;
  * crashes, messages can be recovered by replaying the log file.
  *
  * File format: [4-byte message length][StoredMessage protobuf bytes] repeated.
- * All writes are followed by fsync (FileChannel.force) for crash safety.
+ * We rely on Raft for durability, so we do not synchronously fsync on every append.
  *
  * Uses FileChannel for efficient I/O and position-based reads (no seeking needed
  * for concurrent access).
@@ -69,7 +69,7 @@ public class LogSegment implements AutoCloseable {
         while (buffer.hasRemaining()) {
             fileChannel.write(buffer, position + buffer.position());
         }
-        fileChannel.force(true);
+        // Rely on OS page cache for flush, as RaftLog provides durability
         
         currentSize += buffer.limit();
         BrokerMetrics.get().recordLogAppend(buffer.limit(), System.nanoTime() - startNanos);
