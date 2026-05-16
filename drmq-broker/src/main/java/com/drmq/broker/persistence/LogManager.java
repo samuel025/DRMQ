@@ -68,7 +68,6 @@ public class LogManager implements AutoCloseable {
             if (!Files.exists(topicDir)) {
                 Files.createDirectories(topicDir);
             }
-            // For Phase 2, we use a single segment "00000000.log" per topic
             Path logPath = topicDir.resolve("00000000" + LOG_FILE_SUFFIX);
             LogSegment segment = new LogSegment(logPath);
             topicSegments.put(topic, segment);

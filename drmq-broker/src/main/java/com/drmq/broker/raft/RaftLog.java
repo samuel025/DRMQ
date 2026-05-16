@@ -29,6 +29,7 @@ public class RaftLog {
     private final List<RaftEntry> entries;       
     private final List<Long> filePositions;     
     private RandomAccessFile raf;
+    private long startIndex = 1;
 
     public RaftLog(Path dataDir) throws IOException {
         Path raftDir = dataDir.resolve("raft");
@@ -73,8 +74,11 @@ public class RaftLog {
                 break;
             }
         }
-        logger.info("Raft log recovered: {} entries, lastIndex={}, lastTerm={}",
-                count, getLastIndex(), getLastTerm());
+        if (!entries.isEmpty()) {
+            startIndex = entries.get(0).getIndex();
+        }
+        logger.info("Raft log recovered: {} entries, startIndex={}, lastIndex={}, lastTerm={}",
+                count, startIndex, getLastIndex(), getLastTerm());
     }
 
     /**
@@ -97,20 +101,23 @@ public class RaftLog {
      * Returns null if index is out of bounds.
      */
     public synchronized RaftEntry getEntry(long index) {
-        if (index < 1 || index > entries.size()) {
+        if (index < startIndex || index > getLastIndex()) {
             return null;
         }
-        return entries.get((int) (index - 1));
+        return entries.get((int) (index - startIndex));
     }
 
     /**
      * Get all entries from the given Raft index (inclusive) to the end.
      */
     public synchronized List<RaftEntry> getEntriesFrom(long fromIndex) {
-        if (fromIndex < 1 || fromIndex > entries.size()) {
+        if (fromIndex < startIndex || fromIndex > getLastIndex() + 1) {
             return Collections.emptyList();
         }
-        return new ArrayList<>(entries.subList((int) (fromIndex - 1), entries.size()));
+        if (fromIndex == getLastIndex() + 1) {
+            return Collections.emptyList();
+        }
+        return new ArrayList<>(entries.subList((int) (fromIndex - startIndex), entries.size()));
     }
 
     /**
@@ -154,11 +161,14 @@ public class RaftLog {
      * of the first removed entry, which is atomic on most filesystems.
      */
     public synchronized void truncateFrom(long fromIndex) throws IOException {
-        if (fromIndex < 1 || fromIndex > entries.size()) {
+        if (fromIndex < startIndex || fromIndex > getLastIndex() + 1) {
+            return;
+        }
+        if (fromIndex == getLastIndex() + 1) {
             return;
         }
 
-        int removeFromListIndex = (int) (fromIndex - 1);
+        int removeFromListIndex = (int) (fromIndex - startIndex);
         long truncateToPosition = filePositions.get(removeFromListIndex);
 
         logger.warn("Truncating raft log from index {} (removing {} entries, truncating file to byte {})",
@@ -169,6 +179,21 @@ public class RaftLog {
 
         entries.subList(removeFromListIndex, entries.size()).clear();
         filePositions.subList(removeFromListIndex, filePositions.size()).clear();
+    }
+
+    /**
+     * Compact the Raft log by removing entries from memory up to the given index.
+     * This prevents unbounded memory growth. The MessageStore serves as the permanent store.
+     */
+    public synchronized void compact(long upToIndex) {
+        if (upToIndex <= startIndex || upToIndex > getLastIndex()) {
+            return;
+        }
+        int removeCount = (int) (upToIndex - startIndex);
+        entries.subList(0, removeCount).clear();
+        filePositions.subList(0, removeCount).clear();
+        startIndex = upToIndex;
+        logger.debug("Compacted Raft log up to index {}", upToIndex);
     }
 
     /**

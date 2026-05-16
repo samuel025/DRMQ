@@ -27,16 +27,19 @@ public class MessageStore {
     private final AtomicLong globalOffset = new AtomicLong(0);
     private final LogManager logManager;
 
-    // Topic -> Offset -> Byte Position in log file
+    // Topic -> Offset -> Byte Position in log file (Sparse Index)
     private final ConcurrentHashMap<String, ConcurrentSkipListMap<Long, Long>> topicIndex = new ConcurrentHashMap<>();
+    
+    // Topic -> Total number of messages
+    private final ConcurrentHashMap<String, AtomicLong> topicMessageCounts = new ConcurrentHashMap<>();
     
     // In-memory cache for recent messages (Topic -> BoundedMessageCache)
     private final ConcurrentHashMap<String, BoundedMessageCache> messageCache = new ConcurrentHashMap<>();
     
-    // Maximum number of messages to keep in memory per topic
     private static final int MAX_CACHE_SIZE_PER_TOPIC = 1000;
+    private static final int INDEX_INTERVAL = 1000;
+    private static final int MAX_INDEX_ENTRIES = 10000;
 
-    // Monitor for long-poll notification — consumers wait() on this, append() calls notifyAll()
     private final Object messageMonitor = new Object();
     private final AtomicLong messageSignal = new AtomicLong(0);
 
@@ -65,6 +68,7 @@ public class MessageStore {
                     
                     indexMessage(topic, offset, position);
                     addToCache(topic, message);
+                    topicMessageCounts.computeIfAbsent(topic, k -> new AtomicLong()).incrementAndGet();
                     
                     if (offset > maxOffset) {
                         maxOffset = offset;
@@ -84,8 +88,13 @@ public class MessageStore {
     }
 
     private void indexMessage(String topic, long offset, long position) {
-        topicIndex.computeIfAbsent(topic, k -> new ConcurrentSkipListMap<>())
-                .put(offset, position);
+        if (offset % INDEX_INTERVAL == 0) {
+            ConcurrentSkipListMap<Long, Long> index = topicIndex.computeIfAbsent(topic, k -> new ConcurrentSkipListMap<>());
+            index.put(offset, position);
+            while (index.size() > MAX_INDEX_ENTRIES) {
+                index.pollFirstEntry();
+            }
+        }
     }
 
     private void addToCache(String topic, StoredMessage message) {
@@ -114,15 +123,13 @@ public class MessageStore {
         StoredMessage message = builder.build();
 
         try {
-            // 1. Persist to WAL
             LogSegment segment = logManager.getOrCreateSegment(topic);
             long position = segment.append(message);
 
-            // 2. Update Index
             indexMessage(topic, offset, position);
 
-            // 3. Update Cache
             addToCache(topic, message);
+            topicMessageCounts.computeIfAbsent(topic, k -> new AtomicLong()).incrementAndGet();
 
             logger.debug("Persisted and indexed message: topic={}, offset={}, position={}", 
                     topic, offset, position);
@@ -151,12 +158,26 @@ public class MessageStore {
             if (msg != null) return msg;
         }
 
-        Map<Long, Long> index = topicIndex.get(topic);
-        if (index != null && index.containsKey(offset)) {
+        ConcurrentSkipListMap<Long, Long> index = topicIndex.get(topic);
+        if (index != null) {
             try {
-                long position = index.get(offset);
+                Map.Entry<Long, Long> floorEntry = index.floorEntry(offset);
+                long startPosition = floorEntry != null ? floorEntry.getValue() : 0;
+                
                 LogSegment segment = logManager.getOrCreateSegment(topic);
-                return segment.read(position);
+                long segmentSize = segment.getSize();
+                long position = startPosition;
+
+                while (position < segmentSize) {
+                    StoredMessage message = segment.read(position);
+                    if (message.getOffset() == offset) {
+                        return message;
+                    }
+                    if (message.getOffset() > offset) {
+                        break;
+                    }
+                    position += 4 + message.getSerializedSize();
+                }
             } catch (IOException e) {
                 logger.error("Error reading message from disk: topic={}, offset={}", topic, offset, e);
             }
@@ -168,7 +189,6 @@ public class MessageStore {
     /**
      * Get messages from a topic starting at the given offset.
      * First tries the in-memory cache, then falls back to disk if needed.
-     * Offsets are global across all topics, so a topic's offsets may be sparse.
      */
     public List<StoredMessage> getMessages(String topic, long fromOffset, int maxCount) {
         if (maxCount <= 0) {
@@ -176,52 +196,37 @@ public class MessageStore {
         }
         
         BoundedMessageCache cache = messageCache.get(topic);
-        
-        // Get the index to find the next real offset >= fromOffset (handles sparse topics)
-        ConcurrentSkipListMap<Long, Long> index = topicIndex.get(topic);
-                Long nextRealOffset = null;
-        if (index != null) {
-            nextRealOffset = index.ceilingKey(fromOffset);
-        }
-        
-        if (nextRealOffset == null) {
-            return Collections.emptyList();
-        }
-        
-        // Try cache first
         if (cache != null) {
             List<StoredMessage> cachedMessages = cache.getMessagesFrom(fromOffset, maxCount);
-            if (cachedMessages.size() >= maxCount && cachedMessages.get(0).getOffset() == nextRealOffset) {
+            if (cachedMessages.size() >= maxCount) {
                 return cachedMessages;
             }
         }
         
-        if (index == null) {
-            return Collections.emptyList();
-        }
-        List<StoredMessage> result = new ArrayList<>();
-        LogSegment segment;
-        try {
-            segment = logManager.getOrCreateSegment(topic);
-        } catch (IOException e) {
-            logger.error("Failed to get segment for topic {}: {}", topic, e.getMessage());
-            return Collections.emptyList();
+        ConcurrentSkipListMap<Long, Long> index = topicIndex.get(topic);
+        long startPosition = 0;
+        if (index != null) {
+            Map.Entry<Long, Long> floorEntry = index.floorEntry(fromOffset);
+            if (floorEntry != null) {
+                startPosition = floorEntry.getValue();
+            }
         }
         
-        for (Map.Entry<Long, Long> entry : index.tailMap(fromOffset).entrySet()) {
-            if (result.size() >= maxCount) {
-                break;  
-            }
+        List<StoredMessage> result = new ArrayList<>();
+        try {
+            LogSegment segment = logManager.getOrCreateSegment(topic);
+            long segmentSize = segment.getSize();
+            long position = startPosition;
             
-            long offset = entry.getKey();
-            long position = entry.getValue();
-            
-            try {
+            while (position < segmentSize && result.size() < maxCount) {
                 StoredMessage message = segment.read(position);
-                result.add(message);
-            } catch (IOException e) {
-                logger.warn("Error reading message at offset {} from disk: {}", offset, e.getMessage());
+                if (message.getOffset() >= fromOffset) {
+                    result.add(message);
+                }
+                position += 4 + message.getSerializedSize();
             }
+        } catch (IOException e) {
+            logger.warn("Error reading messages from disk for topic {}: {}", topic, e.getMessage());
         }
         
         return result;
@@ -229,8 +234,7 @@ public class MessageStore {
 
     /**
      * Wait for messages to arrive on a topic, blocking until messages are available
-     * or the timeout expires. Uses Object.wait()/notifyAll() for efficient blocking
-     * instead of polling with Thread.sleep().
+     * or the timeout expires. 
      * @param topic       the topic to wait for messages on
      * @param fromOffset  starting offset
      * @param maxCount    maximum messages to return
@@ -277,16 +281,16 @@ public class MessageStore {
     }
 
     public int getMessageCount(String topic) {
-        Map<Long, Long> index = topicIndex.get(topic);
-        return index == null ? 0 : index.size();
+        AtomicLong count = topicMessageCounts.get(topic);
+        return count == null ? 0 : count.intValue();
     }
 
     public List<String> getTopics() {
-        return new ArrayList<>(topicIndex.keySet());
+        return new ArrayList<>(topicMessageCounts.keySet());
     }
 
     public int getTopicCount() {
-        return topicIndex.size();
+        return topicMessageCounts.size();
     }
 
     public long getCachedMessageCount() {
@@ -299,9 +303,9 @@ public class MessageStore {
 
     public void clear() {
         topicIndex.clear();
+        topicMessageCounts.clear();
         messageCache.clear();
         globalOffset.set(0);
-        // Note: This doesn't delete files from disk for safety, but clears memory view.
         logger.info("Message store memory state cleared");
     }
 
@@ -314,7 +318,6 @@ public class MessageStore {
 
         public BoundedMessageCache(int maxSize) {
             this.maxSize = maxSize;
-            // accessOrder=false: FIFO eviction, get() is NOT a structural modification
             this.cache = new LinkedHashMap<Long, StoredMessage>(maxSize, 0.75f, false) {
                 @Override
                 protected boolean removeEldestEntry(Map.Entry<Long, StoredMessage> eldest) {

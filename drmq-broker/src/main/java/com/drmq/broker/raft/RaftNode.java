@@ -551,6 +551,10 @@ public class RaftNode {
 
         if (applied) {
             stateSaveNeeded = true;
+            long compactIndex = lastApplied - 1000;
+            if (compactIndex > 0) {
+                raftLog.compact(compactIndex);
+            }
         }
     }
 
