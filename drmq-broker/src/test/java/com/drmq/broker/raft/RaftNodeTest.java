@@ -45,6 +45,9 @@ class RaftNodeTest {
 
     @AfterEach
     void tearDown() throws IOException {
+        if (raftNode != null) {
+            raftNode.stop();
+        }
         if (logManager != null) {
             logManager.close();
         }
@@ -130,7 +133,6 @@ class RaftNodeTest {
                 .build();
         raftNode.handleRequestVote(request1);
 
-        // Node3 also requests vote in term 1
         RequestVoteRequest request2 = RequestVoteRequest.newBuilder()
                 .setTerm(1)
                 .setCandidateId("node3")
@@ -147,7 +149,6 @@ class RaftNodeTest {
     void electionTimeoutTransitionsToCandidate() throws InterruptedException {
         AtomicInteger voteRequestsSent = new AtomicInteger(0);
 
-        // Register dummy handlers to count RPCs and simulate a split vote / failure to win
         raftNode.registerVoteHandler("node2", req -> {
             voteRequestsSent.incrementAndGet();
             return RequestVoteResponse.newBuilder().setTerm(req.getTerm()).setVoteGranted(false).build();
@@ -159,10 +160,8 @@ class RaftNodeTest {
 
         raftNode.start();
 
-        // The election timeout is 150-300ms. Wait for 500ms to ensure it fires.
         Thread.sleep(500);
 
-        // Node should have transitioned to CANDIDATE
         assertEquals(RaftState.CANDIDATE, raftNode.getState());
         assertTrue(raftNode.getCurrentTerm() > 0);
         assertTrue(voteRequestsSent.get() > 0, "Should have sent RequestVote RPCs");
@@ -170,7 +169,6 @@ class RaftNodeTest {
 
     @Test
     void winsElectionAndBecomesLeader() throws InterruptedException {
-        // Register dummy handlers that GRANT the vote
         raftNode.registerVoteHandler("node2", req -> 
             RequestVoteResponse.newBuilder().setTerm(req.getTerm()).setVoteGranted(true).build()
         );
@@ -178,7 +176,6 @@ class RaftNodeTest {
             RequestVoteResponse.newBuilder().setTerm(req.getTerm()).setVoteGranted(true).build()
         );
 
-        // Dummy append handler just acknowledges heartbeats
         raftNode.registerAppendHandler("node2", req -> 
             AppendEntriesResponse.newBuilder().setTerm(req.getTerm()).setSuccess(true).setMatchIndex(req.getEntriesCount()).build()
         );
@@ -188,10 +185,8 @@ class RaftNodeTest {
 
         raftNode.start();
 
-        // Wait for election timeout
         Thread.sleep(500);
 
-        // Node should have won the election and become LEADER
         assertEquals(RaftState.LEADER, raftNode.getState());
         assertEquals(nodeId, raftNode.getLeaderId());
     }

@@ -551,6 +551,26 @@ public class RaftNode {
 
         if (applied) {
             stateSaveNeeded = true;
+            
+            long retentionLimit = lastApplied - 100_000; 
+            long safeCompactIndex;
+            
+            if (isLeader()) {
+                long minMatchIndex = lastApplied;
+                for (long idx : matchIndex.values()) {
+                    minMatchIndex = Math.min(minMatchIndex, idx);
+                }
+                safeCompactIndex = Math.max(retentionLimit, minMatchIndex);
+            } else {
+                safeCompactIndex = retentionLimit;
+            }
+            
+            // Leave at least a 1000 entry buffer
+            long finalCompactIndex = Math.min(safeCompactIndex, lastApplied - 1000);
+            
+            if (finalCompactIndex > 0) {
+                raftLog.compact(finalCompactIndex);
+            }
         }
     }
 

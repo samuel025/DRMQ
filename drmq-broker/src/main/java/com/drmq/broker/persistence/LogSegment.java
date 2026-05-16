@@ -13,16 +13,7 @@ import java.nio.file.StandardOpenOption;
 
 /**
  * A single log file (WAL segment) for one topic.
- *
- * Each topic's messages are persisted to disk as a write-ahead log (WAL)
- * before being indexed in memory. This ensures durability: even if the broker
- * crashes, messages can be recovered by replaying the log file.
- *
  * File format: [4-byte message length][StoredMessage protobuf bytes] repeated.
- * We rely on Raft for durability, so we do not synchronously fsync on every append.
- *
- * Uses FileChannel for efficient I/O and position-based reads (no seeking needed
- * for concurrent access).
  */
 public class LogSegment implements AutoCloseable {
     private static final Logger logger = LoggerFactory.getLogger(LogSegment.class);
@@ -30,7 +21,7 @@ public class LogSegment implements AutoCloseable {
 
     private final Path filePath;
     private final FileChannel fileChannel;
-    private volatile long currentSize; // volatile for thread-safe reads
+    private volatile long currentSize; 
 
     public LogSegment(Path filePath) throws IOException {
         this.filePath = filePath;
@@ -53,7 +44,6 @@ public class LogSegment implements AutoCloseable {
         long startNanos = System.nanoTime();
         byte[] messageBytes = message.toByteArray();
         
-        // Validate message size to ensure it can be read back
         if (messageBytes.length > MAX_MESSAGE_SIZE) {
             throw new IllegalArgumentException(
                 "Message size " + messageBytes.length + " bytes exceeds maximum allowed size " + 
@@ -69,7 +59,6 @@ public class LogSegment implements AutoCloseable {
         while (buffer.hasRemaining()) {
             fileChannel.write(buffer, position + buffer.position());
         }
-        // Rely on OS page cache for flush, as RaftLog provides durability
         
         currentSize += buffer.limit();
         BrokerMetrics.get().recordLogAppend(buffer.limit(), System.nanoTime() - startNanos);
@@ -85,7 +74,6 @@ public class LogSegment implements AutoCloseable {
      */
     public StoredMessage read(long position) throws IOException {
         long startNanos = System.nanoTime();
-        // Read 4-byte length prefix, handling short reads
         ByteBuffer lengthBuffer = ByteBuffer.allocate(4);
         int bytesRead = 0;
         while (lengthBuffer.hasRemaining()) {
@@ -98,7 +86,6 @@ public class LogSegment implements AutoCloseable {
         lengthBuffer.flip();
         int length = lengthBuffer.getInt();
         
-        // Validate message length
         if (length <= 0) {
             throw new IOException("Invalid message length " + length + " at position " + position + 
                                   ". Possible data corruption.");
@@ -109,7 +96,6 @@ public class LogSegment implements AutoCloseable {
                                   ". Possible data corruption or OOM attack.");
         }
 
-        // Read message body, handling short reads
         ByteBuffer messageBuffer = ByteBuffer.allocate(length);
         bytesRead = 0;
         while (messageBuffer.hasRemaining()) {
