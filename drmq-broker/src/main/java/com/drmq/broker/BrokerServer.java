@@ -208,6 +208,15 @@ public class BrokerServer {
             logger.error("Error closing log manager", e);
         }
 
+        // Close OffsetManager
+        try {
+            if (offsetManager != null) {
+                offsetManager.close();
+            }
+        } catch (IOException e) {
+            logger.error("Error closing offset manager", e);
+        }
+
         // Shutdown executor
         executor.shutdown();
         try {
