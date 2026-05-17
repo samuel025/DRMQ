@@ -36,6 +36,15 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
             },
             new ThreadPoolExecutor.AbortPolicy());
 
+    public static void shutdownRpcExecutor() {
+        rpcExecutor.shutdown();
+        try {
+            rpcExecutor.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     public ClientHandler(MessageStore messageStore, OffsetManager offsetManager,
                          RaftNode raftNode, ChannelGroup activeChannels) {
         this.messageStore = messageStore;

@@ -166,26 +166,43 @@ public class BrokerServer {
         }
     }
 
+    private volatile boolean isShutdownComplete = false;
+
     public void shutdown() {
-        if (!running) return;
+        if (isShutdownComplete) return;
         logger.info("Shutting down Netty broker...");
-        running = false;
+
+        if (activeChannels != null) {
+            activeChannels.close().awaitUninterruptibly();
+        }
 
         if (serverChannel != null) {
-            serverChannel.close();
-        }
-
-        if (raftNode != null) {
-            raftNode.stop();
-        }
-
-        for (RaftPeer peer : raftPeers) {
-            peer.close();
+            serverChannel.close().awaitUninterruptibly();
         }
 
         if (bossGroup != null) bossGroup.shutdownGracefully();
         if (workerGroup != null) workerGroup.shutdownGracefully();
         if (businessGroup != null) businessGroup.shutdownGracefully();
+
+        try {
+            if (bossGroup != null) bossGroup.terminationFuture().await();
+            if (workerGroup != null) workerGroup.terminationFuture().await();
+            if (businessGroup != null) businessGroup.terminationFuture().await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        ClientHandler.shutdownRpcExecutor();
+
+        if (raftNode != null) {
+            raftNode.stop();
+        }
+
+        if (raftPeers != null) {
+            for (RaftPeer peer : raftPeers) {
+                peer.close();
+            }
+        }
 
         try {
             if (logManager != null) logManager.close();
@@ -200,7 +217,11 @@ public class BrokerServer {
         }
 
         logger.info("Broker shutdown complete");
-        metrics.close();
+        if (metrics != null) {
+            metrics.close();
+        }
+        running = false;
+        isShutdownComplete = true;
     }
 
     public boolean isRunning() { return running; }

@@ -11,6 +11,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Manages consumer group offsets with persistence to disk.
@@ -31,7 +33,8 @@ public class OffsetManager implements Closeable {
     // group/topic -> committed offset
     private final ConcurrentHashMap<String, Long> offsets = new ConcurrentHashMap<>();
     
-    private volatile boolean isDirty = false;
+    private final AtomicBoolean isDirty = new AtomicBoolean(false);
+    private final ReentrantLock persistLock = new ReentrantLock();
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
     public OffsetManager(String dataDir) throws IOException {
@@ -54,7 +57,7 @@ public class OffsetManager implements Closeable {
     public void commit(String consumerGroup, String topic, long offset) {
         String key = key(consumerGroup, topic);
         offsets.put(key, offset);
-        isDirty = true;
+        isDirty.lazySet(true);
         logger.debug("Committed offset in memory: group={}, topic={}, offset={}", consumerGroup, topic, offset);
     }
 
@@ -94,17 +97,21 @@ public class OffsetManager implements Closeable {
         logger.info("Loaded {} consumer offset(s) from {}", offsets.size(), offsetsFile);
     }
 
-    private synchronized void backgroundPersist() {
-        if (isDirty) {
+    private void backgroundPersist() {
+        if (!isDirty.getAndSet(false)) return;
+
+        persistLock.lock();
+        try {
             long startNanos = System.nanoTime();
             try {
                 persist();
-                isDirty = false;
                 BrokerMetrics.get().recordOffsetPersist(System.nanoTime() - startNanos, true);
             } catch (IOException e) {
                 logger.error("Failed to background persist offsets", e);
                 BrokerMetrics.get().recordOffsetPersist(System.nanoTime() - startNanos, false);
             }
+        } finally {
+            persistLock.unlock();
         }
     }
 
@@ -123,9 +130,19 @@ public class OffsetManager implements Closeable {
     @Override
     public void close() throws IOException {
         scheduler.shutdownNow();
-        if (isDirty) {
-            persist();
-            isDirty = false;
+        try {
+            scheduler.awaitTermination(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        
+        if (isDirty.getAndSet(false)) {
+            persistLock.lock();
+            try {
+                persist();
+            } finally {
+                persistLock.unlock();
+            }
         }
     }
 
