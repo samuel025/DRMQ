@@ -22,7 +22,6 @@ import java.net.BindException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
@@ -109,12 +108,12 @@ public final class BrokerMetrics implements AutoCloseable {
         logger.error("Failed to start metrics endpoint after {} attempts", 10);
     }
 
-    public void registerBroker(Set<ClientHandler> activeHandlers, MessageStore messageStore,
+    public void registerBroker(java.util.function.Supplier<Integer> activeConnectionsCount, MessageStore messageStore,
                                OffsetManager offsetManager, LogManager logManager, RaftNode raftNode) {
         if (!enabled || registry == null) {
             return;
         }
-        Gauge.builder("drmq.broker.active_handlers", activeHandlers, Set::size)
+        Gauge.builder("drmq.broker.active_handlers", activeConnectionsCount, java.util.function.Supplier::get)
                 .register(registry);
         Gauge.builder("drmq.broker.topics", messageStore, MessageStore::getTopicCount)
                 .register(registry);

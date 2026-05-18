@@ -2,30 +2,24 @@ package com.drmq.broker;
 
 import com.drmq.broker.raft.RaftNode;
 import com.drmq.protocol.DRMQProtocol.*;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.channel.group.ChannelGroup;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.*;
-import java.net.Socket;
-import java.util.Set;
+import java.io.IOException;
 import java.util.concurrent.*;
 
-/**
- * Handles a single client connection to the broker.
- *
- * Wire protocol: [4-byte big-endian length][MessageEnvelope protobuf bytes]
- * Both client traffic (produce/consume) and Raft peer RPCs (RequestVote,
- * AppendEntries) use this same framing on the same TCP port.
- */
-public class ClientHandler implements Runnable {
+
+public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
     private static final Logger logger = LoggerFactory.getLogger(ClientHandler.class);
 
-    private final Socket socket;
     private final MessageStore messageStore;
     private final OffsetManager offsetManager;
     private final RaftNode raftNode;  
-    private final Set<ClientHandler> ownerSet; 
-    private volatile boolean running = true;
+    private final ChannelGroup activeChannels; 
+
     private static final int RPC_THREAD_COUNT = Math.max(4, Runtime.getRuntime().availableProcessors());
     private static final int RPC_QUEUE_CAPACITY = 1000;
 
@@ -42,73 +36,55 @@ public class ClientHandler implements Runnable {
             },
             new ThreadPoolExecutor.AbortPolicy());
 
-    public ClientHandler(Socket socket, MessageStore messageStore, OffsetManager offsetManager,
-                         RaftNode raftNode, Set<ClientHandler> ownerSet) {
-        this.socket = socket;
-        this.messageStore = messageStore;
-        this.offsetManager = offsetManager;
-        this.raftNode = raftNode;
-        this.ownerSet = ownerSet;
-    }
-
-    public ClientHandler(Socket socket, MessageStore messageStore, OffsetManager offsetManager, RaftNode raftNode) {
-        this(socket, messageStore, offsetManager, raftNode, null);
-    }
-
-    /** Backward-compatible constructor for single-node mode */
-    public ClientHandler(Socket socket, MessageStore messageStore, OffsetManager offsetManager) {
-        this(socket, messageStore, offsetManager, null);
-    }
-
-    @Override
-    public void run() {
-        String clientAddress = socket.getRemoteSocketAddress().toString();
-        logger.info("Client connected: {}", clientAddress);
-        BrokerMetrics.get().recordConnectionOpened();
-
-        try (DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
-             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()))) {
-
-            while (running && !socket.isClosed()) {
-                try {
-                    int length = in.readInt();
-                    if (length <= 0 || length > 10 * 1024 * 1024) { // Max 10MB message
-                        logger.warn("Invalid message length: {}", length);
-                        break;
-                    }
-
-                    byte[] envelopeBytes = new byte[length];
-                    in.readFully(envelopeBytes);
-
-                    MessageEnvelope envelope = MessageEnvelope.parseFrom(envelopeBytes);
-                    MessageEnvelope response = handleMessage(envelope);
-                    byte[] responseBytes = response.toByteArray();
-                    out.writeInt(responseBytes.length);
-                    out.write(responseBytes);
-                    out.flush();
-
-                } catch (EOFException e) {
-                    logger.info("Client disconnected: {}", clientAddress);
-                    break;
-                }
-            }
-
-        } catch (IOException e) {
-            if (running) {
-                logger.error("Error handling client {}: {}", clientAddress, e.getMessage());
-            }
-        } finally {
-            if (ownerSet != null) {
-                ownerSet.remove(this);
-            }
-            closeSocket();
-            BrokerMetrics.get().recordConnectionClosed();
+    public static void shutdownRpcExecutor() {
+        rpcExecutor.shutdown();
+        try {
+            rpcExecutor.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
-    /**
-     * Dispatch incoming message to appropriate handler based on type.
-     */
+    public ClientHandler(MessageStore messageStore, OffsetManager offsetManager,
+                         RaftNode raftNode, ChannelGroup activeChannels) {
+        this.messageStore = messageStore;
+        this.offsetManager = offsetManager;
+        this.raftNode = raftNode;
+        this.activeChannels = activeChannels;
+    }
+
+    @Override
+    public void channelActive(ChannelHandlerContext ctx) {
+        if (activeChannels != null) {
+            activeChannels.add(ctx.channel());
+        }
+        BrokerMetrics.get().recordConnectionOpened();
+        logger.info("Client connected: {}", ctx.channel().remoteAddress());
+    }
+
+    @Override
+    public void channelInactive(ChannelHandlerContext ctx) {
+        BrokerMetrics.get().recordConnectionClosed();
+        logger.info("Client disconnected: {}", ctx.channel().remoteAddress());
+    }
+
+    @Override
+    protected void channelRead0(ChannelHandlerContext ctx, byte[] msg) throws Exception {
+        MessageEnvelope envelope = MessageEnvelope.parseFrom(msg);
+        MessageEnvelope response = handleMessage(envelope);
+        ctx.writeAndFlush(response.toByteArray());
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+        if (cause instanceof java.net.SocketException || cause instanceof java.io.IOException) {
+            logger.debug("Client disconnected with IO error: {}", cause.getMessage());
+        } else {
+            logger.error("Error handling client {}: {}", ctx.channel().remoteAddress(), cause.getMessage(), cause);
+        }
+        ctx.close();
+    }
+
     private MessageEnvelope handleMessage(MessageEnvelope envelope) throws IOException {
         return switch (envelope.getType()) {
             case PRODUCE_REQUEST -> handleProduceRequest(envelope);
@@ -121,9 +97,6 @@ public class ClientHandler implements Runnable {
         };
     }
 
-    /**
-     * Handle a produce request - store the message and return the assigned offset.
-     */
     private MessageEnvelope handleProduceRequest(MessageEnvelope envelope) throws IOException {
         long startNanos = System.nanoTime();
         long payloadBytes = 0;
@@ -150,14 +123,13 @@ public class ClientHandler implements Runnable {
 
             logger.debug("Produced message: topic={}, offset={}", topic, offset);
 
-            // Build success response
             ProduceResponse response = ProduceResponse.newBuilder()
                     .setSuccess(true)
                     .setOffset(offset)
                     .build();
 
-                BrokerMetrics.get().recordRequest("produce", true,
-                    System.nanoTime() - startNanos, payloadBytes, 1);
+            BrokerMetrics.get().recordRequest("produce", true,
+                System.nanoTime() - startNanos, payloadBytes, 1);
 
             return MessageEnvelope.newBuilder()
                     .setType(MessageType.PRODUCE_RESPONSE)
@@ -166,15 +138,12 @@ public class ClientHandler implements Runnable {
 
         } catch (Exception e) {
             logger.error("Error processing produce request", e);
-                BrokerMetrics.get().recordRequest("produce", false,
-                    System.nanoTime() - startNanos, payloadBytes, 1);
+            BrokerMetrics.get().recordRequest("produce", false,
+                System.nanoTime() - startNanos, payloadBytes, 1);
             return createProduceErrorResponse(e.getMessage());
         }
     }
 
-    /**
-     * Handle a consume request - fetch messages from the specified offset.
-     */
     private MessageEnvelope handleConsumeRequest(MessageEnvelope envelope) throws IOException {
         long startNanos = System.nanoTime();
         try {
@@ -197,8 +166,8 @@ public class ClientHandler implements Runnable {
                     .addAllMessages(messages)
                     .build();
 
-                BrokerMetrics.get().recordRequest("consume", true,
-                    System.nanoTime() - startNanos, estimatePayloadBytes(messages), messages.size());
+            BrokerMetrics.get().recordRequest("consume", true,
+                System.nanoTime() - startNanos, estimatePayloadBytes(messages), messages.size());
 
             return MessageEnvelope.newBuilder()
                     .setType(MessageType.CONSUME_RESPONSE)
@@ -207,13 +176,12 @@ public class ClientHandler implements Runnable {
 
         } catch (Exception e) {
             logger.error("Error processing consume request", e);
-                BrokerMetrics.get().recordRequest("consume", false,
-                    System.nanoTime() - startNanos, 0, 0);
+            BrokerMetrics.get().recordRequest("consume", false,
+                System.nanoTime() - startNanos, 0, 0);
             return createConsumeErrorResponse(e.getMessage());
         }
     }
 
-  
     private MessageEnvelope createProduceErrorResponse(String errorMessage) {
         ProduceResponse response = ProduceResponse.newBuilder()
                 .setSuccess(false)
@@ -263,12 +231,6 @@ public class ClientHandler implements Runnable {
                 .build();
     }
 
-    /**
-     * Handle a commit offset request - store the consumer group offset on the broker.
-     *
-     * In cluster mode, offset commits are routed through Raft consensus to ensure
-     * they survive leader failover. In single-node mode, offsets are persisted locally.
-     */
     private MessageEnvelope handleCommitOffsetRequest(MessageEnvelope envelope) throws IOException {
         long startNanos = System.nanoTime();
         try {
@@ -302,8 +264,8 @@ public class ClientHandler implements Runnable {
                     .setSuccess(true)
                     .build();
 
-                BrokerMetrics.get().recordRequest("commit_offset", true,
-                    System.nanoTime() - startNanos, 0, 0);
+            BrokerMetrics.get().recordRequest("commit_offset", true,
+                System.nanoTime() - startNanos, 0, 0);
 
             return MessageEnvelope.newBuilder()
                     .setType(MessageType.COMMIT_OFFSET_RESPONSE)
@@ -312,8 +274,8 @@ public class ClientHandler implements Runnable {
 
         } catch (Exception e) {
             logger.error("Error committing offset", e);
-                BrokerMetrics.get().recordRequest("commit_offset", false,
-                    System.nanoTime() - startNanos, 0, 0);
+            BrokerMetrics.get().recordRequest("commit_offset", false,
+                System.nanoTime() - startNanos, 0, 0);
             CommitOffsetResponse response = CommitOffsetResponse.newBuilder()
                     .setSuccess(false)
                     .setErrorMessage(e.getMessage() != null ? e.getMessage() : "Unknown error")
@@ -325,9 +287,6 @@ public class ClientHandler implements Runnable {
         }
     }
 
-    /**
-     * Handle a fetch offset request - return the committed offset for a consumer group.
-     */
     private MessageEnvelope handleFetchOffsetRequest(MessageEnvelope envelope) throws IOException {
         long startNanos = System.nanoTime();
         try {
@@ -344,8 +303,8 @@ public class ClientHandler implements Runnable {
                     .setOffset(offset)
                     .build();
 
-                BrokerMetrics.get().recordRequest("fetch_offset", true,
-                    System.nanoTime() - startNanos, 0, 0);
+            BrokerMetrics.get().recordRequest("fetch_offset", true,
+                System.nanoTime() - startNanos, 0, 0);
 
             return MessageEnvelope.newBuilder()
                     .setType(MessageType.FETCH_OFFSET_RESPONSE)
@@ -354,8 +313,8 @@ public class ClientHandler implements Runnable {
 
         } catch (Exception e) {
             logger.error("Error fetching offset", e);
-                BrokerMetrics.get().recordRequest("fetch_offset", false,
-                    System.nanoTime() - startNanos, 0, 0);
+            BrokerMetrics.get().recordRequest("fetch_offset", false,
+                System.nanoTime() - startNanos, 0, 0);
             FetchOffsetResponse response = FetchOffsetResponse.newBuilder()
                     .setSuccess(false)
                     .setOffset(-1)
@@ -368,9 +327,6 @@ public class ClientHandler implements Runnable {
         }
     }
 
-    /**
-     * Create a generic error response envelope (deprecated - use specific error methods).
-     */
     @Deprecated
     private MessageEnvelope createErrorResponse(String errorMessage) {
         return createErrorResponse(errorMessage, MessageType.PRODUCE_RESPONSE);
@@ -413,13 +369,6 @@ public class ClientHandler implements Runnable {
                 .build();
     }
 
-    // ===========================
-    //  Raft RPC handlers
-    // ===========================
-
-    /**
-     * Handle an incoming RequestVote RPC from a Raft candidate.
-     */
     private MessageEnvelope handleRequestVoteRequest(MessageEnvelope envelope) throws IOException {
         long startNanos = System.nanoTime();
         if (raftNode == null) {
@@ -465,9 +414,6 @@ public class ClientHandler implements Runnable {
         }
     }
 
-    /**
-     * Handle an incoming AppendEntries RPC from the Raft leader.
-     */
     private MessageEnvelope handleAppendEntriesRequest(MessageEnvelope envelope) throws IOException {
         long startNanos = System.nanoTime();
         if (raftNode == null) {
@@ -510,24 +456,6 @@ public class ClientHandler implements Runnable {
                 future.cancel(true);
             }
             return createAppendEntriesErrorResponse();
-        }
-    }
-
-    /**
-     * Stop processing and close the connection.
-     */
-    public void stop() {
-        running = false;
-        closeSocket();
-    }
-
-    private void closeSocket() {
-        try {
-            if (!socket.isClosed()) {
-                socket.close();
-            }
-        } catch (IOException e) {
-            logger.debug("Error closing socket", e);
         }
     }
 

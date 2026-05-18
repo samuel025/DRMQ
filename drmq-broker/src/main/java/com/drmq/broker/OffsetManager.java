@@ -8,6 +8,11 @@ import java.nio.file.*;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Manages consumer group offsets with persistence to disk.
@@ -18,7 +23,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * Key format:   <consumer_group>/<topic>
  * Value format: <offset> (long)
  */
-public class OffsetManager {
+public class OffsetManager implements Closeable {
     private static final Logger logger = LoggerFactory.getLogger(OffsetManager.class);
     private static final String OFFSETS_DIR  = "__consumer_offsets";
     private static final String OFFSETS_FILE = "offsets.properties";
@@ -27,12 +32,18 @@ public class OffsetManager {
 
     // group/topic -> committed offset
     private final ConcurrentHashMap<String, Long> offsets = new ConcurrentHashMap<>();
+    
+    private final AtomicBoolean isDirty = new AtomicBoolean(false);
+    private final ReentrantLock persistLock = new ReentrantLock();
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
     public OffsetManager(String dataDir) throws IOException {
         Path dir = Paths.get(dataDir, OFFSETS_DIR);
         Files.createDirectories(dir);
         this.offsetsFile = dir.resolve(OFFSETS_FILE);
         load();
+        
+        scheduler.scheduleWithFixedDelay(this::backgroundPersist, 1000, 1000, TimeUnit.MILLISECONDS);
     }
 
 
@@ -43,18 +54,11 @@ public class OffsetManager {
      * @param topic         the topic name
      * @param offset        the NEXT offset to read (i.e. last processed offset + 1)
      */
-    public synchronized void commit(String consumerGroup, String topic, long offset) throws IOException {
-        long startNanos = System.nanoTime();
+    public void commit(String consumerGroup, String topic, long offset) {
         String key = key(consumerGroup, topic);
-        try {
-            offsets.put(key, offset);
-            persist();
-            logger.debug("Committed offset: group={}, topic={}, offset={}", consumerGroup, topic, offset);
-            BrokerMetrics.get().recordOffsetPersist(System.nanoTime() - startNanos, true);
-        } catch (IOException e) {
-            BrokerMetrics.get().recordOffsetPersist(System.nanoTime() - startNanos, false);
-            throw e;
-        }
+        offsets.put(key, offset);
+        isDirty.lazySet(true);
+        logger.debug("Committed offset in memory: group={}, topic={}, offset={}", consumerGroup, topic, offset);
     }
 
     /**
@@ -93,6 +97,24 @@ public class OffsetManager {
         logger.info("Loaded {} consumer offset(s) from {}", offsets.size(), offsetsFile);
     }
 
+    private void backgroundPersist() {
+        if (!isDirty.getAndSet(false)) return;
+
+        persistLock.lock();
+        try {
+            long startNanos = System.nanoTime();
+            try {
+                persist();
+                BrokerMetrics.get().recordOffsetPersist(System.nanoTime() - startNanos, true);
+            } catch (IOException e) {
+                logger.error("Failed to background persist offsets", e);
+                BrokerMetrics.get().recordOffsetPersist(System.nanoTime() - startNanos, false);
+            }
+        } finally {
+            persistLock.unlock();
+        }
+    }
+
     private void persist() throws IOException {
         Properties props = new Properties();
         offsets.forEach((k, v) -> props.setProperty(k, String.valueOf(v)));
@@ -105,6 +127,24 @@ public class OffsetManager {
         Files.move(tmp, offsetsFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
     }
 
+    @Override
+    public void close() throws IOException {
+        scheduler.shutdownNow();
+        try {
+            scheduler.awaitTermination(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        
+        if (isDirty.getAndSet(false)) {
+            persistLock.lock();
+            try {
+                persist();
+            } finally {
+                persistLock.unlock();
+            }
+        }
+    }
 
     private static String key(String consumerGroup, String topic) {
         return consumerGroup + "/" + topic;

@@ -61,7 +61,7 @@ public class RaftNode {
     private final int port;
     private final List<PeerAddress> peers;
     private final MessageStore messageStore;
-    private final OffsetManager offsetManager;  // For applying replicated offset commits
+    private final OffsetManager offsetManager;  
     private final Path stateFilePath;
 
     private final Map<String, Function<RequestVoteRequest, RequestVoteResponse>> voteRpcHandlers = new ConcurrentHashMap<>();
