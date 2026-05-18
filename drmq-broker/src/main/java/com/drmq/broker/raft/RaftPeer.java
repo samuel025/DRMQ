@@ -92,6 +92,46 @@ public class RaftPeer {
     }
 
     /**
+     * Send a PreVote RPC and wait for the response.
+     * PreVote checks if this candidate could win an election without incrementing the term.
+     */
+    public PreVoteResponse sendPreVote(PreVoteRequest request) {
+        synchronized (lock) {
+            long startNanos = System.nanoTime();
+            try {
+                ensureConnected();
+
+                MessageEnvelope envelope = MessageEnvelope.newBuilder()
+                        .setType(MessageType.PRE_VOTE_REQUEST)
+                        .setPayload(request.toByteString())
+                        .build();
+
+                sendEnvelope(envelope);
+                MessageEnvelope response = receiveEnvelope();
+                requireResponseType(response, MessageType.PRE_VOTE_RESPONSE, "PreVote");
+                PreVoteResponse parsed = PreVoteResponse.parseFrom(response.getPayload());
+                BrokerMetrics.get().recordRaftRpc("pre_vote", true,
+                        System.nanoTime() - startNanos);
+                return parsed;
+
+            } catch (Exception e) {
+                close();
+                long now = System.currentTimeMillis();
+                if ((now - lastRequestVoteFailureLogTime) >= LOG_RATE_LIMIT_MS) {
+                    logger.debug("PreVote to {} failed: {}", address, e.getMessage());
+                    lastRequestVoteFailureLogTime = now;
+                }
+                BrokerMetrics.get().recordRaftRpc("pre_vote", false,
+                        System.nanoTime() - startNanos);
+                return PreVoteResponse.newBuilder()
+                        .setTerm(0)
+                        .setVoteGranted(false)
+                        .build();
+            }
+        }
+    }
+
+    /**
      * Send an AppendEntries RPC and wait for the response.
      */
     public AppendEntriesResponse sendAppendEntries(AppendEntriesRequest request) {

@@ -72,6 +72,7 @@ public class BrokerServer {
                 raftPeers.add(raftPeer);
                 raftNode.registerVoteHandler(peer.id(), raftPeer::sendRequestVote);
                 raftNode.registerAppendHandler(peer.id(), raftPeer::sendAppendEntries);
+                raftNode.registerPreVoteHandler(peer.id(), raftPeer::sendPreVote);
             }
 
             logger.info("Cluster mode: nodeId={}, peers={}", config.getNodeId(), config.getPeers());
@@ -171,6 +172,9 @@ public class BrokerServer {
     public void shutdown() {
         if (isShutdownComplete) return;
         logger.info("Shutting down Netty broker...");
+        if (raftNode != null) {
+            raftNode.stop();
+        }
 
         if (activeChannels != null) {
             activeChannels.close().awaitUninterruptibly();
@@ -193,10 +197,6 @@ public class BrokerServer {
         }
 
         ClientHandler.shutdownRpcExecutor();
-
-        if (raftNode != null) {
-            raftNode.stop();
-        }
 
         if (raftPeers != null) {
             for (RaftPeer peer : raftPeers) {

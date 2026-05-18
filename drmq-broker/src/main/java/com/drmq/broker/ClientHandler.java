@@ -92,6 +92,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
             case COMMIT_OFFSET_REQUEST -> handleCommitOffsetRequest(envelope);
             case FETCH_OFFSET_REQUEST -> handleFetchOffsetRequest(envelope);
             case REQUEST_VOTE_REQUEST -> handleRequestVoteRequest(envelope);
+            case PRE_VOTE_REQUEST -> handlePreVoteRequest(envelope);
             case APPEND_ENTRIES_REQUEST -> handleAppendEntriesRequest(envelope);
             default -> createErrorResponse("Unknown message type: " + envelope.getType());
         };
@@ -335,6 +336,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
     private MessageEnvelope createErrorResponse(String errorMessage, MessageType messageType) {
         return switch (messageType) {
             case REQUEST_VOTE_RESPONSE -> createRequestVoteErrorResponse();
+            case PRE_VOTE_RESPONSE -> createPreVoteErrorResponse();
             case APPEND_ENTRIES_RESPONSE -> createAppendEntriesErrorResponse();
             case PRODUCE_RESPONSE -> createProduceErrorResponse(errorMessage);
             case CONSUME_RESPONSE -> createConsumeErrorResponse(errorMessage);
@@ -365,6 +367,18 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
 
         return MessageEnvelope.newBuilder()
                 .setType(MessageType.APPEND_ENTRIES_RESPONSE)
+                .setPayload(response.toByteString())
+                .build();
+    }
+
+    private MessageEnvelope createPreVoteErrorResponse() {
+        PreVoteResponse response = PreVoteResponse.newBuilder()
+                .setTerm(0)
+                .setVoteGranted(false)
+                .build();
+
+        return MessageEnvelope.newBuilder()
+                .setType(MessageType.PRE_VOTE_RESPONSE)
                 .setPayload(response.toByteString())
                 .build();
     }
@@ -411,6 +425,51 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
                 future.cancel(true);
             }
             return createRequestVoteErrorResponse();
+        }
+    }
+
+    private MessageEnvelope handlePreVoteRequest(MessageEnvelope envelope) throws IOException {
+        long startNanos = System.nanoTime();
+        if (raftNode == null) {
+            BrokerMetrics.get().recordRaftRpc("pre_vote", false,
+                    System.nanoTime() - startNanos);
+            return createPreVoteErrorResponse();
+        }
+        PreVoteRequest request = PreVoteRequest.parseFrom(envelope.getPayload());
+
+        Future<PreVoteResponse> future = null;
+        try {
+            future = rpcExecutor.submit(() -> raftNode.handlePreVote(request));
+            PreVoteResponse response = future.get(10, TimeUnit.SECONDS);
+
+            BrokerMetrics.get().recordRaftRpc("pre_vote", true,
+                    System.nanoTime() - startNanos);
+
+            return MessageEnvelope.newBuilder()
+                    .setType(MessageType.PRE_VOTE_RESPONSE)
+                    .setPayload(response.toByteString())
+                    .build();
+        } catch (TimeoutException e) {
+            logger.error("PreVote handler timed out");
+            BrokerMetrics.get().recordRaftRpc("pre_vote", false,
+                    System.nanoTime() - startNanos);
+            if (future != null) {
+                future.cancel(true);
+            }
+            return createPreVoteErrorResponse();
+        } catch (RejectedExecutionException e) {
+            logger.error("PreVote handler rejected: {}", e.getMessage());
+            BrokerMetrics.get().recordRaftRpc("pre_vote", false,
+                    System.nanoTime() - startNanos);
+            return createPreVoteErrorResponse();
+        } catch (Exception e) {
+            logger.error("PreVote handler failed: {}", e.getMessage());
+            BrokerMetrics.get().recordRaftRpc("pre_vote", false,
+                    System.nanoTime() - startNanos);
+            if (future != null) {
+                future.cancel(true);
+            }
+            return createPreVoteErrorResponse();
         }
     }
 
