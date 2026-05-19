@@ -16,6 +16,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
@@ -301,6 +302,14 @@ public class RaftNode {
 
         int votesNeeded = (peers.size() + 1) / 2 + 1;
         AtomicLong votesReceived = new AtomicLong(1); 
+        AtomicBoolean electionStarted = new AtomicBoolean(false);
+
+        if (votesReceived.get() >= votesNeeded) {
+            if (electionStarted.compareAndSet(false, true)) {
+                logger.info("[{}] Pre-vote succeeded, starting real election", nodeId);
+                startElection();
+            }
+        }
 
         for (PeerAddress peer : peers) {
             CompletableFuture.supplyAsync(() -> {
@@ -317,13 +326,20 @@ public class RaftNode {
                 try {
                     if (state == RaftState.LEADER || !running) return;
 
+                    if (response.getTerm() > currentTerm) {
+                        stepDown(response.getTerm());
+                        return;
+                    }
+
                     if (response.getVoteGranted()) {
                         long votes = votesReceived.incrementAndGet();
                         logger.info("[{}] Received pre-vote from {} ({}/{})",
                                 nodeId, peer.id(), votes, votesNeeded);
                         if (votes >= votesNeeded) {
-                            logger.info("[{}] Pre-vote succeeded, starting real election", nodeId);
-                            startElection();
+                            if (electionStarted.compareAndSet(false, true)) {
+                                logger.info("[{}] Pre-vote succeeded, starting real election", nodeId);
+                                startElection();
+                            }
                         }
                     }
                 } finally {
@@ -364,6 +380,13 @@ public class RaftNode {
         long myTerm = currentTerm;
         int votesNeeded = (peers.size() + 1) / 2 + 1;  
         AtomicLong votesReceived = new AtomicLong(1);   
+        java.util.concurrent.atomic.AtomicBoolean electionWon = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+        if (votesReceived.get() >= votesNeeded) {
+            if (electionWon.compareAndSet(false, true)) {
+                becomeLeader();
+            }
+        }
 
         for (PeerAddress peer : peers) {
             CompletableFuture.supplyAsync(() -> {
@@ -389,7 +412,9 @@ public class RaftNode {
                         long votes = votesReceived.incrementAndGet();
                         logger.info("[{}] Received vote from {} ({}/{})", nodeId, peer.id(), votes, votesNeeded);
                         if (votes >= votesNeeded) {
-                            becomeLeader();
+                            if (electionWon.compareAndSet(false, true)) {
+                                becomeLeader();
+                            }
                         }
                     }
                 } finally {

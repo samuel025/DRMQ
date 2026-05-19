@@ -462,6 +462,14 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
             BrokerMetrics.get().recordRaftRpc("pre_vote", false,
                     System.nanoTime() - startNanos);
             return createPreVoteErrorResponse();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            logger.error("PreVote handler interrupted: {}", ie.getMessage());
+            BrokerMetrics.get().recordRaftRpc("pre_vote", false, System.nanoTime() - startNanos);
+            if (future != null) {
+                future.cancel(true);
+            }
+            return createPreVoteErrorResponse();
         } catch (Exception e) {
             logger.error("PreVote handler failed: {}", e.getMessage());
             BrokerMetrics.get().recordRaftRpc("pre_vote", false,

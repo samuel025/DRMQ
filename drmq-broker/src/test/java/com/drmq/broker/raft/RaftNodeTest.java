@@ -53,7 +53,7 @@ class RaftNodeTest {
     private void registerAllHandlers(boolean grantPreVote, boolean grantVote, boolean appendSuccess) {
         for (String peerId : List.of("node2", "node3")) {
             raftNode.registerPreVoteHandler(peerId, req ->
-                PreVoteResponse.newBuilder().setTerm(req.getTerm()).setVoteGranted(grantPreVote).build()
+                PreVoteResponse.newBuilder().setTerm(req.getTerm() - 1).setVoteGranted(grantPreVote).build()
             );
             raftNode.registerVoteHandler(peerId, req ->
                 RequestVoteResponse.newBuilder().setTerm(req.getTerm()).setVoteGranted(grantVote).build()
@@ -338,7 +338,7 @@ class RaftNodeTest {
         for (String peerId : List.of("node2", "node3")) {
             raftNode.registerPreVoteHandler(peerId, req -> {
                 preVotesSent.incrementAndGet();
-                return PreVoteResponse.newBuilder().setTerm(req.getTerm()).setVoteGranted(true).build();
+                return PreVoteResponse.newBuilder().setTerm(req.getTerm() - 1).setVoteGranted(true).build();
             });
             raftNode.registerVoteHandler(peerId, req -> {
                 votesSent.incrementAndGet();
@@ -375,7 +375,7 @@ class RaftNodeTest {
 
         for (String peerId : List.of("node2", "node3")) {
             raftNode.registerPreVoteHandler(peerId, req ->
-                PreVoteResponse.newBuilder().setTerm(req.getTerm()).setVoteGranted(false).build()
+                PreVoteResponse.newBuilder().setTerm(req.getTerm() - 1).setVoteGranted(false).build()
             );
             raftNode.registerVoteHandler(peerId, req -> {
                 votesSent.incrementAndGet();

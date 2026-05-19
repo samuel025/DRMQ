@@ -30,6 +30,7 @@ public class RaftPeer {
     private DataOutputStream out;
     private final Object lock = new Object();
     private long lastRequestVoteFailureLogTime = 0;
+    private long lastPreVoteFailureLogTime = 0;
     private long lastAppendEntriesFailureLogTime = 0;
 
     public RaftPeer(PeerAddress address) {
@@ -117,9 +118,9 @@ public class RaftPeer {
             } catch (Exception e) {
                 close();
                 long now = System.currentTimeMillis();
-                if ((now - lastRequestVoteFailureLogTime) >= LOG_RATE_LIMIT_MS) {
+                if ((now - lastPreVoteFailureLogTime) >= LOG_RATE_LIMIT_MS) {
                     logger.debug("PreVote to {} failed: {}", address, e.getMessage());
-                    lastRequestVoteFailureLogTime = now;
+                    lastPreVoteFailureLogTime = now;
                 }
                 BrokerMetrics.get().recordRaftRpc("pre_vote", false,
                         System.nanoTime() - startNanos);
