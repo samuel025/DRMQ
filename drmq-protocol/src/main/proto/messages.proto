@@ -110,6 +110,22 @@ message RequestVoteResponse {
     bool vote_granted = 2;    // True = vote granted
 }
 
+// --- Raft Pre-Vote (§9.6 disruption prevention) ---
+// Sent before a real election to check if the candidate COULD win
+// without incrementing the term. Prevents restarting nodes from
+// disrupting a healthy leader.
+message PreVoteRequest {
+    int64 term = 1;              // The term the candidate WOULD use (currentTerm + 1)
+    string candidate_id = 2;    // Candidate requesting pre-vote
+    int64 last_log_index = 3;   // Index of candidate's last log entry
+    int64 last_log_term = 4;    // Term of candidate's last log entry
+}
+
+message PreVoteResponse {
+    int64 term = 1;           // Current term of the responder
+    bool vote_granted = 2;    // True = would vote for this candidate
+}
+
 // --- Raft log replication (also used as heartbeat when entries is empty) ---
 message AppendEntriesRequest {
     int64 term = 1;                   // Leader's term
@@ -142,4 +158,6 @@ enum MessageType {
     REQUEST_VOTE_RESPONSE = 11;
     APPEND_ENTRIES_REQUEST = 12;
     APPEND_ENTRIES_RESPONSE = 13;
+    PRE_VOTE_REQUEST = 14;
+    PRE_VOTE_RESPONSE = 15;
 }

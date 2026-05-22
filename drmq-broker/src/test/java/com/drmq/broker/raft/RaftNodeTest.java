@@ -18,7 +18,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Unit tests for RaftNode, heavily isolating the core Raft consensus state machine.
+ * Unit tests for RaftNode — covers core Raft consensus, Pre-Vote (§9.6),
+ * election mechanics, and edge cases around leader disruption prevention.
  */
 class RaftNodeTest {
 
@@ -29,7 +30,7 @@ class RaftNodeTest {
     private MessageStore messageStore;
     private OffsetManager offsetManager;
     private RaftNode raftNode;
-    
+
     private final String nodeId = "node1";
     private final PeerAddress peer2 = new PeerAddress("node2", "localhost", 9093);
     private final PeerAddress peer3 = new PeerAddress("node3", "localhost", 9094);
@@ -39,19 +40,33 @@ class RaftNodeTest {
         logManager = new LogManager(tempDir.toString());
         messageStore = new MessageStore(logManager);
         offsetManager = new OffsetManager(tempDir.toString());
-
         raftNode = new RaftNode(nodeId, 9092, List.of(peer2, peer3), messageStore, offsetManager, tempDir);
     }
 
     @AfterEach
     void tearDown() throws IOException {
-        if (raftNode != null) {
-            raftNode.stop();
-        }
-        if (logManager != null) {
-            logManager.close();
+        if (raftNode != null) raftNode.stop();
+        if (logManager != null) logManager.close();
+    }
+
+    /** Register all RPC handlers (pre-vote, vote, append) with configurable responses. */
+    private void registerAllHandlers(boolean grantPreVote, boolean grantVote, boolean appendSuccess) {
+        for (String peerId : List.of("node2", "node3")) {
+            raftNode.registerPreVoteHandler(peerId, req ->
+                PreVoteResponse.newBuilder().setTerm(req.getTerm() - 1).setVoteGranted(grantPreVote).build()
+            );
+            raftNode.registerVoteHandler(peerId, req ->
+                RequestVoteResponse.newBuilder().setTerm(req.getTerm()).setVoteGranted(grantVote).build()
+            );
+            raftNode.registerAppendHandler(peerId, req ->
+                AppendEntriesResponse.newBuilder().setTerm(req.getTerm()).setSuccess(appendSuccess).setMatchIndex(0).build()
+            );
         }
     }
+
+    // ===========================
+    //  Basic State Tests
+    // ===========================
 
     @Test
     void initialStateIsFollower() {
@@ -61,15 +76,14 @@ class RaftNodeTest {
         assertNull(raftNode.getLeaderId());
     }
 
+    // ===========================
+    //  AppendEntries Tests
+    // ===========================
+
     @Test
     void handlesAppendEntriesFromValidLeader() {
-        // Simulate an AppendEntries heartbeat from a valid leader
         AppendEntriesRequest request = AppendEntriesRequest.newBuilder()
-                .setTerm(1)
-                .setLeaderId("node2")
-                .setPrevLogIndex(0)
-                .setPrevLogTerm(0)
-                .setLeaderCommit(0)
+                .setTerm(1).setLeaderId("node2").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0)
                 .build();
 
         AppendEntriesResponse response = raftNode.handleAppendEntries(request);
@@ -83,40 +97,25 @@ class RaftNodeTest {
 
     @Test
     void rejectsAppendEntriesFromOlderTerm() {
-        AppendEntriesRequest heartbeat = AppendEntriesRequest.newBuilder()
-                .setTerm(2)
-                .setLeaderId("node2")
-                .setPrevLogIndex(0)
-                .setPrevLogTerm(0)
-                .setLeaderCommit(0)
-                .build();
-        raftNode.handleAppendEntries(heartbeat);
+        raftNode.handleAppendEntries(AppendEntriesRequest.newBuilder()
+                .setTerm(2).setLeaderId("node2").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0).build());
 
-        // Now receive from older term 1
-        AppendEntriesRequest staleRequest = AppendEntriesRequest.newBuilder()
-                .setTerm(1)
-                .setLeaderId("node3")
-                .setPrevLogIndex(0)
-                .setPrevLogTerm(0)
-                .setLeaderCommit(0)
-                .build();
-        AppendEntriesResponse response = raftNode.handleAppendEntries(staleRequest);
+        AppendEntriesResponse response = raftNode.handleAppendEntries(AppendEntriesRequest.newBuilder()
+                .setTerm(1).setLeaderId("node3").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0).build());
 
         assertFalse(response.getSuccess());
         assertEquals(2, response.getTerm());
         assertEquals("node2", raftNode.getLeaderId());
     }
 
+    // ===========================
+    //  RequestVote Tests (Standard Raft)
+    // ===========================
+
     @Test
     void grantsRequestVoteToValidCandidate() {
-        RequestVoteRequest request = RequestVoteRequest.newBuilder()
-                .setTerm(1)
-                .setCandidateId("node2")
-                .setLastLogIndex(0)
-                .setLastLogTerm(0)
-                .build();
-
-        RequestVoteResponse response = raftNode.handleRequestVote(request);
+        RequestVoteResponse response = raftNode.handleRequestVote(RequestVoteRequest.newBuilder()
+                .setTerm(1).setCandidateId("node2").setLastLogIndex(0).setLastLogTerm(0).build());
 
         assertTrue(response.getVoteGranted());
         assertEquals(1, response.getTerm());
@@ -125,69 +124,306 @@ class RaftNodeTest {
 
     @Test
     void rejectsRequestVoteIfAlreadyVotedInSameTerm() {
-        RequestVoteRequest request1 = RequestVoteRequest.newBuilder()
-                .setTerm(1)
-                .setCandidateId("node2")
-                .setLastLogIndex(0)
-                .setLastLogTerm(0)
-                .build();
-        raftNode.handleRequestVote(request1);
+        raftNode.handleRequestVote(RequestVoteRequest.newBuilder()
+                .setTerm(1).setCandidateId("node2").setLastLogIndex(0).setLastLogTerm(0).build());
 
-        RequestVoteRequest request2 = RequestVoteRequest.newBuilder()
-                .setTerm(1)
-                .setCandidateId("node3")
-                .setLastLogIndex(0)
-                .setLastLogTerm(0)
-                .build();
-        RequestVoteResponse response = raftNode.handleRequestVote(request2);
+        RequestVoteResponse response = raftNode.handleRequestVote(RequestVoteRequest.newBuilder()
+                .setTerm(1).setCandidateId("node3").setLastLogIndex(0).setLastLogTerm(0).build());
 
         assertFalse(response.getVoteGranted());
         assertEquals(1, response.getTerm());
     }
 
     @Test
-    void electionTimeoutTransitionsToCandidate() throws InterruptedException {
-        AtomicInteger voteRequestsSent = new AtomicInteger(0);
+    void requestVoteStepsDownOnHigherTerm() {
+        // First set node to term 5 by receiving a heartbeat
+        raftNode.handleAppendEntries(AppendEntriesRequest.newBuilder()
+                .setTerm(5).setLeaderId("node2").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0).build());
+        assertEquals(5, raftNode.getCurrentTerm());
 
-        raftNode.registerVoteHandler("node2", req -> {
-            voteRequestsSent.incrementAndGet();
-            return RequestVoteResponse.newBuilder().setTerm(req.getTerm()).setVoteGranted(false).build();
-        });
-        raftNode.registerVoteHandler("node3", req -> {
-            voteRequestsSent.incrementAndGet();
-            return RequestVoteResponse.newBuilder().setTerm(req.getTerm()).setVoteGranted(false).build();
-        });
+        // RequestVote with term=10 should cause step-down to term 10
+        // (standard Raft — no lease interference)
+        // Wait for heartbeat lease to expire
+        try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+
+        RequestVoteResponse response = raftNode.handleRequestVote(RequestVoteRequest.newBuilder()
+                .setTerm(10).setCandidateId("node3").setLastLogIndex(0).setLastLogTerm(0).build());
+
+        assertEquals(10, raftNode.getCurrentTerm(), "Must step down to higher term per Raft §5.1");
+        assertTrue(response.getVoteGranted());
+    }
+
+    @Test
+    void rejectsRequestVoteWithStaleLog() {
+        // Give node1 a log entry at term 5
+        raftNode.handleAppendEntries(AppendEntriesRequest.newBuilder()
+                .setTerm(5).setLeaderId("node2").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0)
+                .addEntries(RaftEntry.newBuilder().setTerm(5).setIndex(1).setTopic("t")
+                        .setPayload(com.google.protobuf.ByteString.copyFromUtf8("data")).setTimestamp(1).build())
+                .build());
+
+        // Wait for heartbeat lease to expire
+        try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+
+        // Candidate with stale log (term 3, index 0) should be rejected
+        RequestVoteResponse response = raftNode.handleRequestVote(RequestVoteRequest.newBuilder()
+                .setTerm(6).setCandidateId("node3").setLastLogIndex(0).setLastLogTerm(3).build());
+
+        assertFalse(response.getVoteGranted(), "Should reject candidate with stale log");
+    }
+
+    // ===========================
+    //  Pre-Vote Tests (§9.6)
+    // ===========================
+
+    @Test
+    void preVoteRejectedByLeader() throws InterruptedException {
+        // Make node1 become leader
+        registerAllHandlers(true, true, true);
+        raftNode.start();
+        Thread.sleep(1500);
+        assertEquals(RaftState.LEADER, raftNode.getState(), "Node should be leader");
+
+        // A restarting node sends PreVote — leader must reject
+        PreVoteResponse response = raftNode.handlePreVote(PreVoteRequest.newBuilder()
+                .setTerm(raftNode.getCurrentTerm() + 1)
+                .setCandidateId("node3")
+                .setLastLogIndex(0).setLastLogTerm(0)
+                .build());
+
+        assertFalse(response.getVoteGranted(), "Leader must reject pre-vote — it IS the leader");
+    }
+
+    @Test
+    void preVoteRejectedByFollowerWithRecentHeartbeat() {
+        // Follower receives a heartbeat — sets lastHeartbeatReceivedMs
+        raftNode.handleAppendEntries(AppendEntriesRequest.newBuilder()
+                .setTerm(5).setLeaderId("node2").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0).build());
+
+        // Immediately send PreVote — should be rejected (leader is alive)
+        PreVoteResponse response = raftNode.handlePreVote(PreVoteRequest.newBuilder()
+                .setTerm(6).setCandidateId("node3")
+                .setLastLogIndex(0).setLastLogTerm(0)
+                .build());
+
+        assertFalse(response.getVoteGranted(),
+                "Follower must reject pre-vote when it heard from the leader recently");
+    }
+
+    @Test
+    void preVoteGrantedByFollowerWithStaleHeartbeat() throws InterruptedException {
+        // Follower receives a heartbeat, then lease expires
+        raftNode.handleAppendEntries(AppendEntriesRequest.newBuilder()
+                .setTerm(5).setLeaderId("node2").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0).build());
+
+        // Wait for heartbeat lease to expire (> ELECTION_TIMEOUT_MIN_MS = 150ms)
+        Thread.sleep(200);
+
+        // Now PreVote should be granted (no recent heartbeat = leader might be dead)
+        PreVoteResponse response = raftNode.handlePreVote(PreVoteRequest.newBuilder()
+                .setTerm(6).setCandidateId("node3")
+                .setLastLogIndex(0).setLastLogTerm(0)
+                .build());
+
+        assertTrue(response.getVoteGranted(),
+                "Follower should grant pre-vote when leader heartbeat is stale");
+    }
+
+    @Test
+    void preVoteRejectedWithStaleTerm() {
+        // Set node to term 5
+        raftNode.handleAppendEntries(AppendEntriesRequest.newBuilder()
+                .setTerm(5).setLeaderId("node2").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0).build());
+
+        // Wait for lease to expire
+        try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+
+        // PreVote with proposedTerm=3 (behind node's term=5) — must reject
+        PreVoteResponse response = raftNode.handlePreVote(PreVoteRequest.newBuilder()
+                .setTerm(3).setCandidateId("node3")
+                .setLastLogIndex(0).setLastLogTerm(0)
+                .build());
+
+        assertFalse(response.getVoteGranted(), "Must reject pre-vote with stale term");
+        assertEquals(5, response.getTerm(), "Response should include current term");
+    }
+
+    @Test
+    void preVoteRejectedWithStaleLog() throws InterruptedException {
+        // Give node1 a log entry at term 5
+        raftNode.handleAppendEntries(AppendEntriesRequest.newBuilder()
+                .setTerm(5).setLeaderId("node2").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0)
+                .addEntries(RaftEntry.newBuilder().setTerm(5).setIndex(1).setTopic("t")
+                        .setPayload(com.google.protobuf.ByteString.copyFromUtf8("data")).setTimestamp(1).build())
+                .build());
+
+        // Wait for heartbeat lease to expire
+        Thread.sleep(200);
+
+        // PreVote with stale log (term 3) — must reject even though heartbeat is stale
+        PreVoteResponse response = raftNode.handlePreVote(PreVoteRequest.newBuilder()
+                .setTerm(6).setCandidateId("node3")
+                .setLastLogIndex(0).setLastLogTerm(3)
+                .build());
+
+        assertFalse(response.getVoteGranted(),
+                "Must reject pre-vote when candidate's log is behind");
+    }
+
+    @Test
+    void preVoteDoesNotMutateState() {
+        // Set known state
+        raftNode.handleAppendEntries(AppendEntriesRequest.newBuilder()
+                .setTerm(5).setLeaderId("node2").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0).build());
+
+        long termBefore = raftNode.getCurrentTerm();
+        RaftState stateBefore = raftNode.getState();
+        String leaderBefore = raftNode.getLeaderId();
+
+        // Wait for lease to expire so pre-vote is actually processed
+        try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+
+        // Send pre-vote with higher term
+        raftNode.handlePreVote(PreVoteRequest.newBuilder()
+                .setTerm(10).setCandidateId("node3")
+                .setLastLogIndex(0).setLastLogTerm(0)
+                .build());
+
+        // State must be COMPLETELY unchanged — Pre-Vote is read-only
+        assertEquals(termBefore, raftNode.getCurrentTerm(), "Pre-vote must NOT change currentTerm");
+        assertEquals(stateBefore, raftNode.getState(), "Pre-vote must NOT change state");
+        assertEquals(leaderBefore, raftNode.getLeaderId(), "Pre-vote must NOT change leaderId");
+    }
+
+    @Test
+    void preVoteGrantedWithEqualLog() throws InterruptedException {
+        // Node has empty log at term 5
+        raftNode.handleAppendEntries(AppendEntriesRequest.newBuilder()
+                .setTerm(5).setLeaderId("node2").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0).build());
+
+        // Wait for lease expiry
+        Thread.sleep(200);
+
+        // Candidate with same (empty) log — should be granted
+        PreVoteResponse response = raftNode.handlePreVote(PreVoteRequest.newBuilder()
+                .setTerm(6).setCandidateId("node3")
+                .setLastLogIndex(0).setLastLogTerm(0)
+                .build());
+
+        assertTrue(response.getVoteGranted(),
+                "Should grant pre-vote when candidate's log is equally up-to-date");
+    }
+
+    @Test
+    void freshNodeGrantsPreVote() {
+        // A fresh node (term=0, no leader, no heartbeat) should grant pre-votes
+        PreVoteResponse response = raftNode.handlePreVote(PreVoteRequest.newBuilder()
+                .setTerm(1).setCandidateId("node2")
+                .setLastLogIndex(0).setLastLogTerm(0)
+                .build());
+
+        assertTrue(response.getVoteGranted(),
+                "Fresh node with no leader should grant pre-vote");
+    }
+
+    // ===========================
+    //  Election Flow Tests
+    // ===========================
+
+    @Test
+    void electionTimeoutTriggersPreVoteThenElection() throws InterruptedException {
+        AtomicInteger preVotesSent = new AtomicInteger(0);
+        AtomicInteger votesSent = new AtomicInteger(0);
+
+        for (String peerId : List.of("node2", "node3")) {
+            raftNode.registerPreVoteHandler(peerId, req -> {
+                preVotesSent.incrementAndGet();
+                return PreVoteResponse.newBuilder().setTerm(req.getTerm() - 1).setVoteGranted(true).build();
+            });
+            raftNode.registerVoteHandler(peerId, req -> {
+                votesSent.incrementAndGet();
+                return RequestVoteResponse.newBuilder().setTerm(req.getTerm()).setVoteGranted(false).build();
+            });
+            raftNode.registerAppendHandler(peerId, req ->
+                AppendEntriesResponse.newBuilder().setTerm(req.getTerm()).setSuccess(true).setMatchIndex(0).build()
+            );
+        }
 
         raftNode.start();
+        // Startup grace = 900ms + normal timeout ~225ms + some buffer
+        Thread.sleep(1500);
 
-        Thread.sleep(500);
-
-        assertEquals(RaftState.CANDIDATE, raftNode.getState());
-        assertTrue(raftNode.getCurrentTerm() > 0);
-        assertTrue(voteRequestsSent.get() > 0, "Should have sent RequestVote RPCs");
+        assertTrue(preVotesSent.get() > 0, "Should have sent PreVote RPCs before real election");
+        assertTrue(votesSent.get() > 0, "Should have sent real RequestVote after pre-vote succeeded");
+        assertTrue(raftNode.getCurrentTerm() > 0, "Term should be incremented after pre-vote + election");
     }
 
     @Test
     void winsElectionAndBecomesLeader() throws InterruptedException {
-        raftNode.registerVoteHandler("node2", req -> 
-            RequestVoteResponse.newBuilder().setTerm(req.getTerm()).setVoteGranted(true).build()
-        );
-        raftNode.registerVoteHandler("node3", req -> 
-            RequestVoteResponse.newBuilder().setTerm(req.getTerm()).setVoteGranted(true).build()
-        );
-
-        raftNode.registerAppendHandler("node2", req -> 
-            AppendEntriesResponse.newBuilder().setTerm(req.getTerm()).setSuccess(true).setMatchIndex(req.getEntriesCount()).build()
-        );
-        raftNode.registerAppendHandler("node3", req -> 
-            AppendEntriesResponse.newBuilder().setTerm(req.getTerm()).setSuccess(true).setMatchIndex(req.getEntriesCount()).build()
-        );
-
+        registerAllHandlers(true, true, true);
         raftNode.start();
-
-        Thread.sleep(500);
+        Thread.sleep(1500);
 
         assertEquals(RaftState.LEADER, raftNode.getState());
         assertEquals(nodeId, raftNode.getLeaderId());
+    }
+
+    @Test
+    void failedPreVoteDoesNotIncrementTerm() throws InterruptedException {
+        // Pre-votes rejected, real votes never sent
+        AtomicInteger votesSent = new AtomicInteger(0);
+
+        for (String peerId : List.of("node2", "node3")) {
+            raftNode.registerPreVoteHandler(peerId, req ->
+                PreVoteResponse.newBuilder().setTerm(req.getTerm() - 1).setVoteGranted(false).build()
+            );
+            raftNode.registerVoteHandler(peerId, req -> {
+                votesSent.incrementAndGet();
+                return RequestVoteResponse.newBuilder().setTerm(req.getTerm()).setVoteGranted(false).build();
+            });
+            raftNode.registerAppendHandler(peerId, req ->
+                AppendEntriesResponse.newBuilder().setTerm(req.getTerm()).setSuccess(true).setMatchIndex(0).build()
+            );
+        }
+
+        raftNode.start();
+        Thread.sleep(1500);
+
+        assertEquals(0, raftNode.getCurrentTerm(),
+                "Term must NOT be incremented when pre-vote fails — this is the core Pre-Vote guarantee");
+        assertEquals(0, votesSent.get(),
+                "Real RequestVote should never be sent when pre-vote fails");
+    }
+
+    // ===========================
+    //  Quorum Check Tests
+    // ===========================
+
+    @Test
+    void stepsDownWhenQuorumIsLost() throws InterruptedException {
+        registerAllHandlers(true, true, true);
+        raftNode.start();
+        Thread.sleep(1500);
+        assertEquals(RaftState.LEADER, raftNode.getState());
+
+        // Simulate complete network partition — all RPCs throw exceptions.
+        // When handler.apply() throws, replicateTo catches it and returns
+        // WITHOUT updating lastContactTime (line 552 is skipped).
+        raftNode.registerAppendHandler("node2", req -> { throw new RuntimeException("unreachable"); });
+        raftNode.registerAppendHandler("node3", req -> { throw new RuntimeException("unreachable"); });
+        raftNode.registerPreVoteHandler("node2", req -> { throw new RuntimeException("unreachable"); });
+        raftNode.registerPreVoteHandler("node3", req -> { throw new RuntimeException("unreachable"); });
+        raftNode.registerVoteHandler("node2", req -> { throw new RuntimeException("unreachable"); });
+        raftNode.registerVoteHandler("node3", req -> { throw new RuntimeException("unreachable"); });
+
+        // Wait for quorum loss detection.
+        // becomeLeader() seeds lastContactTime for all peers to 'now' and schedules
+        // checkQuorum every 900ms. The quorum window is 900ms.
+        // Need: staleness > 900ms, i.e., we need at least one full check cycle
+        // AFTER the contacts go stale. With generous buffer for scheduling jitter.
+        Thread.sleep(6000);
+
+        assertNotEquals(RaftState.LEADER, raftNode.getState(),
+                "Leader should step down after losing quorum");
     }
 }

@@ -30,6 +30,7 @@ public class RaftPeer {
     private DataOutputStream out;
     private final Object lock = new Object();
     private long lastRequestVoteFailureLogTime = 0;
+    private long lastPreVoteFailureLogTime = 0;
     private long lastAppendEntriesFailureLogTime = 0;
 
     public RaftPeer(PeerAddress address) {
@@ -84,6 +85,46 @@ public class RaftPeer {
                 BrokerMetrics.get().recordRaftRpc("request_vote", false,
                         System.nanoTime() - startNanos);
                 return RequestVoteResponse.newBuilder()
+                        .setTerm(0)
+                        .setVoteGranted(false)
+                        .build();
+            }
+        }
+    }
+
+    /**
+     * Send a PreVote RPC and wait for the response.
+     * PreVote checks if this candidate could win an election without incrementing the term.
+     */
+    public PreVoteResponse sendPreVote(PreVoteRequest request) {
+        synchronized (lock) {
+            long startNanos = System.nanoTime();
+            try {
+                ensureConnected();
+
+                MessageEnvelope envelope = MessageEnvelope.newBuilder()
+                        .setType(MessageType.PRE_VOTE_REQUEST)
+                        .setPayload(request.toByteString())
+                        .build();
+
+                sendEnvelope(envelope);
+                MessageEnvelope response = receiveEnvelope();
+                requireResponseType(response, MessageType.PRE_VOTE_RESPONSE, "PreVote");
+                PreVoteResponse parsed = PreVoteResponse.parseFrom(response.getPayload());
+                BrokerMetrics.get().recordRaftRpc("pre_vote", true,
+                        System.nanoTime() - startNanos);
+                return parsed;
+
+            } catch (Exception e) {
+                close();
+                long now = System.currentTimeMillis();
+                if ((now - lastPreVoteFailureLogTime) >= LOG_RATE_LIMIT_MS) {
+                    logger.debug("PreVote to {} failed: {}", address, e.getMessage());
+                    lastPreVoteFailureLogTime = now;
+                }
+                BrokerMetrics.get().recordRaftRpc("pre_vote", false,
+                        System.nanoTime() - startNanos);
+                return PreVoteResponse.newBuilder()
                         .setTerm(0)
                         .setVoteGranted(false)
                         .build();

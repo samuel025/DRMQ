@@ -16,6 +16,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
@@ -66,17 +67,24 @@ public class RaftNode {
 
     private final Map<String, Function<RequestVoteRequest, RequestVoteResponse>> voteRpcHandlers = new ConcurrentHashMap<>();
     private final Map<String, Function<AppendEntriesRequest, AppendEntriesResponse>> appendRpcHandlers = new ConcurrentHashMap<>();
+    private final Map<String, Function<PreVoteRequest, PreVoteResponse>> preVoteRpcHandlers = new ConcurrentHashMap<>();
 
     private final ReentrantLock lock = new ReentrantLock();
-    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
+    // Using a cached thread pool or larger scheduled pool size
+    // We have 5 timed tasks (election, heartbeat, quorum check, proposal cleanup, state save).
+    // Given they are short-lived, 4 threads minimizes scheduling collision while preserving efficiency.
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
     private final ExecutorService raftExecutor;
     private ScheduledFuture<?> electionTimer;
     private ScheduledFuture<?> heartbeatTimer;    
     private ScheduledFuture<?> proposalCleanupTimer;
     private ScheduledFuture<?> stateSaveTimer;
+    private ScheduledFuture<?> quorumCheckTimer;
     private volatile boolean running = false;
     private volatile boolean stateSaveNeeded = false;
     private volatile long electionStartNanos;
+    private volatile long lastHeartbeatReceivedMs;
+    private volatile boolean startupGrace = true;
 
     private static class ProposalState {
         final long term;
@@ -92,6 +100,7 @@ public class RaftNode {
     }
     private final Map<Long, ProposalState> pendingProposals = new ConcurrentHashMap<>();
     private final Map<String, Long> lastLogTime = new ConcurrentHashMap<>();
+    private final Map<String, Long> lastContactTime = new ConcurrentHashMap<>();
     private static final long LOG_RATE_LIMIT_MS = 1000;  
 
     public RaftNode(String nodeId, int port, List<PeerAddress> peers,
@@ -135,6 +144,7 @@ public class RaftNode {
    
     public void start() {
         running = true;
+        startupGrace = true;
         resetElectionTimer();
         startProposalCleanupTask();
         
@@ -198,6 +208,7 @@ public class RaftNode {
         if (heartbeatTimer != null) heartbeatTimer.cancel(false);
         if (proposalCleanupTimer != null) proposalCleanupTimer.cancel(false);
         if (stateSaveTimer != null) stateSaveTimer.cancel(false);
+        if (quorumCheckTimer != null) quorumCheckTimer.cancel(false);
         scheduler.shutdownNow();
         raftExecutor.shutdownNow();
 
@@ -230,6 +241,13 @@ public class RaftNode {
         appendRpcHandlers.put(peerId, handler);
     }
 
+    /**
+     * Register an RPC handler for sending PreVote to a peer.
+     */
+    public void registerPreVoteHandler(String peerId, Function<PreVoteRequest, PreVoteResponse> handler) {
+        preVoteRpcHandlers.put(peerId, handler);
+    }
+
     
     
     //  Election 
@@ -242,81 +260,168 @@ public class RaftNode {
         if (electionTimer != null) {
             electionTimer.cancel(false);
         }
-        long timeout = ELECTION_TIMEOUT_MIN_MS +
-                ThreadLocalRandom.current().nextLong(ELECTION_TIMEOUT_MAX_MS - ELECTION_TIMEOUT_MIN_MS);
-        electionTimer = scheduler.schedule(this::startElection, timeout, TimeUnit.MILLISECONDS);
+        long timeout;
+        if (startupGrace) {
+            timeout = ELECTION_TIMEOUT_MAX_MS * 3;
+            startupGrace = false;
+            logger.info("[{}] Startup grace: election timeout set to {}ms", nodeId, timeout);
+        } else {
+            timeout = ELECTION_TIMEOUT_MIN_MS +
+                    ThreadLocalRandom.current().nextLong(ELECTION_TIMEOUT_MAX_MS - ELECTION_TIMEOUT_MIN_MS);
+        }
+        electionTimer = scheduler.schedule(this::startPreVote, timeout, TimeUnit.MILLISECONDS);
     }
 
     /**
-     * Start an election: transition to CANDIDATE, vote for self, request votes from peers.
+     * Pre-Vote phase.
      */
-    private void startElection() {
+    private void startPreVote() {
         lock.lock();
+        long proposedTerm;
+        long lastLogIndex;
+        long lastLogTerm;
         try {
             if (!running) return;
+            if (state == RaftState.LEADER) return;
 
-            electionStartNanos = System.nanoTime();
-            currentTerm++;
-            state = RaftState.CANDIDATE;
-            votedFor = nodeId;
-            leaderId = null;
-            savePersistentState();
+            proposedTerm = currentTerm + 1;
+            lastLogIndex = raftLog.getLastIndex();
+            lastLogTerm = raftLog.getLastTerm();
 
-            logger.info("[{}] Starting election for term {}", nodeId, currentTerm);
-
-            long lastLogIndex = raftLog.getLastIndex();
-            long lastLogTerm = raftLog.getLastTerm();
-
-            RequestVoteRequest request = RequestVoteRequest.newBuilder()
-                    .setTerm(currentTerm)
-                    .setCandidateId(nodeId)
-                    .setLastLogIndex(lastLogIndex)
-                    .setLastLogTerm(lastLogTerm)
-                    .build();
-
-            long myTerm = currentTerm;
-            int votesNeeded = (peers.size() + 1) / 2 + 1;  
-            AtomicLong votesReceived = new AtomicLong(1);   
-
-            // Send RequestVote to all peers asynchronously
-            for (PeerAddress peer : peers) {
-                CompletableFuture.supplyAsync(() -> {
-                    Function<RequestVoteRequest, RequestVoteResponse> handler = voteRpcHandlers.get(peer.id());
-                    if (handler == null) return null;
-                    try {
-                        return handler.apply(request);
-                    } catch (Exception e) {
-                        return null;
-                    }
-                }, raftExecutor).thenAcceptAsync(response -> {
-                    if (response == null) return;
-                    lock.lock();
-                    try {
-                        if (currentTerm != myTerm || state != RaftState.CANDIDATE) return;
-
-                        if (response.getTerm() > currentTerm) {
-                            stepDown(response.getTerm());
-                            return;
-                        }
-
-                        if (response.getVoteGranted()) {
-                            long votes = votesReceived.incrementAndGet();
-                            logger.info("[{}] Received vote from {} ({}/{})", nodeId, peer.id(), votes, votesNeeded);
-                            if (votes >= votesNeeded) {
-                                becomeLeader();
-                            }
-                        }
-                    } finally {
-                        lock.unlock();
-                    }
-                });
-            }
-
+            logger.info("[{}] Starting pre-vote for proposed term {}", nodeId, proposedTerm);
         } finally {
             lock.unlock();
         }
 
+        PreVoteRequest request = PreVoteRequest.newBuilder()
+                .setTerm(proposedTerm)
+                .setCandidateId(nodeId)
+                .setLastLogIndex(lastLogIndex)
+                .setLastLogTerm(lastLogTerm)
+                .build();
+
+        int votesNeeded = (peers.size() + 1) / 2 + 1;
+        AtomicLong votesReceived = new AtomicLong(1); 
+        AtomicBoolean electionStarted = new AtomicBoolean(false);
+
+        if (votesReceived.get() >= votesNeeded) {
+            if (electionStarted.compareAndSet(false, true)) {
+                logger.info("[{}] Pre-vote succeeded, starting real election", nodeId);
+                startElection();
+            }
+        }
+
+        for (PeerAddress peer : peers) {
+            CompletableFuture.supplyAsync(() -> {
+                Function<PreVoteRequest, PreVoteResponse> handler = preVoteRpcHandlers.get(peer.id());
+                if (handler == null) return null;
+                try {
+                    return handler.apply(request);
+                } catch (Exception e) {
+                    return null;
+                }
+            }, raftExecutor).thenAcceptAsync(response -> {
+                if (response == null) return;
+                lock.lock();
+                try {
+                    if (state == RaftState.LEADER || !running) return;
+
+                    if (response.getTerm() > currentTerm) {
+                        stepDown(response.getTerm());
+                        return;
+                    }
+
+                    if (response.getVoteGranted()) {
+                        long votes = votesReceived.incrementAndGet();
+                        logger.info("[{}] Received pre-vote from {} ({}/{})",
+                                nodeId, peer.id(), votes, votesNeeded);
+                        if (votes >= votesNeeded) {
+                            if (electionStarted.compareAndSet(false, true)) {
+                                logger.info("[{}] Pre-vote succeeded, starting real election", nodeId);
+                                startElection();
+                            }
+                        }
+                    }
+                } finally {
+                    lock.unlock();
+                }
+            });
+        }
+
         resetElectionTimer();
+    }
+
+    /**
+     * Start a real election: transition to CANDIDATE, increment term, vote for self,
+     * request votes from peers. Only called after a successful pre-vote.
+     */
+    private void startElection() {
+        if (!running) return;
+
+        electionStartNanos = System.nanoTime();
+        currentTerm++;
+        state = RaftState.CANDIDATE;
+        votedFor = nodeId;
+        leaderId = null;
+        savePersistentState();
+
+        logger.info("[{}] Starting election for term {}", nodeId, currentTerm);
+
+        long lastLogIndex = raftLog.getLastIndex();
+        long lastLogTerm = raftLog.getLastTerm();
+
+        RequestVoteRequest request = RequestVoteRequest.newBuilder()
+                .setTerm(currentTerm)
+                .setCandidateId(nodeId)
+                .setLastLogIndex(lastLogIndex)
+                .setLastLogTerm(lastLogTerm)
+                .build();
+
+        long myTerm = currentTerm;
+        int votesNeeded = (peers.size() + 1) / 2 + 1;  
+        AtomicLong votesReceived = new AtomicLong(1);   
+        java.util.concurrent.atomic.AtomicBoolean electionWon = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+        if (votesReceived.get() >= votesNeeded) {
+            if (electionWon.compareAndSet(false, true)) {
+                becomeLeader();
+            }
+        }
+
+        for (PeerAddress peer : peers) {
+            CompletableFuture.supplyAsync(() -> {
+                Function<RequestVoteRequest, RequestVoteResponse> handler = voteRpcHandlers.get(peer.id());
+                if (handler == null) return null;
+                try {
+                    return handler.apply(request);
+                } catch (Exception e) {
+                    return null;
+                }
+            }, raftExecutor).thenAcceptAsync(response -> {
+                if (response == null) return;
+                lock.lock();
+                try {
+                    if (currentTerm != myTerm || state != RaftState.CANDIDATE) return;
+
+                    if (response.getTerm() > currentTerm) {
+                        stepDown(response.getTerm());
+                        return;
+                    }
+
+                    if (response.getVoteGranted()) {
+                        long votes = votesReceived.incrementAndGet();
+                        logger.info("[{}] Received vote from {} ({}/{})", nodeId, peer.id(), votes, votesNeeded);
+                        if (votes >= votesNeeded) {
+                            if (electionWon.compareAndSet(false, true)) {
+                                becomeLeader();
+                            }
+                        }
+                    }
+                } finally {
+                    lock.unlock();
+                }
+            });
+        }
     }
 
     /**
@@ -332,9 +437,11 @@ public class RaftNode {
         for (PeerAddress peer : peers) {
             nextIndex.put(peer.id(), lastLogIndex + 1);
             matchIndex.put(peer.id(), 0L);
+            lastContactTime.put(peer.id(), System.currentTimeMillis());
         }
 
         if (electionTimer != null) electionTimer.cancel(false);
+        if (quorumCheckTimer != null) quorumCheckTimer.cancel(false);
 
         logger.info("[{}] ★ Became LEADER for term {} (lastLogIndex={}, electionMs={})",
             nodeId, currentTerm, lastLogIndex, electionDuration);
@@ -343,6 +450,10 @@ public class RaftNode {
 
         heartbeatTimer = scheduler.scheduleAtFixedRate(
                 this::sendHeartbeats, HEARTBEAT_INTERVAL_MS, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        
+        long quorumCheckIntervalMs = ELECTION_TIMEOUT_MAX_MS * 3;
+        quorumCheckTimer = scheduler.scheduleAtFixedRate(
+                this::checkQuorum, quorumCheckIntervalMs, quorumCheckIntervalMs, TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -369,7 +480,39 @@ public class RaftNode {
         }
 
         if (heartbeatTimer != null) heartbeatTimer.cancel(false);
+        if (quorumCheckTimer != null) quorumCheckTimer.cancel(false);
         resetElectionTimer();
+    }
+
+    /**
+     * Check if the leader has successfully communicated with a majority
+     * of the cluster in the last timeout window. Step down if lost.
+     */
+    private void checkQuorum() {
+        lock.lock();
+        try {
+            if (state != RaftState.LEADER) return;
+
+            long now = System.currentTimeMillis();
+            long quorumWindow = ELECTION_TIMEOUT_MAX_MS * 3;
+            int activePeers = 1; 
+
+            for (PeerAddress peer : peers) {
+                Long lastContact = lastContactTime.get(peer.id());
+                if (lastContact != null && (now - lastContact) <= quorumWindow) {
+                    activePeers++;
+                }
+            }
+
+            int majority = (peers.size() + 1) / 2 + 1;
+            if (activePeers < majority) {
+                logger.warn("[{}] Lost quorum (active: {}, majority: {}). Stepping down to FOLLOWER.",
+                        nodeId, activePeers, majority);
+                stepDown(currentTerm); 
+            }
+        } finally {
+            lock.unlock();
+        }
     }
 
     //  Heartbeats & Replication 
@@ -417,6 +560,7 @@ public class RaftNode {
         AppendEntriesResponse response;
         try {
             response = handler.apply(request);
+            lastContactTime.put(peer.id(), System.currentTimeMillis());
         } catch (Exception e) {
             if (shouldLog("append_failure_" + peer.id())) {
                 logger.debug("[{}] AppendEntries to {} failed: {}", nodeId, peer.id(), e.getMessage());
@@ -714,7 +858,6 @@ public class RaftNode {
     public RequestVoteResponse handleRequestVote(RequestVoteRequest request) {
         lock.lock();
         try {
-            // If request term is higher, step down
             if (request.getTerm() > currentTerm) {
                 stepDown(request.getTerm());
             }
@@ -746,6 +889,51 @@ public class RaftNode {
     }
 
     /**
+     * Handle an incoming PreVote RPC from a candidate.
+     */
+    public PreVoteResponse handlePreVote(PreVoteRequest request) {
+        lock.lock();
+        try {
+            // Reject if proposed term is behind ours
+            if (request.getTerm() < currentTerm) {
+                return PreVoteResponse.newBuilder()
+                        .setTerm(currentTerm)
+                        .setVoteGranted(false)
+                        .build();
+            }
+
+            boolean leaderAlive = (state == RaftState.LEADER)
+                    || (lastHeartbeatReceivedMs > 0
+                        && (System.currentTimeMillis() - lastHeartbeatReceivedMs) < ELECTION_TIMEOUT_MIN_MS);
+
+            if (leaderAlive) {
+                logger.info("[{}] Rejecting pre-vote for {} (term {}) — leader is alive (state={})",
+                        nodeId, request.getCandidateId(), request.getTerm(), state);
+                return PreVoteResponse.newBuilder()
+                        .setTerm(currentTerm)
+                        .setVoteGranted(false)
+                        .build();
+            }
+
+            // Check log up-to-date
+            boolean logOk = isLogUpToDate(request.getLastLogIndex(), request.getLastLogTerm());
+
+            if (logOk) {
+                logger.info("[{}] Granted pre-vote to {} for proposed term {}",
+                        nodeId, request.getCandidateId(), request.getTerm());
+            }
+
+            return PreVoteResponse.newBuilder()
+                    .setTerm(currentTerm)
+                    .setVoteGranted(logOk)
+                    .build();
+
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
      * Handle an incoming AppendEntries RPC from the leader.
      * Also serves as heartbeat when entries list is empty.
      */
@@ -765,12 +953,11 @@ public class RaftNode {
                         .build();
             }
 
-            // Valid AppendEntries from current leader — reset election timer
             state = RaftState.FOLLOWER;
             leaderId = request.getLeaderId();
+            lastHeartbeatReceivedMs = System.currentTimeMillis();
             resetElectionTimer();
 
-            // Log consistency check
             if (request.getPrevLogIndex() > 0) {
                 long prevTerm = raftLog.getTermAt(request.getPrevLogIndex());
                 if (request.getPrevLogIndex() > raftLog.getLastIndex() || prevTerm != request.getPrevLogTerm()) {
@@ -782,7 +969,6 @@ public class RaftNode {
                 }
             }
 
-            // Append new entries (handling conflicts by truncation)
             if (!request.getEntriesList().isEmpty()) {
                 for (RaftEntry entry : request.getEntriesList()) {
                     long existingTerm = raftLog.getTermAt(entry.getIndex());
