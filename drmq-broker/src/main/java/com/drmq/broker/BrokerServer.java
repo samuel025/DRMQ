@@ -37,6 +37,7 @@ public class BrokerServer {
     private final MessageStore messageStore;
     private final LogManager logManager;
     private final OffsetManager offsetManager;
+    private final ConsumerGroupCoordinator groupCoordinator;
     private final RaftNode raftNode;       
     private final List<RaftPeer> raftPeers; 
     private final BrokerMetrics metrics;
@@ -54,6 +55,7 @@ public class BrokerServer {
         this.logManager = new LogManager(config.getDataDir());
         this.messageStore = new MessageStore(logManager);
         this.offsetManager = new OffsetManager(config.getDataDir());
+        this.groupCoordinator = new ConsumerGroupCoordinator(messageStore, offsetManager);
         this.raftPeers = new ArrayList<>();
         this.metrics = BrokerMetrics.init(config);
 
@@ -124,7 +126,7 @@ public class BrokerServer {
                      p.addLast(new ByteArrayDecoder());
                      p.addLast(new LengthFieldPrepender(4));
                      p.addLast(new ByteArrayEncoder());
-                     p.addLast(businessGroup, "clientHandler", new ClientHandler(messageStore, offsetManager, raftNode, activeChannels));
+                     p.addLast(businessGroup, "clientHandler", new ClientHandler(messageStore, offsetManager, raftNode, activeChannels, groupCoordinator));
                  }
              });
 
@@ -214,6 +216,10 @@ public class BrokerServer {
             if (offsetManager != null) offsetManager.close();
         } catch (IOException e) {
             logger.error("Error closing offset manager", e);
+        }
+
+        if (groupCoordinator != null) {
+            groupCoordinator.close();
         }
 
         logger.info("Broker shutdown complete");

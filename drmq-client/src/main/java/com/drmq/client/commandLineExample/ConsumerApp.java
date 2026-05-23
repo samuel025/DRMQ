@@ -32,7 +32,9 @@ public class ConsumerApp {
 
                 consumer.connect();
                 System.out.println("✓ Connected to broker");
-            System.out.printf( "✓ Offsets tracked by broker for group '%s'\n\n", consumerGroup);
+            System.out.printf( "✓ Consumer ID: %s\n", consumer.getConsumerId());
+            System.out.printf( "✓ Group mode: %s (broker coordinates offsets across consumers)\n",
+                    consumer.isGroupMode() ? "on" : "off");
                 System.out.printf("✓ Auto-commit: %s (use 'autocommit on|off')\n\n",
                     consumer.isAutoCommit() ? "on" : "off");
 
@@ -176,10 +178,12 @@ public class ConsumerApp {
 
                     case "status" -> {
                         System.out.printf("\nGroup: %s\n", consumerGroup);
+                        System.out.printf("Consumer ID: %s\n", consumer.getConsumerId());
                         System.out.println("─────────────────────────────");
+                        System.out.printf("Group mode:  %s\n", consumer.isGroupMode() ? "on (broker coordinates)" : "off (legacy)");
                         System.out.printf("Auto-commit: %s\n", consumer.isAutoCommit() ? "on" : "off");
                         System.out.println("  (Use 'subscribe <topic>' to add subscriptions)");
-                        System.out.println("  Tip: Offsets persist on the broker — restart anytime and resume!\n");
+                        System.out.println("  Tip: Multiple consumers with the same group share the workload!\n");
                     }
 
                     case "commit" -> {
@@ -226,6 +230,25 @@ public class ConsumerApp {
                         }
                     }
 
+                    case "mode" -> {
+                        if (parts.length < 2) {
+                            System.out.printf("Current mode: %s\n",
+                                    consumer.isGroupMode() ? "group (broker coordinates)" : "legacy (client offsets)");
+                            System.out.println("Usage: mode group|legacy\n");
+                            continue;
+                        }
+                        String value = parts[1].toLowerCase();
+                        if ("group".equals(value)) {
+                            consumer.setGroupMode(true);
+                            System.out.println("✓ Switched to group mode (broker coordinates offsets)\n");
+                        } else if ("legacy".equals(value)) {
+                            consumer.setGroupMode(false);
+                            System.out.println("✓ Switched to legacy mode (client manages offsets)\n");
+                        } else {
+                            System.out.println("❌ Usage: mode group|legacy\n");
+                        }
+                    }
+
                     default -> {
                         System.out.printf("❌ Unknown command: %s\n", command);
                         System.out.println("   Type 'help' for available commands\n");
@@ -249,6 +272,7 @@ public class ConsumerApp {
         System.out.println("    timeout_ms>0 → long poll (broker waits up to N ms for messages)");
         System.out.println("  commit <topic> [offset]              - Commit current or explicit offset");
         System.out.println("  autocommit on|off                    - Enable/disable auto-commit");
+        System.out.println("  mode group|legacy                    - Switch consumption mode");
         System.out.println("  stream [timeout_ms]                  - Continuous mode: auto-polls forever");
         System.out.println("    (press Ctrl+C to stop streaming)");
         System.out.println("  status                               - Show group info");

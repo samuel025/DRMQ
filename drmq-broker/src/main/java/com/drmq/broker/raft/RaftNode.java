@@ -380,7 +380,7 @@ public class RaftNode {
         long myTerm = currentTerm;
         int votesNeeded = (peers.size() + 1) / 2 + 1;  
         AtomicLong votesReceived = new AtomicLong(1);   
-        java.util.concurrent.atomic.AtomicBoolean electionWon = new java.util.concurrent.atomic.AtomicBoolean(false);
+        AtomicBoolean electionWon = new AtomicBoolean(false);
 
         if (votesReceived.get() >= votesNeeded) {
             if (electionWon.compareAndSet(false, true)) {
@@ -894,8 +894,7 @@ public class RaftNode {
     public PreVoteResponse handlePreVote(PreVoteRequest request) {
         lock.lock();
         try {
-            // Reject if proposed term is behind ours
-            if (request.getTerm() < currentTerm) {
+            if (request.getTerm() <= currentTerm) {
                 return PreVoteResponse.newBuilder()
                         .setTerm(currentTerm)
                         .setVoteGranted(false)
@@ -915,7 +914,6 @@ public class RaftNode {
                         .build();
             }
 
-            // Check log up-to-date
             boolean logOk = isLogUpToDate(request.getLastLogIndex(), request.getLastLogTerm());
 
             if (logOk) {
