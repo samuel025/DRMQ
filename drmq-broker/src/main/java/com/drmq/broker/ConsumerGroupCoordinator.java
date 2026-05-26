@@ -12,15 +12,13 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
+import com.drmq.broker.raft.RaftNode;
+
 /**
  * Coordinates message consumption across multiple consumers within a consumer group.
  *
  * <h3>Design: Broker-Side Offset Leasing</h3>
- * <p>
- * Instead of letting all consumers in a group share a single offset (causing duplicates),
- * the coordinator assigns non-overlapping offset ranges ("leases") to each consumer.
- * Each message in a topic is delivered to exactly one consumer in the group.
- * </p>
+
  *
  * <h3>Key Concepts</h3>
  * <ul>
@@ -28,21 +26,17 @@ import java.util.concurrent.locks.ReentrantLock;
  *   <li><b>committedOffset</b> — the highest contiguously committed offset (persisted for crash recovery)</li>
  *   <li><b>Lease</b> — a range of offsets assigned to a specific consumer, with an expiry time</li>
  * </ul>
- *
- * <p>If a consumer fails to commit its lease before the timeout, the lease expires and
- * the offsets are re-dispatched to another consumer.</p>
  */
 public class ConsumerGroupCoordinator implements Closeable {
     private static final Logger logger = LoggerFactory.getLogger(ConsumerGroupCoordinator.class);
 
-    /** Default time a lease can be held before it expires and is re-dispatched. */
-    private static final long DEFAULT_LEASE_TIMEOUT_MS = 30_000;
+    static final long DEFAULT_LEASE_TIMEOUT_MS = 30_000;
 
-    /** How frequently the background task checks for expired leases. */
     private static final long LEASE_CHECK_INTERVAL_MS = 5_000;
 
     private final MessageStore messageStore;
     private final OffsetManager offsetManager;
+    private final RaftNode raftNode;
     private final long leaseTimeoutMs;
 
     /** group/topic → GroupTopicState */
@@ -51,12 +45,18 @@ public class ConsumerGroupCoordinator implements Closeable {
     private final ScheduledExecutorService leaseReaper;
 
     public ConsumerGroupCoordinator(MessageStore messageStore, OffsetManager offsetManager) {
-        this(messageStore, offsetManager, DEFAULT_LEASE_TIMEOUT_MS);
+        this(messageStore, offsetManager, null, DEFAULT_LEASE_TIMEOUT_MS);
     }
 
     public ConsumerGroupCoordinator(MessageStore messageStore, OffsetManager offsetManager, long leaseTimeoutMs) {
+        this(messageStore, offsetManager, null, leaseTimeoutMs);
+    }
+
+    public ConsumerGroupCoordinator(MessageStore messageStore, OffsetManager offsetManager,
+                                     RaftNode raftNode, long leaseTimeoutMs) {
         this.messageStore = messageStore;
         this.offsetManager = offsetManager;
+        this.raftNode = raftNode;
         this.leaseTimeoutMs = leaseTimeoutMs;
 
         this.leaseReaper = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -83,7 +83,6 @@ public class ConsumerGroupCoordinator implements Closeable {
                                                 int maxMessages, long timeoutMs) {
         String key = groupKey(group, topic);
         GroupTopicState state = groupStates.computeIfAbsent(key, k -> {
-            // Bootstrap dispatchOffset from the committed offset
             long committed = offsetManager.fetch(group, topic);
             long startOffset = committed >= 0 ? committed : 0;
             logger.info("Initializing group state: group={}, topic={}, startOffset={}", group, topic, startOffset);
@@ -97,8 +96,6 @@ public class ConsumerGroupCoordinator implements Closeable {
         } finally {
             state.lock.unlock();
         }
-
-        // Fetch messages from the store WITHOUT holding the lock
         List<StoredMessage> messages = (timeoutMs > 0)
                 ? messageStore.waitForMessages(topic, fromOffset, maxMessages, timeoutMs)
                 : messageStore.getMessages(topic, fromOffset, maxMessages);
@@ -206,6 +203,17 @@ public class ConsumerGroupCoordinator implements Closeable {
         if (current > state.committedOffset) {
             state.committedOffset = current;
             offsetManager.commit(group, topic, current);
+
+            // Replicate via Raft so the offset survives leader failover
+            if (raftNode != null && raftNode.isLeader()) {
+                try {
+                    raftNode.proposeOffsetCommit(group, topic, current);
+                } catch (Exception e) {
+                    logger.warn("Failed to replicate committed offset via Raft: group={}, topic={}, offset={}: {}",
+                            group, topic, current, e.getMessage());
+                }
+            }
+
             logger.debug("Advanced committed offset to {} for group={}, topic={}", current, group, topic);
         }
     }
@@ -214,7 +222,7 @@ public class ConsumerGroupCoordinator implements Closeable {
      * Periodic task: expire leases that have not been committed in time.
      * Rewinds the dispatch offset so the expired range can be re-dispatched.
      */
-    private void expireLeases() {
+    void expireLeases() {
         long now = System.currentTimeMillis();
 
         for (Map.Entry<String, GroupTopicState> entry : groupStates.entrySet()) {
@@ -247,11 +255,7 @@ public class ConsumerGroupCoordinator implements Closeable {
         }
     }
 
-    /**
-     * Check if a consumer group is being actively coordinated.
-     * Used by the ClientHandler to decide whether offset commits should
-     * go through the coordinator or the raw OffsetManager.
-     */
+
     public boolean isGroupActive(String group, String topic) {
         String key = groupKey(group, topic);
         GroupTopicState state = groupStates.get(key);
@@ -291,9 +295,6 @@ public class ConsumerGroupCoordinator implements Closeable {
         return group + "/" + topic;
     }
 
-    // -------------------------------------------------------------------------
-    // Internal data structures
-    // -------------------------------------------------------------------------
 
     /**
      * Per (group, topic) coordination state.
@@ -301,10 +302,8 @@ public class ConsumerGroupCoordinator implements Closeable {
     private static class GroupTopicState {
         final ReentrantLock lock = new ReentrantLock();
 
-        /** The next offset to dispatch to a consumer. */
         long dispatchOffset;
 
-        /** The highest contiguously committed offset (safe restart point). */
         long committedOffset;
 
         /** Active leases: consumerId → Lease */
@@ -327,9 +326,9 @@ public class ConsumerGroupCoordinator implements Closeable {
      */
     private static class Lease {
         final String consumerId;
-        final long fromOffset;    // inclusive
-        final long toOffset;      // exclusive
-        final long expiresAt;     // epoch ms
+        final long fromOffset;    
+        final long toOffset;     
+        final long expiresAt;     
 
         Lease(String consumerId, long fromOffset, long toOffset, long expiresAt) {
             this.consumerId = consumerId;
@@ -343,8 +342,8 @@ public class ConsumerGroupCoordinator implements Closeable {
      * A range of offsets that a consumer has successfully committed.
      */
     private static class CommittedRange {
-        final long fromOffset;  // inclusive
-        final long toOffset;    // exclusive (= committed offset value)
+        final long fromOffset;  
+        final long toOffset;    
 
         CommittedRange(long fromOffset, long toOffset) {
             this.fromOffset = fromOffset;

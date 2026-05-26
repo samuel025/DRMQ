@@ -91,7 +91,6 @@ public class BrokerConfig {
                 case "--metrics-port" -> metricsPort = parsePortArg(args, ++i, "--metrics-port");
                 case "--metrics-path" -> metricsPath = parsePathArg(args, ++i, "--metrics-path");
                 default -> {
-                    // Legacy support: first positional arg = port, second = dataDir
                     if (i == 0) {
                         try {
                             port = Integer.parseInt(args[i]);

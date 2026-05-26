@@ -25,7 +25,7 @@ import java.util.concurrent.ThreadLocalRandom;
  *       instances can join the same group. The broker coordinates offset dispatch
  *       so each message is delivered to exactly one consumer in the group.
  *       Different groups each receive all messages (fan-out).</li>
- *   <li><b>Legacy mode</b> (when {@code useGroupMode(false)} is called): The consumer
+ *   <li><b>Single mode</b> (when {@code useGroupMode(false)} is called): The consumer
  *       manages its own offset locally and sends raw offset-based ConsumeRequests.</li>
  * </ul>
  */
@@ -114,12 +114,7 @@ public class DRMQConsumer implements AutoCloseable {
         return autoCommit;
     }
 
-    /**
-     * Enable or disable broker-coordinated group consumption.
-     * <p>When enabled (default), the broker manages offset dispatch across
-     * all consumers in the same group. When disabled, the consumer manages
-     * its own offset locally (legacy behavior).</p>
-     */
+
     public void setGroupMode(boolean groupMode) {
         this.groupMode = groupMode;
     }
@@ -289,7 +284,7 @@ public class DRMQConsumer implements AutoCloseable {
 
     /**
      * Subscribe to a topic. In group mode, the broker manages offsets.
-     * In legacy mode, resumes from the broker-committed offset automatically.
+     * In single mode, resumes from the broker-committed offset automatically.
      * If no offset has been committed yet, starts from offset 0.
      */
     public void subscribe(String topic) throws IOException {

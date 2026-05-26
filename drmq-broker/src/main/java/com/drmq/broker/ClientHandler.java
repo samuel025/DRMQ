@@ -173,7 +173,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
                 logger.debug("Group-consume {} messages: group={}, consumer={}, topic={}",
                         messages.size(), group, consumerId, topic);
             } else {
-                // Legacy: client-driven offset consumption
+                // Single mode: client-driven offset consumption
                 long fromOffset = request.getFromOffset();
                 messages = (timeoutMs > 0)
                         ? messageStore.waitForMessages(topic, fromOffset, maxMessages, timeoutMs)

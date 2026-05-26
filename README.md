@@ -10,7 +10,7 @@ The project is structured as a multi-module Maven build, separating the core bro
 
 ## Key Features
 
-- **Scalable Consumer Groups:** Scale your consumers dynamically without the complexity of partitions. Simply start multiple consumers with the same group name, and the broker will automatically distribute messages among them. Each message goes to exactly one consumer in the group. Need to replay or read specific messages? Switch to legacy mode for full manual offset control.
+- **Scalable Consumer Groups:** Scale your consumers dynamically without the complexity of partitions. Simply start multiple consumers with the same group name, and the broker will automatically distribute messages among them. Each message goes to exactly one consumer in the group. Need to replay or read specific messages? Switch to single mode for full manual offset control.
 - **Raft Consensus Integration:** Full implementation of the Raft protocol for distributed state replication, leader election, and high availability. Features **Quorum-Loss Stepdown** to detect network partitions and demote isolated leaders, preventing split-brain/ghost leadership data loss.
 - **Persistent Storage:** Custom Write-Ahead Log (WAL) and segment-based message storage ensure messages are durably persisted to disk. Features thread-safe, atomic consumer offset management with bounds locking designed to minimize data loss during concurrent background writes and handle shutdowns gracefully.
 - **Graceful Teardown Coordination:** Orchestrated, safe termination of Netty EventLoops, RPC executors, and disk storage guaranteeing state integrity without resource leaks during node shutdowns.
@@ -95,7 +95,7 @@ try (DRMQProducer producer = new DRMQProducer("localhost:9092,localhost:9093")) 
 
 ### Consumer
 
-DRMQ supports two modes of consumption: **Group Mode** (for scalable, load-balanced processing) and **Legacy Mode** (for precise manual control and replay).
+DRMQ supports two modes of consumption: **Group Mode** (for scalable, load-balanced processing) and **Single Consumer Mode** (for precise manual control and replay).
 
 #### 1. Group Mode (Default - Auto Load Balancing)
 
@@ -125,7 +125,7 @@ while (true) {
 }
 ```
 
-#### 2. Legacy Mode (Manual Offset Control & Replay)
+#### 2. Single Consumer Mode (Manual Offset Control & Replay)
 
 If you need strict control over what messages you read—for example, if you want to replay messages from the beginning or start from a specific offset—you can disable group mode. In this mode, the client tells the broker exactly which offset to fetch.
 
@@ -143,7 +143,7 @@ try (DRMQConsumer consumer = new DRMQConsumer("localhost:9092", "my-group")) {
             System.out.printf("Replaying (offset %d): %s\n", msg.offset(), msg.payloadAsString());
         }
         
-        // In legacy mode, you must manually commit the offset if you want the broker to remember where you stopped
+        // In Single consumer mode, you must manually commit the offset if you want the broker to remember where you stopped
         if (!messages.isEmpty()) {
             long lastOffset = messages.get(messages.size() - 1).offset();
             consumer.commit("my-topic", lastOffset + 1);
@@ -176,7 +176,7 @@ mvn exec:java -Dexec.mainClass="com.drmq.client.commandLineExample.ConsumerApp" 
 
 Run multiple instances with the same group name in separate terminals to see messages load-balanced across consumers.
 
-_Commands:_ `subscribe <topic>`, `poll`, `stream`, `commit`, `mode group|legacy`, `status`
+_Commands:_ `subscribe <topic>`, `poll`, `stream`, `commit`, `mode group|single`, `status`
 
 ## Monitoring
 

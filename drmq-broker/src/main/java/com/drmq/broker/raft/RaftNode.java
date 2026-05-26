@@ -709,7 +709,6 @@ public class RaftNode {
                 safeCompactIndex = retentionLimit;
             }
             
-            // Leave at least a 1000 entry buffer
             long finalCompactIndex = Math.min(safeCompactIndex, lastApplied - 1000);
             
             if (finalCompactIndex > 0) {

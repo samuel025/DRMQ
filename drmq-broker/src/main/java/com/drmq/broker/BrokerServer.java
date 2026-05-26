@@ -55,7 +55,6 @@ public class BrokerServer {
         this.logManager = new LogManager(config.getDataDir());
         this.messageStore = new MessageStore(logManager);
         this.offsetManager = new OffsetManager(config.getDataDir());
-        this.groupCoordinator = new ConsumerGroupCoordinator(messageStore, offsetManager);
         this.raftPeers = new ArrayList<>();
         this.metrics = BrokerMetrics.init(config);
 
@@ -82,6 +81,9 @@ public class BrokerServer {
             this.raftNode = null;
             logger.info("Single-node mode (no Raft)");
         }
+
+        this.groupCoordinator = new ConsumerGroupCoordinator(messageStore, offsetManager,
+                raftNode, ConsumerGroupCoordinator.DEFAULT_LEASE_TIMEOUT_MS);
 
         metrics.registerBroker(activeChannels::size, messageStore, offsetManager, logManager, raftNode);
     }
@@ -137,7 +139,7 @@ public class BrokerServer {
             if (raftNode != null) {
                 raftNode.start();
             }
-            logger.info("DRMQ Netty Broker started on port {} with data directory {}",
+            logger.info("DRMQ Broker started on port {} with data directory {}",
                     config.getPort(), config.getDataDir());
 
             serverChannel.closeFuture().sync();

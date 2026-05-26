@@ -75,7 +75,7 @@ class ConsumerIntegrationTest {
             }
         }
 
-        // Consume starting from offset 5 (requires legacy mode for explicit offset)
+        // Consume starting from offset 5 (requires single mode for explicit offset)
         try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT)) {
             consumer.setGroupMode(false);
             consumer.connect();
