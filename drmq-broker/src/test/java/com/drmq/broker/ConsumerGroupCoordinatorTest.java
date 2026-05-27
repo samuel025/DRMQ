@@ -304,6 +304,27 @@ class ConsumerGroupCoordinatorTest {
         assertEquals(0, coordinator.getConsumerCount(GROUP, TOPIC));
     }
 
+    @Test
+    void commitRemovesConsumerFromMembers() {
+        produceMessages(6);
+
+        coordinator.acquireMessages(GROUP, TOPIC, "consumer-A", 3, 0);
+        coordinator.acquireMessages(GROUP, TOPIC, "consumer-B", 3, 0);
+        assertEquals(2, coordinator.getConsumerCount(GROUP, TOPIC));
+
+        // A commits — should be removed from members
+        coordinator.commitOffset(GROUP, TOPIC, "consumer-A", 3);
+        assertEquals(1, coordinator.getConsumerCount(GROUP, TOPIC));
+
+        // B commits — members is now empty
+        coordinator.commitOffset(GROUP, TOPIC, "consumer-B", 6);
+        assertEquals(0, coordinator.getConsumerCount(GROUP, TOPIC));
+
+        // isGroupActive should also reflect this
+        assertFalse(coordinator.isGroupActive(GROUP, TOPIC),
+                "Group should not be active after all consumers commit");
+    }
+
     // =========================================================================
     // 10. Disjoint delivery (no duplicates across consumers)
     // =========================================================================

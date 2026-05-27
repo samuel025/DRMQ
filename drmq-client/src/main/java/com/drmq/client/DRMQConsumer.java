@@ -529,8 +529,7 @@ public class DRMQConsumer implements AutoCloseable {
         return fetchMessagesWithRetry(topic, fromOffset, maxMessages, timeoutMs, MAX_RETRIES);
     }
 
-    private List<ConsumedMessage> fetchMessagesWithRetry(String topic, long fromOffset, int maxMessages,
-                                                          long timeoutMs, int retriesLeft) throws IOException {
+    private List<ConsumedMessage> fetchMessagesWithRetry(String topic, long fromOffset, int maxMessages, long timeoutMs, int retriesLeft) throws IOException {
         IOException lastException = null;
 
         for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {

@@ -79,8 +79,7 @@ public class ConsumerGroupCoordinator implements Closeable {
      * @param timeoutMs  long-poll timeout (0 = return immediately)
      * @return the messages assigned to this consumer (may be empty)
      */
-    public List<StoredMessage> acquireMessages(String group, String topic, String consumerId,
-                                                int maxMessages, long timeoutMs) {
+    public List<StoredMessage> acquireMessages(String group, String topic, String consumerId, int maxMessages, long timeoutMs) {
         String key = groupKey(group, topic);
         GroupTopicState state = groupStates.computeIfAbsent(key, k -> {
             long committed = offsetManager.fetch(group, topic);
@@ -106,24 +105,15 @@ public class ConsumerGroupCoordinator implements Closeable {
 
         state.lock.lock();
         try {
-            // Check if another consumer advanced the offset while we were waiting
             if (state.dispatchOffset > fromOffset) {
-                // Someone else grabbed these exact messages. Return empty so the client polls again.
                 return Collections.emptyList();
             }
-
             state.members.add(consumerId);
-
-            // Determine the range we're leasing out
             long lastOffset = messages.get(messages.size() - 1).getOffset();
-            long leaseEnd = lastOffset + 1; // exclusive
-
-            // Create the lease
+            long leaseEnd = lastOffset + 1; 
             Lease lease = new Lease(consumerId, fromOffset, leaseEnd,
                     System.currentTimeMillis() + leaseTimeoutMs);
             state.activeLeases.put(consumerId, lease);
-
-            // Advance the dispatch offset past the leased range
             state.dispatchOffset = leaseEnd;
 
             logger.debug("Leased offsets [{}, {}) to consumer {} in group={}, topic={}",
@@ -151,24 +141,21 @@ public class ConsumerGroupCoordinator implements Closeable {
         GroupTopicState state = groupStates.get(key);
 
         if (state == null) {
-            // No active state — fall through to the plain offset manager
             offsetManager.commit(group, topic, offset);
             return;
         }
 
         state.lock.lock();
         try {
-            // Remove the lease for this consumer (it's been fulfilled)
             Lease lease = state.activeLeases.remove(consumerId);
 
             if (lease != null) {
-                // Record the committed range
                 state.committedRanges.add(new CommittedRange(lease.fromOffset, offset));
+                state.members.remove(consumerId);
                 logger.debug("Consumer {} committed offset {} for group={}, topic={} (lease [{}, {}))",
                         consumerId, offset, group, topic, lease.fromOffset, lease.toOffset);
             }
 
-            // Try to advance the contiguous committed offset
             advanceCommittedOffset(state, group, topic);
 
         } finally {
@@ -181,7 +168,6 @@ public class ConsumerGroupCoordinator implements Closeable {
      * Only commits to the OffsetManager when the offset actually advances.
      */
     private void advanceCommittedOffset(GroupTopicState state, String group, String topic) {
-        // Sort committed ranges by start offset
         state.committedRanges.sort(Comparator.comparingLong(r -> r.fromOffset));
 
         long current = state.committedOffset;
@@ -190,21 +176,18 @@ public class ConsumerGroupCoordinator implements Closeable {
         while (it.hasNext()) {
             CommittedRange range = it.next();
             if (range.fromOffset <= current) {
-                // This range is contiguous with (or overlaps) the current committed offset
                 if (range.toOffset > current) {
                     current = range.toOffset;
                 }
-                it.remove(); // consumed this range
+                it.remove(); 
             } else {
-                break; // gap — can't advance further
+                break;
             }
         }
 
         if (current > state.committedOffset) {
             state.committedOffset = current;
             offsetManager.commit(group, topic, current);
-
-            // Replicate via Raft so the offset survives leader failover
             if (raftNode != null && raftNode.isLeader()) {
                 try {
                     raftNode.proposeOffsetCommit(group, topic, current);
@@ -237,14 +220,9 @@ public class ConsumerGroupCoordinator implements Closeable {
                     if (now >= lease.expiresAt) {
                         logger.warn("Lease expired for consumer {} in {}: offsets [{}, {}). Rewinding dispatch offset.",
                                 leaseEntry.getKey(), entry.getKey(), lease.fromOffset, lease.toOffset);
-
-                        // Rewind the dispatch offset to the start of the expired lease
-                        // so another consumer can pick up these messages
                         if (lease.fromOffset < state.dispatchOffset) {
                             state.dispatchOffset = lease.fromOffset;
                         }
-
-                        // Remove the consumer from active members since their lease expired
                         state.members.remove(leaseEntry.getKey());
                         it.remove();
                     }
