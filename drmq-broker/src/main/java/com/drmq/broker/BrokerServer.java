@@ -37,6 +37,7 @@ public class BrokerServer {
     private final MessageStore messageStore;
     private final LogManager logManager;
     private final OffsetManager offsetManager;
+    private final ConsumerGroupCoordinator groupCoordinator;
     private final RaftNode raftNode;       
     private final List<RaftPeer> raftPeers; 
     private final BrokerMetrics metrics;
@@ -81,6 +82,9 @@ public class BrokerServer {
             logger.info("Single-node mode (no Raft)");
         }
 
+        this.groupCoordinator = new ConsumerGroupCoordinator(messageStore, offsetManager,
+                raftNode, ConsumerGroupCoordinator.DEFAULT_LEASE_TIMEOUT_MS);
+
         metrics.registerBroker(activeChannels::size, messageStore, offsetManager, logManager, raftNode);
     }
 
@@ -124,7 +128,7 @@ public class BrokerServer {
                      p.addLast(new ByteArrayDecoder());
                      p.addLast(new LengthFieldPrepender(4));
                      p.addLast(new ByteArrayEncoder());
-                     p.addLast(businessGroup, "clientHandler", new ClientHandler(messageStore, offsetManager, raftNode, activeChannels));
+                     p.addLast(businessGroup, "clientHandler", new ClientHandler(messageStore, offsetManager, raftNode, activeChannels, groupCoordinator));
                  }
              });
 
@@ -135,7 +139,7 @@ public class BrokerServer {
             if (raftNode != null) {
                 raftNode.start();
             }
-            logger.info("DRMQ Netty Broker started on port {} with data directory {}",
+            logger.info("DRMQ Broker started on port {} with data directory {}",
                     config.getPort(), config.getDataDir());
 
             serverChannel.closeFuture().sync();
@@ -214,6 +218,10 @@ public class BrokerServer {
             if (offsetManager != null) offsetManager.close();
         } catch (IOException e) {
             logger.error("Error closing offset manager", e);
+        }
+
+        if (groupCoordinator != null) {
+            groupCoordinator.close();
         }
 
         logger.info("Broker shutdown complete");

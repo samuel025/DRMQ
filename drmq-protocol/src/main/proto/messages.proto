@@ -34,9 +34,11 @@ message StoredMessage {
 // Request to consume messages from a topic
 message ConsumeRequest {
     string topic = 1;
-    int64 from_offset = 2;    // Starting offset (inclusive)
+    int64 from_offset = 2;    // Starting offset (inclusive) — ignored when consumer_group is set
     int32 max_messages = 3;   // Maximum number of messages to fetch
     int64 timeout_ms = 4;     // Long-poll timeout (0 = return immediately)
+    optional string consumer_group = 5;  // If set, broker manages offset via group coordination
+    optional string consumer_id = 6;     // Unique ID for this consumer instance within the group
 }
 
 // Response containing consumed messages
@@ -51,6 +53,7 @@ message CommitOffsetRequest {
     string consumer_group = 1;
     string topic = 2;
     int64 offset = 3;   // The next offset to read (last processed + 1)
+    optional string consumer_id = 4;  // Consumer instance ID (for group coordination)
 }
 
 // Response to a commit offset request

@@ -75,8 +75,9 @@ class ConsumerIntegrationTest {
             }
         }
 
-        // Consume starting from offset 5
+        // Consume starting from offset 5 (requires single mode for explicit offset)
         try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT)) {
+            consumer.setGroupMode(false);
             consumer.connect();
             consumer.subscribe("offset-test", 5);
 
@@ -195,6 +196,7 @@ class ConsumerIntegrationTest {
         }
 
         try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT)) {
+            consumer.setGroupMode(false);
             consumer.connect();
             consumer.subscribe("offset-tracking");
 

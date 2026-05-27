@@ -301,12 +301,13 @@ public class RaftNode {
                 .build();
 
         int votesNeeded = (peers.size() + 1) / 2 + 1;
-        AtomicLong votesReceived = new AtomicLong(1); 
+        AtomicLong votesReceived = new AtomicLong(1); // self-vote
         AtomicBoolean electionStarted = new AtomicBoolean(false);
 
+        // Single-node cluster: self-vote alone satisfies quorum, start election immediately
         if (votesReceived.get() >= votesNeeded) {
             if (electionStarted.compareAndSet(false, true)) {
-                logger.info("[{}] Pre-vote succeeded, starting real election", nodeId);
+                logger.info("[{}] Pre-vote succeeded (single-node quorum), starting real election", nodeId);
                 startElection();
             }
         }
@@ -322,6 +323,7 @@ public class RaftNode {
                 }
             }, raftExecutor).thenAcceptAsync(response -> {
                 if (response == null) return;
+                boolean shouldStartElection = false;
                 lock.lock();
                 try {
                     if (state == RaftState.LEADER || !running) return;
@@ -338,12 +340,16 @@ public class RaftNode {
                         if (votes >= votesNeeded) {
                             if (electionStarted.compareAndSet(false, true)) {
                                 logger.info("[{}] Pre-vote succeeded, starting real election", nodeId);
-                                startElection();
+                                shouldStartElection = true;
                             }
                         }
                     }
                 } finally {
                     lock.unlock();
+                }
+                // Release lock before startElection() to avoid holding it during disk I/O
+                if (shouldStartElection) {
+                    startElection();
                 }
             });
         }
@@ -358,33 +364,54 @@ public class RaftNode {
     private void startElection() {
         if (!running) return;
 
-        electionStartNanos = System.nanoTime();
-        currentTerm++;
-        state = RaftState.CANDIDATE;
-        votedFor = nodeId;
-        leaderId = null;
+        long myTerm;
+        RequestVoteRequest request;
+
+        lock.lock();
+        try {
+            if (!running || state == RaftState.LEADER) return;
+
+            electionStartNanos = System.nanoTime();
+            currentTerm++;
+            state = RaftState.CANDIDATE;
+            votedFor = nodeId;
+            leaderId = null;
+
+            myTerm = currentTerm;
+
+            logger.info("[{}] Starting election for term {}", nodeId, currentTerm);
+
+            long lastLogIndex = raftLog.getLastIndex();
+            long lastLogTerm = raftLog.getLastTerm();
+
+            request = RequestVoteRequest.newBuilder()
+                    .setTerm(currentTerm)
+                    .setCandidateId(nodeId)
+                    .setLastLogIndex(lastLogIndex)
+                    .setLastLogTerm(lastLogTerm)
+                    .build();
+        } finally {
+            lock.unlock();
+        }
+
+
         savePersistentState();
 
-        logger.info("[{}] Starting election for term {}", nodeId, currentTerm);
-
-        long lastLogIndex = raftLog.getLastIndex();
-        long lastLogTerm = raftLog.getLastTerm();
-
-        RequestVoteRequest request = RequestVoteRequest.newBuilder()
-                .setTerm(currentTerm)
-                .setCandidateId(nodeId)
-                .setLastLogIndex(lastLogIndex)
-                .setLastLogTerm(lastLogTerm)
-                .build();
-
-        long myTerm = currentTerm;
         int votesNeeded = (peers.size() + 1) / 2 + 1;  
-        AtomicLong votesReceived = new AtomicLong(1);   
-        java.util.concurrent.atomic.AtomicBoolean electionWon = new java.util.concurrent.atomic.AtomicBoolean(false);
+        AtomicLong votesReceived = new AtomicLong(1);   // self-vote
+        AtomicBoolean electionWon = new AtomicBoolean(false);
 
+        // Single-node cluster: self-vote alone satisfies quorum, become leader immediately
         if (votesReceived.get() >= votesNeeded) {
             if (electionWon.compareAndSet(false, true)) {
-                becomeLeader();
+                lock.lock();
+                try {
+                    if (currentTerm == myTerm && state == RaftState.CANDIDATE) {
+                        becomeLeader();
+                    }
+                } finally {
+                    lock.unlock();
+                }
             }
         }
 
@@ -709,7 +736,6 @@ public class RaftNode {
                 safeCompactIndex = retentionLimit;
             }
             
-            // Leave at least a 1000 entry buffer
             long finalCompactIndex = Math.min(safeCompactIndex, lastApplied - 1000);
             
             if (finalCompactIndex > 0) {
@@ -894,8 +920,7 @@ public class RaftNode {
     public PreVoteResponse handlePreVote(PreVoteRequest request) {
         lock.lock();
         try {
-            // Reject if proposed term is behind ours
-            if (request.getTerm() < currentTerm) {
+            if (request.getTerm() <= currentTerm) {
                 return PreVoteResponse.newBuilder()
                         .setTerm(currentTerm)
                         .setVoteGranted(false)
@@ -915,7 +940,6 @@ public class RaftNode {
                         .build();
             }
 
-            // Check log up-to-date
             boolean logOk = isLogUpToDate(request.getLastLogIndex(), request.getLastLogTerm());
 
             if (logOk) {

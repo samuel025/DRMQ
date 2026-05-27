@@ -9,6 +9,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.concurrent.*;
 
 
@@ -18,7 +19,8 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
     private final MessageStore messageStore;
     private final OffsetManager offsetManager;
     private final RaftNode raftNode;  
-    private final ChannelGroup activeChannels; 
+    private final ChannelGroup activeChannels;
+    private final ConsumerGroupCoordinator groupCoordinator;
 
     private static final int RPC_THREAD_COUNT = Math.max(4, Runtime.getRuntime().availableProcessors());
     private static final int RPC_QUEUE_CAPACITY = 1000;
@@ -46,11 +48,13 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
     }
 
     public ClientHandler(MessageStore messageStore, OffsetManager offsetManager,
-                         RaftNode raftNode, ChannelGroup activeChannels) {
+                         RaftNode raftNode, ChannelGroup activeChannels,
+                         ConsumerGroupCoordinator groupCoordinator) {
         this.messageStore = messageStore;
         this.offsetManager = offsetManager;
         this.raftNode = raftNode;
         this.activeChannels = activeChannels;
+        this.groupCoordinator = groupCoordinator;
     }
 
     @Override
@@ -151,16 +155,32 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
             ConsumeRequest request = ConsumeRequest.parseFrom(envelope.getPayload());
 
             String topic      = request.getTopic();
-            long fromOffset   = request.getFromOffset();
             int maxMessages   = request.getMaxMessages();
             long timeoutMs    = request.getTimeoutMs();
 
-            var messages = (timeoutMs > 0)
-                    ? messageStore.waitForMessages(topic, fromOffset, maxMessages, timeoutMs)
-                    : messageStore.getMessages(topic, fromOffset, maxMessages);
+            List<StoredMessage> messages;
 
-            logger.debug("Consumed {} messages: topic={}, fromOffset={}, longPoll={}",
-                    messages.size(), topic, fromOffset, timeoutMs > 0);
+            // Group-aware consumption: broker coordinates offset dispatch
+            if (request.hasConsumerGroup() && request.hasConsumerId() && groupCoordinator != null) {
+                if (raftNode != null && !raftNode.isLeader()) {
+                    String leaderAddr = raftNode.getLeaderAddress();
+                    return createConsumeErrorResponse("NOT_LEADER:" +
+                            (leaderAddr != null ? leaderAddr : "UNKNOWN"));
+                }
+                String group = request.getConsumerGroup();
+                String consumerId = request.getConsumerId();
+                messages = groupCoordinator.acquireMessages(group, topic, consumerId, maxMessages, timeoutMs);
+                logger.debug("Group-consume {} messages: group={}, consumer={}, topic={}",
+                        messages.size(), group, consumerId, topic);
+            } else {
+                // Single mode: client-driven offset consumption
+                long fromOffset = request.getFromOffset();
+                messages = (timeoutMs > 0)
+                        ? messageStore.waitForMessages(topic, fromOffset, maxMessages, timeoutMs)
+                        : messageStore.getMessages(topic, fromOffset, maxMessages);
+                logger.debug("Consumed {} messages: topic={}, fromOffset={}, longPoll={}",
+                        messages.size(), topic, fromOffset, timeoutMs > 0);
+            }
 
             ConsumeResponse response = ConsumeResponse.newBuilder()
                     .setSuccess(true)
@@ -241,7 +261,11 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
             String topic = request.getTopic();
             long offset  = request.getOffset();
 
-            if (raftNode != null) {
+            // Route through the coordinator if this group is actively coordinated
+            if (groupCoordinator != null && groupCoordinator.isGroupActive(group, topic)) {
+                String consumerId = request.hasConsumerId() ? request.getConsumerId() : group;
+                groupCoordinator.commitOffset(group, topic, consumerId, offset);
+            } else if (raftNode != null) {
                 if (!raftNode.isLeader()) {
                     String leaderAddr = raftNode.getLeaderAddress();
                     CommitOffsetResponse response = CommitOffsetResponse.newBuilder()

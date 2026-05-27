@@ -10,18 +10,24 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * DRMQ Consumer client for reading messages from topics.
  *
- * Supports bootstrap servers: provide multiple broker addresses so the consumer
- * can automatically failover to another broker if the current one dies.
+ * <p>Supports bootstrap servers: provide multiple broker addresses so the consumer
+ * can automatically failover to another broker if the current one dies.</p>
  *
- * Offsets are stored on the broker per consumer group.
- * On subscribe(), the consumer fetches its last committed offset from the
- * broker and resumes from there. Offsets are only auto-committed after poll()
- * when auto-commit is enabled.
+ * <h3>Consumption Modes</h3>
+ * <ul>
+ *   <li><b>Group mode</b> (default when consumerGroup is set): Multiple consumer
+ *       instances can join the same group. The broker coordinates offset dispatch
+ *       so each message is delivered to exactly one consumer in the group.
+ *       Different groups each receive all messages (fan-out).</li>
+ *   <li><b>Single mode</b> (when {@code useGroupMode(false)} is called): The consumer
+ *       manages its own offset locally and sends raw offset-based ConsumeRequests.</li>
+ * </ul>
  */
 public class DRMQConsumer implements AutoCloseable {
     private static final Logger logger = LoggerFactory.getLogger(DRMQConsumer.class);
@@ -34,11 +40,8 @@ public class DRMQConsumer implements AutoCloseable {
 
     private String host;
     private int port;
-    /**
-     * Consumer Identifier used for offset tracking on the broker
-     * Note: DRMQ does not support multiple consumers per consumer group. Each group name should be used by a single consumer instance to avoid offset conflicts.
-     */
     private final String consumerGroup;
+    private final String consumerId;
     private final List<String[]> bootstrapServers;
     private int currentServerIndex = 0;
 
@@ -50,6 +53,7 @@ public class DRMQConsumer implements AutoCloseable {
     private final Map<String, Long> topicOffsets = new HashMap<>();
     private final Object pollLock = new Object();
     private volatile boolean autoCommit = false;
+    private volatile boolean groupMode = true;
 
 
 
@@ -67,6 +71,7 @@ public class DRMQConsumer implements AutoCloseable {
 
     public DRMQConsumer(String host, int port, String consumerGroup) {
         this.consumerGroup = consumerGroup;
+        this.consumerId = UUID.randomUUID().toString();
         List<String[]> parsed = host != null && host.contains(",") ? parseBootstrapServers(host) : List.of();
         if (!parsed.isEmpty()) {
             this.bootstrapServers = new ArrayList<>(parsed);
@@ -88,6 +93,7 @@ public class DRMQConsumer implements AutoCloseable {
      */
     public DRMQConsumer(String bootstrapServersStr, String consumerGroup) {
         this.consumerGroup = consumerGroup;
+        this.consumerId = UUID.randomUUID().toString();
         this.bootstrapServers = new ArrayList<>(parseBootstrapServers(bootstrapServersStr));
         if (bootstrapServers.isEmpty()) {
             throw new IllegalArgumentException("No valid bootstrap servers: " + bootstrapServersStr);
@@ -106,6 +112,19 @@ public class DRMQConsumer implements AutoCloseable {
 
     public boolean isAutoCommit() {
         return autoCommit;
+    }
+
+
+    public void setGroupMode(boolean groupMode) {
+        this.groupMode = groupMode;
+    }
+
+    public boolean isGroupMode() {
+        return groupMode;
+    }
+
+    public String getConsumerId() {
+        return consumerId;
     }
 
     private static List<String[]> parseBootstrapServers(String bootstrapServersStr) {
@@ -264,14 +283,22 @@ public class DRMQConsumer implements AutoCloseable {
     }
 
     /**
-     * Subscribe to a topic. Resumes from the broker-committed offset automatically.
+     * Subscribe to a topic. In group mode, the broker manages offsets.
+     * In single mode, resumes from the broker-committed offset automatically.
      * If no offset has been committed yet, starts from offset 0.
      */
     public void subscribe(String topic) throws IOException {
         ensureConnectedWithRetry();
-        long offset = fetchOffsetFromBroker(topic);
-        topicOffsets.put(topic, offset);
-        logger.info("Subscribed to topic '{}' from offset {} (group='{}')", topic, offset, consumerGroup);
+        if (groupMode) {
+            // In group mode, the broker manages offsets — just register the topic
+            topicOffsets.put(topic, -1L); // sentinel: broker will assign
+            logger.info("Subscribed to topic '{}' in group mode (group='{}', consumerId='{}')",
+                    topic, consumerGroup, consumerId);
+        } else {
+            long offset = fetchOffsetFromBroker(topic);
+            topicOffsets.put(topic, offset);
+            logger.info("Subscribed to topic '{}' from offset {} (group='{}')", topic, offset, consumerGroup);
+        }
     }
 
     /**
@@ -322,7 +349,12 @@ public class DRMQConsumer implements AutoCloseable {
             String topic = entry.getKey();
             long fromOffset = entry.getValue();
 
-            List<ConsumedMessage> messages = fetchMessages(topic, fromOffset, maxMessages, timeoutMs);
+            List<ConsumedMessage> messages;
+            if (groupMode) {
+                messages = fetchMessages(topic, 0, maxMessages, timeoutMs);
+            } else {
+                messages = fetchMessages(topic, fromOffset, maxMessages, timeoutMs);
+            }
             allMessages.addAll(messages);
 
             if (!messages.isEmpty()) {
@@ -337,9 +369,6 @@ public class DRMQConsumer implements AutoCloseable {
         return allMessages;
     }
 
-    // -------------------------------------------------------------------------
-    // Manual commit / offset management
-    // -------------------------------------------------------------------------
 
     /**
      * Manually commit a specific offset to the broker.
@@ -358,10 +387,6 @@ public class DRMQConsumer implements AutoCloseable {
     public String getConsumerGroup() {
         return consumerGroup;
     }
-
-    // -------------------------------------------------------------------------
-    // Broker offset protocol
-    // -------------------------------------------------------------------------
 
     /**
      * Ask the broker for the last committed offset for this group/topic.
@@ -460,11 +485,16 @@ public class DRMQConsumer implements AutoCloseable {
     }
 
     private void commitOffsetToBrokerInternal(String topic, long offset) throws IOException {
-        CommitOffsetRequest request = CommitOffsetRequest.newBuilder()
+        CommitOffsetRequest.Builder requestBuilder = CommitOffsetRequest.newBuilder()
                 .setConsumerGroup(consumerGroup)
                 .setTopic(topic)
-                .setOffset(offset)
-                .build();
+                .setOffset(offset);
+
+        if (groupMode) {
+            requestBuilder.setConsumerId(consumerId);
+        }
+
+        CommitOffsetRequest request = requestBuilder.build();
 
         MessageEnvelope envelope = MessageEnvelope.newBuilder()
                 .setType(MessageType.COMMIT_OFFSET_REQUEST)
@@ -499,8 +529,7 @@ public class DRMQConsumer implements AutoCloseable {
         return fetchMessagesWithRetry(topic, fromOffset, maxMessages, timeoutMs, MAX_RETRIES);
     }
 
-    private List<ConsumedMessage> fetchMessagesWithRetry(String topic, long fromOffset, int maxMessages,
-                                                          long timeoutMs, int retriesLeft) throws IOException {
+    private List<ConsumedMessage> fetchMessagesWithRetry(String topic, long fromOffset, int maxMessages, long timeoutMs, int retriesLeft) throws IOException {
         IOException lastException = null;
 
         for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
@@ -526,12 +555,19 @@ public class DRMQConsumer implements AutoCloseable {
     }
 
     private List<ConsumedMessage> fetchMessagesInternal(String topic, long fromOffset, int maxMessages, long timeoutMs) throws IOException {
-        ConsumeRequest request = ConsumeRequest.newBuilder()
+        ConsumeRequest.Builder requestBuilder = ConsumeRequest.newBuilder()
                 .setTopic(topic)
                 .setFromOffset(fromOffset)
                 .setMaxMessages(maxMessages)
-                .setTimeoutMs(timeoutMs)
-                .build();
+                .setTimeoutMs(timeoutMs);
+
+
+        if (groupMode) {
+            requestBuilder.setConsumerGroup(consumerGroup);
+            requestBuilder.setConsumerId(consumerId);
+        }
+
+        ConsumeRequest request = requestBuilder.build();
 
         MessageEnvelope envelope = MessageEnvelope.newBuilder()
                 .setType(MessageType.CONSUME_REQUEST)
