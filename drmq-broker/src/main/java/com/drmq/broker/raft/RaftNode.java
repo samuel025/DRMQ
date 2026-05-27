@@ -301,12 +301,13 @@ public class RaftNode {
                 .build();
 
         int votesNeeded = (peers.size() + 1) / 2 + 1;
-        AtomicLong votesReceived = new AtomicLong(1); 
+        AtomicLong votesReceived = new AtomicLong(1); // self-vote
         AtomicBoolean electionStarted = new AtomicBoolean(false);
 
+        // Single-node cluster: self-vote alone satisfies quorum, start election immediately
         if (votesReceived.get() >= votesNeeded) {
             if (electionStarted.compareAndSet(false, true)) {
-                logger.info("[{}] Pre-vote succeeded, starting real election", nodeId);
+                logger.info("[{}] Pre-vote succeeded (single-node quorum), starting real election", nodeId);
                 startElection();
             }
         }
@@ -322,6 +323,7 @@ public class RaftNode {
                 }
             }, raftExecutor).thenAcceptAsync(response -> {
                 if (response == null) return;
+                boolean shouldStartElection = false;
                 lock.lock();
                 try {
                     if (state == RaftState.LEADER || !running) return;
@@ -338,12 +340,16 @@ public class RaftNode {
                         if (votes >= votesNeeded) {
                             if (electionStarted.compareAndSet(false, true)) {
                                 logger.info("[{}] Pre-vote succeeded, starting real election", nodeId);
-                                startElection();
+                                shouldStartElection = true;
                             }
                         }
                     }
                 } finally {
                     lock.unlock();
+                }
+                // Release lock before startElection() to avoid holding it during disk I/O
+                if (shouldStartElection) {
+                    startElection();
                 }
             });
         }
@@ -379,9 +385,10 @@ public class RaftNode {
 
         long myTerm = currentTerm;
         int votesNeeded = (peers.size() + 1) / 2 + 1;  
-        AtomicLong votesReceived = new AtomicLong(1);   
+        AtomicLong votesReceived = new AtomicLong(1);   // self-vote
         AtomicBoolean electionWon = new AtomicBoolean(false);
 
+        // Single-node cluster: self-vote alone satisfies quorum, become leader immediately
         if (votesReceived.get() >= votesNeeded) {
             if (electionWon.compareAndSet(false, true)) {
                 becomeLeader();
