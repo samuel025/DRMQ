@@ -364,26 +364,39 @@ public class RaftNode {
     private void startElection() {
         if (!running) return;
 
-        electionStartNanos = System.nanoTime();
-        currentTerm++;
-        state = RaftState.CANDIDATE;
-        votedFor = nodeId;
-        leaderId = null;
+        long myTerm;
+        RequestVoteRequest request;
+
+        lock.lock();
+        try {
+            if (!running || state == RaftState.LEADER) return;
+
+            electionStartNanos = System.nanoTime();
+            currentTerm++;
+            state = RaftState.CANDIDATE;
+            votedFor = nodeId;
+            leaderId = null;
+
+            myTerm = currentTerm;
+
+            logger.info("[{}] Starting election for term {}", nodeId, currentTerm);
+
+            long lastLogIndex = raftLog.getLastIndex();
+            long lastLogTerm = raftLog.getLastTerm();
+
+            request = RequestVoteRequest.newBuilder()
+                    .setTerm(currentTerm)
+                    .setCandidateId(nodeId)
+                    .setLastLogIndex(lastLogIndex)
+                    .setLastLogTerm(lastLogTerm)
+                    .build();
+        } finally {
+            lock.unlock();
+        }
+
+
         savePersistentState();
 
-        logger.info("[{}] Starting election for term {}", nodeId, currentTerm);
-
-        long lastLogIndex = raftLog.getLastIndex();
-        long lastLogTerm = raftLog.getLastTerm();
-
-        RequestVoteRequest request = RequestVoteRequest.newBuilder()
-                .setTerm(currentTerm)
-                .setCandidateId(nodeId)
-                .setLastLogIndex(lastLogIndex)
-                .setLastLogTerm(lastLogTerm)
-                .build();
-
-        long myTerm = currentTerm;
         int votesNeeded = (peers.size() + 1) / 2 + 1;  
         AtomicLong votesReceived = new AtomicLong(1);   // self-vote
         AtomicBoolean electionWon = new AtomicBoolean(false);
@@ -391,7 +404,14 @@ public class RaftNode {
         // Single-node cluster: self-vote alone satisfies quorum, become leader immediately
         if (votesReceived.get() >= votesNeeded) {
             if (electionWon.compareAndSet(false, true)) {
-                becomeLeader();
+                lock.lock();
+                try {
+                    if (currentTerm == myTerm && state == RaftState.CANDIDATE) {
+                        becomeLeader();
+                    }
+                } finally {
+                    lock.unlock();
+                }
             }
         }
 

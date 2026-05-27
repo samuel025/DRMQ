@@ -10,7 +10,7 @@ The project is structured as a multi-module Maven build, separating the core bro
 
 ## Key Features
 
-- **Scalable Consumer Groups:** Scale your consumers dynamically without the complexity of partitions. Simply start multiple consumers with the same group name, and the broker will automatically distribute messages among them. Each message goes to exactly one consumer in the group. Need to replay or read specific messages? Switch to single mode for full manual offset control.
+- **Scalable Consumer Groups:** Scale your consumers dynamically without the complexity of partitions. Simply start multiple consumers with the same group name, and the broker will automatically distribute messages among them. Messages are load-balanced across consumers in a group with at-least-once delivery; a lease-based protocol ensures that uncommitted messages are redelivered if a consumer fails. Need to replay or read specific messages? Switch to single mode for full manual offset control.
 - **Raft Consensus Integration:** Full implementation of the Raft protocol for distributed state replication, leader election, and high availability. Features **Quorum-Loss Stepdown** to detect network partitions and demote isolated leaders, preventing split-brain/ghost leadership data loss.
 - **Persistent Storage:** Custom Write-Ahead Log (WAL) and segment-based message storage ensure messages are durably persisted to disk. Features thread-safe, atomic consumer offset management with bounds locking designed to minimize data loss during concurrent background writes and handle shutdowns gracefully.
 - **Graceful Teardown Coordination:** Orchestrated, safe termination of Netty EventLoops, RPC executors, and disk storage guaranteeing state integrity without resource leaks during node shutdowns.
@@ -99,7 +99,7 @@ DRMQ supports two modes of consumption: **Group Mode** (for scalable, load-balan
 
 #### 1. Group Mode (Default - Auto Load Balancing)
 
-By default, the broker coordinates message delivery. If you start multiple consumers with the same group name, the broker will automatically split the workload among them. Each message is delivered to exactly one consumer in the group. No partitions required!
+By default, the broker coordinates message delivery. If you start multiple consumers with the same group name, the broker will automatically split the workload among them. Messages are load-balanced across consumers in a group with at-least-once delivery semantics — consumers should be idempotent to handle potential redelivery of uncommitted messages. No partitions required!
 
 ```java
 // Consumer 1

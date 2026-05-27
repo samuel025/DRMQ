@@ -33,8 +33,10 @@ public class ConsumerApp {
                 consumer.connect();
                 System.out.println("✓ Connected to broker");
             System.out.printf( "✓ Consumer ID: %s\n", consumer.getConsumerId());
-            System.out.printf( "✓ Group mode: %s (broker coordinates offsets across consumers)\n",
-                    consumer.isGroupMode() ? "on" : "off");
+            System.out.printf( "✓ Group mode: %s\n",
+                    consumer.isGroupMode()
+                            ? "on (broker coordinates offsets across consumers)"
+                            : "off (single mode: this consumer manages its own offsets)");
                 System.out.printf("✓ Auto-commit: %s (use 'autocommit on|off')\n\n",
                     consumer.isAutoCommit() ? "on" : "off");
 
@@ -183,7 +185,11 @@ public class ConsumerApp {
                         System.out.printf("Group mode:  %s\n", consumer.isGroupMode() ? "on (broker coordinates)" : "off (single mode)");
                         System.out.printf("Auto-commit: %s\n", consumer.isAutoCommit() ? "on" : "off");
                         System.out.println("  (Use 'subscribe <topic>' to add subscriptions)");
-                        System.out.println("  Tip: Multiple consumers with the same group share the workload!\n");
+                        if (consumer.isGroupMode()) {
+                            System.out.println("  Tip: Multiple consumers with the same group share the workload!\n");
+                        } else {
+                            System.out.println("  Tip: Use 'mode group' to enable broker-coordinated consumption.\n");
+                        }
                     }
 
                     case "commit" -> {
