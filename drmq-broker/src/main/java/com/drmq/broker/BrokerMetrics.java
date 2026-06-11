@@ -133,6 +133,14 @@ public final class BrokerMetrics implements AutoCloseable {
                     .register(registry);
             Gauge.builder("drmq.broker.raft.is_leader", raftNode, node -> node.isLeader() ? 1 : 0)
                     .register(registry);
+            for (String peerId : raftNode.getPeerIds()) {
+                Gauge.builder("drmq.broker.raft.replication_lag", raftNode, node -> {
+                    if (!node.isLeader()) return 0.0;
+                    Long matchIdx = node.getMatchIndexMap().get(peerId);
+                    if (matchIdx == null) return 0.0;
+                    return (double) (node.getLastLogIndex() - matchIdx);
+                }).tags("peer_id", peerId).register(registry);
+            }
         }
     }
 

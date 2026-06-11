@@ -1144,6 +1144,9 @@ public class RaftNode {
     public long getCommitIndex() { return commitIndex; }
     public long getLastApplied() { return lastApplied; }
     public boolean isLeader() { return state == RaftState.LEADER; }
+    public long getLastLogIndex() { return raftLog.getLastIndex(); }
+    public Map<String, Long> getMatchIndexMap() { return Collections.unmodifiableMap(matchIndex); }
+    public List<String> getPeerIds() { return peers.stream().map(PeerAddress::id).toList(); }
 
     /**
      * Get the leader's address as "host:port" for client redirection.
