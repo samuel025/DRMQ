@@ -49,7 +49,7 @@ mvn clean install
 To run a standalone broker (useful for testing and development):
 
 ```bash
-java -jar drmq-broker/target/drmq-broker-1.0.0-SNAPSHOT.jar --port 9092 --data-dir ./data-1
+./mvnw -pl drmq-broker exec:java -Dexec.args="--port 9092 --data-dir ./data-1"
 ```
 
 ### Cluster Mode
@@ -59,19 +59,19 @@ To run a fault-tolerant cluster, you must start multiple broker instances and pr
 **Node 1:**
 
 ```bash
-java -jar drmq-broker/target/drmq-broker-1.0.0-SNAPSHOT.jar --node-id 1 --port 9092 --data-dir ./data-1 --peers 2:localhost:9093,3:localhost:9094
+./mvnw -pl drmq-broker exec:java -Dexec.args="--node-id 1 --port 9092 --data-dir ./data-1 --peers 2:localhost:9093,3:localhost:9094"
 ```
 
 **Node 2:**
 
 ```bash
-java -jar drmq-broker/target/drmq-broker-1.0.0-SNAPSHOT.jar --node-id 2 --port 9093 --data-dir ./data-2 --peers 1:localhost:9092,3:localhost:9094
+./mvnw -pl drmq-broker exec:java -Dexec.args="--node-id 2 --port 9093 --data-dir ./data-2 --peers 1:localhost:9092,3:localhost:9094"
 ```
 
 **Node 3:**
 
 ```bash
-java -jar drmq-broker/target/drmq-broker-1.0.0-SNAPSHOT.jar --node-id 3 --port 9094 --data-dir ./data-3 --peers 1:localhost:9092,2:localhost:9093
+./mvnw -pl drmq-broker exec:java -Dexec.args="--node-id 3 --port 9094 --data-dir ./data-3 --peers 1:localhost:9092,2:localhost:9093"
 ```
 
 ## Usage Example

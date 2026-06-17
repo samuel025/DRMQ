@@ -39,12 +39,10 @@ public class SnapshotManager {
      * @return Path to the generated zip file.
      */
     public Path createSnapshot(long lastIncludedIndex) throws IOException {
-        // 1. Force the OffsetManager to dump its in-memory map to disk
         if (offsetManager != null) {
             offsetManager.forcePersist();
         }
 
-        // 2. Prepare the snapshot directory and file
         Path snapshotsDir = dataDir.resolve("raft/snapshots");
         Files.createDirectories(snapshotsDir);
         Path zipFile = snapshotsDir.resolve("snapshot_" + lastIncludedIndex + ".zip");
@@ -52,12 +50,9 @@ public class SnapshotManager {
         logger.info("Starting snapshot generation for index {}...", lastIncludedIndex);
         long startMs = System.currentTimeMillis();
 
-        // 3. Lock MessageStore to prevent concurrent appends during the zip process
         messageStore.lockForSnapshot(() -> {
             try (OutputStream fos = Files.newOutputStream(zipFile, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
                  ZipOutputStream zos = new ZipOutputStream(fos)) {
-
-                // 3a. Zip the topics/messages store directory
                 Path storeDir = dataDir.resolve("store");
                 zipDirectory(storeDir, "store", zos);
 
@@ -90,7 +85,6 @@ public class SnapshotManager {
             paths.filter(path -> !Files.isDirectory(path))
                  .forEach(path -> {
                      try {
-                         // Convert Windows paths to Unix-style for zip compatibility
                          String relative = sourceDir.relativize(path).toString().replace('\\', '/');
                          String zipEntryName = baseName + "/" + relative;
                          
