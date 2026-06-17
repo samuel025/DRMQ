@@ -62,7 +62,9 @@ export interface TelemetryState {
 
 export type TelemetryCallback = (state: TelemetryState) => void;
 
+export type TelemetryErrorCallback = (error: string) => void;
+
 export interface TelemetryProvider {
-  connect(onData: TelemetryCallback): void;
+  connect(onData: TelemetryCallback, onError?: TelemetryErrorCallback): void;
   disconnect(): void;
 }

@@ -41,7 +41,7 @@ export class MockTelemetryProvider implements TelemetryProvider {
     };
   }
 
-  connect(onData: TelemetryCallback): void {
+  connect(onData: TelemetryCallback, _onError?: (error: string) => void): void {
     onData(this.state);
     this.intervalId = setInterval(() => {
       this.simulateTick();

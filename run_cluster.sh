@@ -3,11 +3,11 @@
 echo "🚀 Starting DRMQ Cluster in new terminal tabs..."
 
 # Clean up any previously running instances
-pkill -f "drmq-broker"
-pkill -f "ConsumerApp"
-pkill -f "ProducerApp"
-pkill -f "load_test.sh"
-pkill -f "vite"
+pkill -f "mvnw -pl drmq-broker"
+pkill -f "com.drmq.client.commandLineExample.ConsumerApp"
+pkill -f "com.drmq.client.commandLineExample.ProducerApp"
+pkill -f "\./load_test\.sh"
+pkill -f "VITE_USE_WEBSOCKET=true"
 sleep 2
 
 # Clean previous data to start fresh (comment out if you want to keep old data)

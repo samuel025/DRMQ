@@ -1,7 +1,5 @@
-import { LayoutDashboard, Database, Network, Activity, Zap, Users, AlertTriangle, Server, HardDrive } from 'lucide-react';
+import { Activity, Zap, Users, AlertTriangle, HardDrive } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { useClusterTelemetry } from '../useClusterTelemetry';
-
 // ─── Sub-components ───────────────────────────────────────────────────────────
 
 function HexagonNode({ x, y, color, label, subLabel, status }: any) {
@@ -119,8 +117,17 @@ function formatNum(n: number, decimals = 0) {
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 
-export default function Dashboard() {
-  const telemetryState = useClusterTelemetry();
+export default function Dashboard({ telemetryState, telemetryError }: { telemetryState: any, telemetryError?: string | null }) {
+  if (telemetryError) {
+    return (
+      <div className="flex h-full bg-[#06080f] items-center justify-center">
+        <div className="flex flex-col items-center gap-4">
+          <AlertTriangle className="w-10 h-10 text-red-500" />
+          <p className="text-[10px] font-mono tracking-[0.3em] text-red-400 uppercase">{telemetryError}</p>
+        </div>
+      </div>
+    );
+  }
 
   if (!telemetryState) {
     return (
@@ -150,7 +157,7 @@ export default function Dashboard() {
             <span className="text-xs font-bold tracking-widest text-white uppercase">Live Telemetry</span>
             <span className="text-zinc-700 text-xs">/</span>
             <span className="text-xs font-mono text-zinc-500">
-              {nodes.find(n => n.status === 'LEADER')?.name ?? 'No Leader'}
+              {nodes.find((n: any) => n.status === 'LEADER')?.name ?? 'No Leader'}
             </span>
           </div>
           <div className="flex items-center gap-3">

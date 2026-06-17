@@ -139,8 +139,10 @@ public class TelemetryWebSocketServer extends WebSocketServer {
         // Scale: 50 MB/s = 100 on chart
         double chartVal = Math.min(100, (totalMBps / 50.0) * 100);
         if (chartVal < 3 && totalMBps > 0) chartVal = 3; // minimum visibility
-        throughputHistory.remove(0);
-        throughputHistory.add(chartVal);
+        synchronized (throughputHistory) {
+            throughputHistory.remove(0);
+            throughputHistory.add(chartVal);
+        }
     }
 
     private String buildTelemetryPayload() {
@@ -241,8 +243,10 @@ public class TelemetryWebSocketServer extends WebSocketServer {
 
         // Throughput chart history
         JsonArray history = new JsonArray();
-        for (Double val : throughputHistory) {
-            history.add(round2(val));
+        synchronized (throughputHistory) {
+            for (Double val : throughputHistory) {
+                history.add(round2(val));
+            }
         }
         metrics.add("throughputHistory", history);
 

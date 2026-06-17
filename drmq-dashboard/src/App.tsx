@@ -1,12 +1,11 @@
 import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router-dom';
-import { LayoutDashboard, Book, Server, Database, Network } from 'lucide-react';
+import { LayoutDashboard, Book, Server } from 'lucide-react';
 import Dashboard from './pages/Dashboard';
 import Documentation from './pages/Documentation';
 import { useClusterTelemetry } from './useClusterTelemetry';
 
-function Sidebar() {
+function Sidebar({ telemetryState }: { telemetryState: any }) {
   const location = useLocation();
-  const telemetryState = useClusterTelemetry();
   
   const metrics = telemetryState?.metrics;
   const healthColor = metrics?.health === 'OPTIMAL' ? '#10b981' : metrics?.health === 'DEGRADED' ? '#f59e0b' : '#ef4444';
@@ -26,14 +25,14 @@ function Sidebar() {
 
       {/* Nav */}
       <nav className="flex-1 p-3 space-y-1">
-        <Link to="/"
+        <Link to="/" aria-label="Telemetry"
           className={`flex items-center justify-center lg:justify-start gap-3 px-3 py-2.5 rounded-lg text-sm transition-all ${
             location.pathname === '/' ? 'bg-cyan-500/10 text-white border border-cyan-500/20 shadow-[inset_2px_0_0_#06b6d4]'
                    : 'text-zinc-500 hover:text-zinc-300 hover:bg-white/5'}`}>
           <LayoutDashboard className={`w-4 h-4 shrink-0 ${location.pathname === '/' ? 'text-cyan-400' : ''}`} />
           <span className="hidden lg:block font-medium tracking-wide">Telemetry</span>
         </Link>
-        <Link to="/docs"
+        <Link to="/docs" aria-label="Documentation"
           className={`flex items-center justify-center lg:justify-start gap-3 px-3 py-2.5 rounded-lg text-sm transition-all ${
             location.pathname === '/docs' ? 'bg-cyan-500/10 text-white border border-cyan-500/20 shadow-[inset_2px_0_0_#06b6d4]'
                    : 'text-zinc-500 hover:text-zinc-300 hover:bg-white/5'}`}>
@@ -56,13 +55,14 @@ function Sidebar() {
 }
 
 export default function App() {
+  const { data: telemetryState, error: telemetryError } = useClusterTelemetry();
   return (
     <BrowserRouter>
       <div className="h-screen bg-[#06080f] flex text-zinc-300 font-sans overflow-hidden">
-        <Sidebar />
+        <Sidebar telemetryState={telemetryState} />
         <main className="flex-1 min-w-0 overflow-y-auto">
           <Routes>
-            <Route path="/" element={<Dashboard />} />
+            <Route path="/" element={<Dashboard telemetryState={telemetryState} telemetryError={telemetryError} />} />
             <Route path="/docs" element={<Documentation />} />
           </Routes>
         </main>

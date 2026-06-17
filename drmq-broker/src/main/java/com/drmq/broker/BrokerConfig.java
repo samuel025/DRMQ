@@ -170,7 +170,11 @@ public class BrokerConfig {
     private static long parseLongArg(String[] args, int index, String flag) {
         String value = requireValue(args, index, flag);
         try {
-            return Long.parseLong(value);
+            long parsed = Long.parseLong(value);
+            if (parsed <= 0) {
+                throw new IllegalArgumentException(flag + " must be positive");
+            }
+            return parsed;
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException(flag + " must be a valid long integer, got: " + value, e);
         }

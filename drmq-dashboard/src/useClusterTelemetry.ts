@@ -4,7 +4,8 @@ import { MockTelemetryProvider } from './services/telemetry/MockTelemetryProvide
 import { WebSocketTelemetryProvider } from './services/telemetry/WebSocketTelemetryProvider';
 
 export function useClusterTelemetry() {
-  const [state, setState] = useState<TelemetryState | null>(null);
+  const [data, setData] = useState<TelemetryState | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const providerRef = useRef<TelemetryProvider | null>(null);
 
   useEffect(() => {
@@ -23,7 +24,10 @@ export function useClusterTelemetry() {
     }
 
     providerRef.current.connect((newData) => {
-      setState(newData);
+      setData(newData);
+      setError(null);
+    }, (errMsg) => {
+      setError(errMsg);
     });
 
     return () => {
@@ -33,5 +37,5 @@ export function useClusterTelemetry() {
     };
   }, []);
 
-  return state;
+  return { data, error };
 }

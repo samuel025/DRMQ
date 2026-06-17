@@ -22,6 +22,7 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
   private reconnectTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private latestFrames: Map<string, TelemetryState> = new Map();
   private onDataCallback: TelemetryCallback | null = null;
+  private onErrorCallback?: import('../../types/telemetry').TelemetryErrorCallback;
   private stopped = false;
 
   // Fixed screen positions for up to 3 nodes, by sorted index
@@ -35,12 +36,18 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
     this.urls = urls;
   }
 
-  connect(onData: TelemetryCallback): void {
+  connect(onData: TelemetryCallback, onError?: import('../../types/telemetry').TelemetryErrorCallback): void {
     this.stopped = false;
     this.onDataCallback = onData;
+    this.onErrorCallback = onError;
     for (const url of this.urls) {
       this.openSocket(url);
     }
+    setTimeout(() => {
+      if (!this.stopped && this.onErrorCallback && Array.from(this.sockets.values()).every(s => !s || s.readyState !== WebSocket.OPEN)) {
+        this.onErrorCallback('Connection timeout. Check if brokers are running.');
+      }
+    }, 5000);
   }
 
   disconnect(): void {
@@ -78,6 +85,9 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
       ws.onclose = () => {
         console.log(`[DRMQ] Disconnected: ${url}`);
         this.sockets.set(url, null);
+        if (this.onErrorCallback && Array.from(this.sockets.values()).every(s => !s || s.readyState !== WebSocket.OPEN)) {
+          this.onErrorCallback('Cluster offline. Retrying connection...');
+        }
         this.scheduleReconnect(url);
       };
     } catch (e) {
