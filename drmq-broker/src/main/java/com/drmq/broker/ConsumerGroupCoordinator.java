@@ -111,13 +111,17 @@ public class ConsumerGroupCoordinator implements Closeable {
             state.members.add(consumerId);
             long lastOffset = messages.get(messages.size() - 1).getOffset();
             long leaseEnd = lastOffset + 1; 
-            Lease lease = new Lease(consumerId, fromOffset, leaseEnd,
+            
+            Lease existingLease = state.activeLeases.get(consumerId);
+            long leaseStart = (existingLease != null) ? existingLease.fromOffset : fromOffset;
+            
+            Lease lease = new Lease(consumerId, leaseStart, leaseEnd,
                     System.currentTimeMillis() + leaseTimeoutMs);
             state.activeLeases.put(consumerId, lease);
             state.dispatchOffset = leaseEnd;
 
             logger.debug("Leased offsets [{}, {}) to consumer {} in group={}, topic={}",
-                    fromOffset, leaseEnd, consumerId, group, topic);
+                    leaseStart, leaseEnd, consumerId, group, topic);
 
             return messages;
 

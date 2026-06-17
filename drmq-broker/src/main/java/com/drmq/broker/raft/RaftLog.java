@@ -110,22 +110,47 @@ public class RaftLog {
     /**
      * Get all entries from the given Raft index (inclusive) to the end.
      */
+    /** Maximum number of log entries sent in a single AppendEntries RPC.
+     * Prevents oversized frames when catching up a lagging follower. */
+    public static final int MAX_ENTRIES_PER_RPC = 500;
+
     public synchronized List<RaftEntry> getEntriesFrom(long fromIndex) {
+        return getEntriesFrom(fromIndex, MAX_ENTRIES_PER_RPC);
+    }
+
+    public synchronized List<RaftEntry> getEntriesFrom(long fromIndex, int maxEntries) {
         if (fromIndex < startIndex || fromIndex > getLastIndex() + 1) {
             return Collections.emptyList();
         }
         if (fromIndex == getLastIndex() + 1) {
             return Collections.emptyList();
         }
-        return new ArrayList<>(entries.subList((int) (fromIndex - startIndex), entries.size()));
+        int from = (int) (fromIndex - startIndex);
+        int to   = Math.min(from + maxEntries, entries.size());
+        return new ArrayList<>(entries.subList(from, to));
     }
 
     /**
-     * Get the Raft index of the last entry, or 0 if the log is empty.
+     * Get the Raft index of the last entry, or the last compacted index if the log is empty.
      */
     public synchronized long getLastIndex() {
-        if (entries.isEmpty()) return 0;
+        if (entries.isEmpty()) return Math.max(0, startIndex - 1);
         return entries.get(entries.size() - 1).getIndex();
+    }
+
+    /**
+     * Set the start index manually, used during recovery if the log is completely empty
+     * but the node has previously applied a snapshot.
+     */
+    public synchronized void setStartIndex(long index) {
+        this.startIndex = index;
+    }
+
+    /**
+     * Get the starting index of the Raft log (useful to know if log was compacted).
+     */
+    public synchronized long getStartIndex() {
+        return startIndex;
     }
 
     /**
@@ -182,18 +207,47 @@ public class RaftLog {
     }
 
     /**
-     * Compact the Raft log by removing entries from memory up to the given index.
-     * This prevents unbounded memory growth. The MessageStore serves as the permanent store.
+     * Compact the Raft log by removing entries from memory up to the given index,
+     * and rewriting the log file on disk to reclaim space.
      */
-    public synchronized void compact(long upToIndex) {
+    public synchronized void compact(long upToIndex) throws IOException {
         if (upToIndex <= startIndex || upToIndex > getLastIndex()) {
             return;
         }
-        int removeCount = (int) (upToIndex - startIndex);
-        entries.subList(0, removeCount).clear();
-        filePositions.subList(0, removeCount).clear();
-        startIndex = upToIndex;
-        logger.debug("Compacted Raft log up to index {}", upToIndex);
+        int removeCount = (int) (upToIndex - startIndex + 1);
+        
+        List<RaftEntry> remainingEntries = new ArrayList<>(entries.subList(removeCount, entries.size()));
+        
+        java.io.File tempFile = new java.io.File(logPath.getParent().toFile(), logPath.getFileName().toString() + ".tmp");
+        List<Long> newPositions = new ArrayList<>(remainingEntries.size());
+        
+        try (RandomAccessFile tempRaf = new RandomAccessFile(tempFile, "rw")) {
+            for (RaftEntry entry : remainingEntries) {
+                newPositions.add(tempRaf.getFilePointer());
+                byte[] data = entry.toByteArray();
+                tempRaf.writeInt(data.length);
+                tempRaf.write(data);
+            }
+            tempRaf.getFD().sync();
+        }
+        
+        // Swap files
+        raf.close();
+        java.nio.file.Files.move(tempFile.toPath(), logPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        try {
+            raf = new RandomAccessFile(logPath.toFile(), "rw");
+        } catch (IOException e) {
+            throw new IOException("Failed to reopen compacted log: " + logPath, e);
+        }
+        raf.seek(raf.length());
+        
+        entries.clear();
+        entries.addAll(remainingEntries);
+        filePositions.clear();
+        filePositions.addAll(newPositions);
+        startIndex = upToIndex + 1;
+        
+        logger.debug("Compacted Raft log on disk up to index {}", upToIndex);
     }
 
     /**

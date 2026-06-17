@@ -49,7 +49,7 @@ mvn clean install
 To run a standalone broker (useful for testing and development):
 
 ```bash
-java -jar drmq-broker/target/drmq-broker-1.0.0-SNAPSHOT.jar --port 9092 --data-dir ./data-1
+./mvnw -pl drmq-broker exec:java -Dexec.args="--port 9092 --data-dir ./data-1"
 ```
 
 ### Cluster Mode
@@ -59,19 +59,19 @@ To run a fault-tolerant cluster, you must start multiple broker instances and pr
 **Node 1:**
 
 ```bash
-java -jar drmq-broker/target/drmq-broker-1.0.0-SNAPSHOT.jar --node-id 1 --port 9092 --data-dir ./data-1 --peers 2:localhost:9093,3:localhost:9094
+./mvnw -pl drmq-broker exec:java -Dexec.args="--node-id 1 --port 9092 --data-dir ./data-1 --peers 2:localhost:9093,3:localhost:9094"
 ```
 
 **Node 2:**
 
 ```bash
-java -jar drmq-broker/target/drmq-broker-1.0.0-SNAPSHOT.jar --node-id 2 --port 9093 --data-dir ./data-2 --peers 1:localhost:9092,3:localhost:9094
+./mvnw -pl drmq-broker exec:java -Dexec.args="--node-id 2 --port 9093 --data-dir ./data-2 --peers 1:localhost:9092,3:localhost:9094"
 ```
 
 **Node 3:**
 
 ```bash
-java -jar drmq-broker/target/drmq-broker-1.0.0-SNAPSHOT.jar --node-id 3 --port 9094 --data-dir ./data-3 --peers 1:localhost:9092,2:localhost:9093
+./mvnw -pl drmq-broker exec:java -Dexec.args="--node-id 3 --port 9094 --data-dir ./data-3 --peers 1:localhost:9092,2:localhost:9093"
 ```
 
 ## Usage Example
@@ -151,6 +151,66 @@ try (DRMQConsumer consumer = new DRMQConsumer("localhost:9092", "my-group")) {
     }
 } catch (IOException e) {
     e.printStackTrace();
+}
+```
+
+### Python Client (SDK)
+
+DRMQ supports cross-language communication via raw TCP and Protocol Buffers. A Python client implementation is provided in `drmq-python-client`. 
+The SDK features automatic leader failover, transparent retries, and offset auto-commit functionality identical to the Java client.
+
+**Producer Example:**
+```python
+from drmq_client import DRMQProducer
+
+producer = DRMQProducer("localhost:9092,localhost:9093")
+producer.connect()
+res = producer.send("python-topic", b"Hello from Python!")
+print(f"Sent at offset {res.offset}")
+```
+
+**Consumer Example:**
+```python
+from drmq_client import DRMQConsumer
+
+consumer = DRMQConsumer("localhost:9092,localhost:9093", group_id="python-workers")
+consumer.auto_commit = True
+consumer.connect()
+consumer.subscribe("python-topic")
+
+messages = consumer.poll(max_messages=10, timeout_ms=5000)
+for msg in messages:
+    print(f"Received: {msg.payload.decode('utf-8')}")
+```
+
+### TypeScript Client (SDK)
+
+A native Node.js/TypeScript client is provided in `drmq-ts-client`. Like the Python SDK, it natively supports cluster failovers and leader redirects.
+
+**Producer Example:**
+```typescript
+import { DRMQProducer } from './client';
+
+const producer = new DRMQProducer("localhost:9092,localhost:9093");
+await producer.connect();
+
+const payload = Buffer.from("Hello from TypeScript!");
+const res = await producer.send("ts-topic", payload);
+console.log(`Sent at offset ${res.offset}`);
+```
+
+**Consumer Example:**
+```typescript
+import { DRMQConsumer } from './client';
+
+const consumer = new DRMQConsumer("localhost:9092,localhost:9093", "ts-workers");
+consumer.autoCommit = true;
+await consumer.connect();
+await consumer.subscribe("ts-topic");
+
+const messages = await consumer.poll(10, 5000);
+for (const msg of messages) {
+  console.log(`Received: ${Buffer.from(msg.payload).toString('utf-8')}`);
 }
 ```
 

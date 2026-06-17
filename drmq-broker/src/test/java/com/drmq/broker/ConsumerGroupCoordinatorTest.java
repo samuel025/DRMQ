@@ -31,7 +31,7 @@ class ConsumerGroupCoordinatorTest {
     @BeforeEach
     void setUp() throws IOException {
         logManager = new LogManager(tempDir.toString());
-        messageStore = new MessageStore(logManager);
+        messageStore = new MessageStore(logManager, new BrokerConfig(9092, tempDir.toString()));
         offsetManager = new OffsetManager(tempDir.toString());
         // Use a very short lease timeout (100ms) so expiry tests don't need long sleeps
         coordinator = new ConsumerGroupCoordinator(messageStore, offsetManager, 100);

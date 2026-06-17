@@ -52,6 +52,7 @@ public class RaftNode {
     private RaftState state;
     private long commitIndex; 
     private long lastApplied;   
+    private long lastAppliedTerm;
     private String leaderId;  
 
     // Leader-only volatile state 
@@ -63,11 +64,15 @@ public class RaftNode {
     private final List<PeerAddress> peers;
     private final MessageStore messageStore;
     private final OffsetManager offsetManager;  
+    private final SnapshotManager snapshotManager;
+    private final Path dataDir;
     private final Path stateFilePath;
+    private final long raftCompactThreshold;
 
     private final Map<String, Function<RequestVoteRequest, RequestVoteResponse>> voteRpcHandlers = new ConcurrentHashMap<>();
     private final Map<String, Function<AppendEntriesRequest, AppendEntriesResponse>> appendRpcHandlers = new ConcurrentHashMap<>();
     private final Map<String, Function<PreVoteRequest, PreVoteResponse>> preVoteRpcHandlers = new ConcurrentHashMap<>();
+    private final Map<String, Function<InstallSnapshotRequest, InstallSnapshotResponse>> installSnapshotRpcHandlers = new ConcurrentHashMap<>();
 
     private final ReentrantLock lock = new ReentrantLock();
     // Using a cached thread pool or larger scheduled pool size
@@ -103,19 +108,32 @@ public class RaftNode {
     private final Map<String, Long> lastContactTime = new ConcurrentHashMap<>();
     private static final long LOG_RATE_LIMIT_MS = 1000;  
 
+    // Snapshot receive state
+    private long snapshotReceiveOffset = 0;
+    private java.io.OutputStream snapshotReceiveStream = null;
+    private Path snapshotTempFile = null;
+    private long expectedSnapshotIndex = -1;
+
+    private final Map<String, AtomicBoolean> isReplicating;
+
     public RaftNode(String nodeId, int port, List<PeerAddress> peers,
-                    MessageStore messageStore, OffsetManager offsetManager, Path dataDir) throws IOException {
+                    MessageStore messageStore, OffsetManager offsetManager, Path dataDir,
+                    long raftCompactThreshold) throws IOException {
         this.nodeId = nodeId;
         this.port = port;
         this.peers = peers;
         this.messageStore = messageStore;
         this.offsetManager = offsetManager;
+        this.dataDir = dataDir;
+        this.snapshotManager = new SnapshotManager(dataDir, messageStore, offsetManager);
+        this.raftCompactThreshold = raftCompactThreshold;
         this.raftLog = new RaftLog(dataDir);
         this.state = RaftState.FOLLOWER;
         this.commitIndex = 0;
         this.lastApplied = 0;
         this.nextIndex = new ConcurrentHashMap<>();
         this.matchIndex = new ConcurrentHashMap<>();
+        this.isReplicating = new ConcurrentHashMap<>();
         this.raftExecutor = Executors.newFixedThreadPool(
                 Math.max(4, peers.size() + 2),
                 r -> {
@@ -128,6 +146,14 @@ public class RaftNode {
         Files.createDirectories(raftDir);
         this.stateFilePath = raftDir.resolve("state.properties");
         loadPersistentState();
+    }
+
+    /**
+     * Backward-compatible constructor using default compaction threshold (1000).
+     */
+    public RaftNode(String nodeId, int port, List<PeerAddress> peers,
+                    MessageStore messageStore, OffsetManager offsetManager, Path dataDir) throws IOException {
+        this(nodeId, port, peers, messageStore, offsetManager, dataDir, 1000L);
     }
 
   
@@ -246,6 +272,13 @@ public class RaftNode {
      */
     public void registerPreVoteHandler(String peerId, Function<PreVoteRequest, PreVoteResponse> handler) {
         preVoteRpcHandlers.put(peerId, handler);
+    }
+
+    /**
+     * Register an RPC handler for sending InstallSnapshot to a peer.
+     */
+    public void registerInstallSnapshotHandler(String peerId, Function<InstallSnapshotRequest, InstallSnapshotResponse> handler) {
+        installSnapshotRpcHandlers.put(peerId, handler);
     }
 
     
@@ -550,7 +583,16 @@ public class RaftNode {
         if (state != RaftState.LEADER || !running) return;
 
         for (PeerAddress peer : peers) {
-            CompletableFuture.runAsync(() -> replicateTo(peer), raftExecutor);
+            AtomicBoolean replicating = isReplicating.computeIfAbsent(peer.id(), k -> new AtomicBoolean(false));
+            if (replicating.compareAndSet(false, true)) {
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        replicateTo(peer);
+                    } finally {
+                        replicating.set(false);
+                    }
+                }, raftExecutor);
+            }
         }
     }
 
@@ -558,13 +600,20 @@ public class RaftNode {
      * Replicate log entries to a single peer.
      */
     private void replicateTo(PeerAddress peer) {
-        lock.lock();
+        boolean needsSnapshot = false;
         AppendEntriesRequest request;
+        lock.lock();
         try {
             if (state != RaftState.LEADER) return;
 
             long peerNextIndex = nextIndex.getOrDefault(peer.id(), raftLog.getLastIndex() + 1);
             long prevLogIndex = peerNextIndex - 1;
+            
+            if (prevLogIndex > 0 && prevLogIndex < raftLog.getStartIndex()) {
+                needsSnapshot = true;
+                return;
+            }
+
             long prevLogTerm = raftLog.getTermAt(prevLogIndex);
 
             List<RaftEntry> entries = raftLog.getEntriesFrom(peerNextIndex);
@@ -579,7 +628,11 @@ public class RaftNode {
                     .build();
         } finally {
             lock.unlock();
+            if (needsSnapshot) {
+                sendInstallSnapshotToPeer(peer);
+            }
         }
+        if (needsSnapshot) return;
 
         Function<AppendEntriesRequest, AppendEntriesResponse> handler = appendRpcHandlers.get(peer.id());
         if (handler == null) return;
@@ -619,6 +672,86 @@ public class RaftNode {
             }
         } finally {
             lock.unlock();
+        }
+    }
+
+    private void sendInstallSnapshotToPeer(PeerAddress peer) {
+        long snapshotIndex;
+        long snapshotTerm;
+        long term;
+        lock.lock();
+        try {
+            if (state != RaftState.LEADER) return;
+            snapshotIndex = lastApplied;
+            snapshotTerm = lastAppliedTerm;
+            term = currentTerm;
+        } finally {
+            lock.unlock();
+        }
+
+        Path snapshotZip;
+        try {
+            snapshotZip = snapshotManager.createSnapshot(snapshotIndex);
+        } catch (IOException e) {
+            logger.error("[{}] Failed to create snapshot for peer {}", nodeId, peer.id(), e);
+            return;
+        }
+
+        Function<InstallSnapshotRequest, InstallSnapshotResponse> handler = installSnapshotRpcHandlers.get(peer.id());
+        if (handler == null) return;
+
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(snapshotZip.toFile(), "r")) {
+            long totalBytes = raf.length();
+            long offset = 0;
+            int chunkSize = 2 * 1024 * 1024; // 2MB chunks
+            byte[] buffer = new byte[chunkSize];
+
+            while (offset < totalBytes || totalBytes == 0) {
+                int bytesRead = totalBytes == 0 ? -1 : raf.read(buffer);
+                boolean isDone = (bytesRead <= 0) || (offset + bytesRead >= totalBytes);
+                int payloadSize = Math.max(0, bytesRead);
+
+                InstallSnapshotRequest request = InstallSnapshotRequest.newBuilder()
+                        .setTerm(term)
+                        .setLeaderId(nodeId)
+                        .setLastIncludedIndex(snapshotIndex)
+                        .setLastIncludedTerm(snapshotTerm)
+                        .setOffset(offset)
+                        .setData(com.google.protobuf.ByteString.copyFrom(buffer, 0, payloadSize))
+                        .setDone(isDone)
+                        .build();
+
+                InstallSnapshotResponse response = handler.apply(request);
+                
+                lock.lock();
+                try {
+                    if (state != RaftState.LEADER) return;
+                    if (response.getTerm() > currentTerm) {
+                        stepDown(response.getTerm());
+                        return;
+                    }
+                } finally {
+                    lock.unlock();
+                }
+
+                if (isDone) {
+                    lock.lock();
+                    try {
+                        if (state == RaftState.LEADER) {
+                            nextIndex.put(peer.id(), snapshotIndex + 1);
+                            matchIndex.put(peer.id(), snapshotIndex);
+                            logger.info("[{}] InstallSnapshot to {} succeeded. NextIndex updated to {}", 
+                                nodeId, peer.id(), snapshotIndex + 1);
+                        }
+                    } finally {
+                        lock.unlock();
+                    }
+                    break;
+                }
+                offset += bytesRead;
+            }
+        } catch (Exception e) {
+            logger.debug("[{}] InstallSnapshot to {} failed: {}", nodeId, peer.id(), e.getMessage());
         }
     }
 
@@ -663,6 +796,7 @@ public class RaftNode {
                 logger.error("[{}] Missing raft entry at index {} during apply", nodeId, lastApplied);
                 break;
             }
+            lastAppliedTerm = entry.getTerm();
 
             long completionValue = lastApplied;
             boolean applySucceeded = true;
@@ -723,7 +857,8 @@ public class RaftNode {
         if (applied) {
             stateSaveNeeded = true;
             
-            long retentionLimit = lastApplied - 100_000; 
+            // Keep at least 100x the compact threshold as a retention buffer
+            long retentionLimit = lastApplied - (raftCompactThreshold * 100);
             long safeCompactIndex;
             
             if (isLeader()) {
@@ -736,10 +871,15 @@ public class RaftNode {
                 safeCompactIndex = retentionLimit;
             }
             
-            long finalCompactIndex = Math.min(safeCompactIndex, lastApplied - 1000);
+            // Always keep at least raftCompactThreshold entries after lastApplied
+            long finalCompactIndex = Math.min(safeCompactIndex, lastApplied - raftCompactThreshold);
             
             if (finalCompactIndex > 0) {
-                raftLog.compact(finalCompactIndex);
+                try {
+                    raftLog.compact(finalCompactIndex);
+                } catch (IOException e) {
+                    logger.error("Failed to compact Raft log", e);
+                }
             }
         }
     }
@@ -984,7 +1124,8 @@ public class RaftNode {
 
             if (request.getPrevLogIndex() > 0) {
                 long prevTerm = raftLog.getTermAt(request.getPrevLogIndex());
-                if (request.getPrevLogIndex() > raftLog.getLastIndex() || prevTerm != request.getPrevLogTerm()) {
+                if (request.getPrevLogIndex() > raftLog.getLastIndex() || 
+                   (prevTerm != 0 && prevTerm != request.getPrevLogTerm())) {
                     return AppendEntriesResponse.newBuilder()
                             .setTerm(currentTerm)
                             .setSuccess(false)
@@ -1042,6 +1183,95 @@ public class RaftNode {
         }
     }
 
+    /**
+     * Handle an incoming InstallSnapshot RPC from the leader.
+     */
+    public InstallSnapshotResponse handleInstallSnapshot(InstallSnapshotRequest request) {
+        lock.lock();
+        try {
+            if (request.getTerm() > currentTerm) {
+                stepDown(request.getTerm());
+            }
+
+            if (request.getTerm() < currentTerm) {
+                return InstallSnapshotResponse.newBuilder().setTerm(currentTerm).build();
+            }
+
+            resetElectionTimer();
+            leaderId = request.getLeaderId();
+            state = RaftState.FOLLOWER;
+
+            // Initialize or reset receive state for the first chunk or if index changes
+            if (request.getOffset() == 0 || request.getLastIncludedIndex() != expectedSnapshotIndex) {
+                if (snapshotReceiveStream != null) {
+                    try { snapshotReceiveStream.close(); } catch (Exception ignored) {}
+                }
+                Path tempDir = dataDir.resolve("raft/snapshots");
+                Files.createDirectories(tempDir);
+                snapshotTempFile = tempDir.resolve("temp_receive_" + request.getLastIncludedIndex() + ".zip");
+                snapshotReceiveStream = Files.newOutputStream(snapshotTempFile, 
+                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+                snapshotReceiveOffset = 0;
+                expectedSnapshotIndex = request.getLastIncludedIndex();
+            }
+
+            // Verify offset
+            if (request.getOffset() != snapshotReceiveOffset) {
+                throw new IllegalStateException("Expected chunk offset " + snapshotReceiveOffset + 
+                                                " but got " + request.getOffset());
+            }
+
+            // Append chunk data
+            if (request.getData().size() > 0) {
+                snapshotReceiveStream.write(request.getData().toByteArray());
+                snapshotReceiveOffset += request.getData().size();
+            }
+
+            // If final chunk, process hot-swap
+            if (request.getDone()) {
+                snapshotReceiveStream.close();
+                snapshotReceiveStream = null;
+
+                long snapshotIndex = request.getLastIncludedIndex();
+                if (snapshotIndex > lastApplied) {
+                    logger.info("[{}] Received full snapshot. Applying hot-swap up to index {}", nodeId, snapshotIndex);
+                    
+                    // Restore snapshot and clear memory state
+                    snapshotManager.restoreSnapshot(snapshotTempFile);
+                    messageStore.reload();
+                    if (offsetManager != null) {
+                        offsetManager.reload();
+                    }
+
+                    // Discard all local log entries up to the snapshot point
+                    if (raftLog.getLastIndex() > 0) {
+                        try {
+                            long compactUpTo = Math.min(snapshotIndex, raftLog.getLastIndex());
+                            raftLog.compact(compactUpTo);
+                        } catch (IOException e) {
+                            logger.error("Failed to compact Raft log during InstallSnapshot", e);
+                        }
+                    }
+                    raftLog.setStartIndex(snapshotIndex + 1);
+                    lastApplied = snapshotIndex;
+                    lastAppliedTerm = request.getLastIncludedTerm();
+                    commitIndex = Math.max(commitIndex, snapshotIndex);
+                    logger.info("[{}] Successfully applied snapshot. lastApplied={}, commitIndex={}",
+                            nodeId, lastApplied, commitIndex);
+                }
+                
+                Files.deleteIfExists(snapshotTempFile);
+            }
+
+            return InstallSnapshotResponse.newBuilder().setTerm(currentTerm).build();
+        } catch (Exception e) {
+             logger.error("Error handling InstallSnapshot", e);
+             return InstallSnapshotResponse.newBuilder().setTerm(currentTerm).build();
+        } finally {
+            lock.unlock();
+        }
+    }
+
 
     /**
      Election restriction: only vote for candidates whose log
@@ -1062,12 +1292,14 @@ public class RaftNode {
         long term;
         String voted;
         long applied;
+        long appliedTerm;
         
         lock.lock();
         try {
             term = currentTerm;
             voted = votedFor;
             applied = lastApplied;
+            appliedTerm = lastAppliedTerm;
             stateSaveNeeded = false;
         } finally {
             lock.unlock();
@@ -1079,6 +1311,7 @@ public class RaftNode {
             props.setProperty("currentTerm", String.valueOf(term));
             props.setProperty("votedFor", voted != null ? voted : "");
             props.setProperty("lastApplied", String.valueOf(applied));
+            props.setProperty("lastAppliedTerm", String.valueOf(appliedTerm));
             tempPath = Files.createTempFile(stateFilePath.getParent(), stateFilePath.getFileName().toString(), ".tmp");
             try (FileOutputStream fos = new FileOutputStream(tempPath.toFile())) {
                 props.store(fos, "Raft persistent state");
@@ -1127,6 +1360,10 @@ public class RaftNode {
             String vf = props.getProperty("votedFor", "");
             votedFor = vf.isEmpty() ? null : vf;
             lastApplied = Long.parseLong(props.getProperty("lastApplied", "0"));
+            lastAppliedTerm = Long.parseLong(props.getProperty("lastAppliedTerm", "0"));
+            if (raftLog.getLastIndex() == 0 && lastApplied > 0) {
+                raftLog.setStartIndex(lastApplied + 1);
+            }
             commitIndex = Math.min(raftLog.getLastIndex(), Math.max(commitIndex, lastApplied));
             logger.info("[{}] Loaded persistent state: term={}, votedFor={}, lastApplied={}",
                     nodeId, currentTerm, votedFor, lastApplied);
@@ -1144,6 +1381,9 @@ public class RaftNode {
     public long getCommitIndex() { return commitIndex; }
     public long getLastApplied() { return lastApplied; }
     public boolean isLeader() { return state == RaftState.LEADER; }
+    public long getLastLogIndex() { return raftLog.getLastIndex(); }
+    public Map<String, Long> getMatchIndexMap() { return Collections.unmodifiableMap(matchIndex); }
+    public List<String> getPeerIds() { return peers.stream().map(PeerAddress::id).toList(); }
 
     /**
      * Get the leader's address as "host:port" for client redirection.

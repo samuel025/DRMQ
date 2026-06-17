@@ -41,6 +41,7 @@ public class BrokerServer {
     private final RaftNode raftNode;       
     private final List<RaftPeer> raftPeers; 
     private final BrokerMetrics metrics;
+    private TelemetryWebSocketServer telemetryServer;
 
     private volatile boolean running = false;
     
@@ -52,8 +53,8 @@ public class BrokerServer {
 
     public BrokerServer(BrokerConfig config) throws IOException {
         this.config = config;
-        this.logManager = new LogManager(config.getDataDir());
-        this.messageStore = new MessageStore(logManager);
+        this.logManager = new LogManager(config);
+        this.messageStore = new MessageStore(logManager, config);
         this.offsetManager = new OffsetManager(config.getDataDir());
         this.raftPeers = new ArrayList<>();
         this.metrics = BrokerMetrics.init(config);
@@ -65,7 +66,8 @@ public class BrokerServer {
                     config.getPeers(),
                     messageStore,
                     offsetManager,
-                    Paths.get(config.getDataDir())
+                    Paths.get(config.getDataDir()),
+                    config.getRaftCompactThreshold()
             );
 
             for (BrokerConfig.PeerAddress peer : config.getPeers()) {
@@ -74,6 +76,7 @@ public class BrokerServer {
                 raftNode.registerVoteHandler(peer.id(), raftPeer::sendRequestVote);
                 raftNode.registerAppendHandler(peer.id(), raftPeer::sendAppendEntries);
                 raftNode.registerPreVoteHandler(peer.id(), raftPeer::sendPreVote);
+                raftNode.registerInstallSnapshotHandler(peer.id(), raftPeer::sendInstallSnapshot);
             }
 
             logger.info("Cluster mode: nodeId={}, peers={}", config.getNodeId(), config.getPeers());
@@ -100,6 +103,10 @@ public class BrokerServer {
         this(DEFAULT_PORT, DEFAULT_THREAD_POOL_SIZE);
     }
 
+    public int getActiveChannelsCount() {
+        return activeChannels != null ? activeChannels.size() : 0;
+    }
+
     public void start() throws IOException {
         try {
             messageStore.recover();
@@ -124,7 +131,7 @@ public class BrokerServer {
                  @Override
                  public void initChannel(SocketChannel ch) {
                      ChannelPipeline p = ch.pipeline();
-                     p.addLast(new LengthFieldBasedFrameDecoder(10 * 1024 * 1024, 0, 4, 0, 4));
+                     p.addLast(new LengthFieldBasedFrameDecoder(256 * 1024 * 1024, 0, 4, 0, 4));
                      p.addLast(new ByteArrayDecoder());
                      p.addLast(new LengthFieldPrepender(4));
                      p.addLast(new ByteArrayEncoder());
@@ -139,6 +146,10 @@ public class BrokerServer {
             if (raftNode != null) {
                 raftNode.start();
             }
+            int wsPort = config.getPort() + 200;
+            telemetryServer = new TelemetryWebSocketServer(wsPort, this);
+            telemetryServer.start();
+
             logger.info("DRMQ Broker started on port {} with data directory {}",
                     config.getPort(), config.getDataDir());
 
@@ -178,6 +189,9 @@ public class BrokerServer {
         logger.info("Shutting down Netty broker...");
         if (raftNode != null) {
             raftNode.stop();
+        }
+        if (telemetryServer != null) {
+            telemetryServer.shutdown();
         }
 
         if (activeChannels != null) {

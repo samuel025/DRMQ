@@ -97,6 +97,21 @@ public class OffsetManager implements Closeable {
         logger.info("Loaded {} consumer offset(s) from {}", offsets.size(), offsetsFile);
     }
 
+    /**
+     * Completely clear in-memory state and reload from disk.
+     * Used after installing a Raft snapshot.
+     */
+    public void reload() throws IOException {
+        persistLock.lock();
+        try {
+            offsets.clear();
+            load();
+            isDirty.set(false);
+        } finally {
+            persistLock.unlock();
+        }
+    }
+
     private void backgroundPersist() {
         if (!isDirty.getAndSet(false)) return;
 
@@ -110,6 +125,21 @@ public class OffsetManager implements Closeable {
                 logger.error("Failed to background persist offsets", e);
                 BrokerMetrics.get().recordOffsetPersist(System.nanoTime() - startNanos, false);
             }
+        } finally {
+            persistLock.unlock();
+        }
+    }
+
+    /**
+     * Synchronously force all pending offsets to be persisted to disk.
+     * Used before taking a Raft snapshot.
+     */
+    public void forcePersist() throws IOException {
+        if (!isDirty.getAndSet(false)) return;
+
+        persistLock.lock();
+        try {
+            persist();
         } finally {
             persistLock.unlock();
         }

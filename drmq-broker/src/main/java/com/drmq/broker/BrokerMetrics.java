@@ -133,6 +133,14 @@ public final class BrokerMetrics implements AutoCloseable {
                     .register(registry);
             Gauge.builder("drmq.broker.raft.is_leader", raftNode, node -> node.isLeader() ? 1 : 0)
                     .register(registry);
+            for (String peerId : raftNode.getPeerIds()) {
+                Gauge.builder("drmq.broker.raft.replication_lag", raftNode, node -> {
+                    if (!node.isLeader()) return 0.0;
+                    Long matchIdx = node.getMatchIndexMap().get(peerId);
+                    if (matchIdx == null) return 0.0;
+                    return (double) (node.getLastLogIndex() - matchIdx);
+                }).tags("peer_id", peerId).register(registry);
+            }
         }
     }
 
@@ -352,6 +360,35 @@ public final class BrokerMetrics implements AutoCloseable {
         json.append('\"').append(key).append("\":{");
         json.append("\"mean_seconds\":").append(meanSeconds);
         json.append('}');
+    }
+
+    public double getCounterValueByType(String name, String type) {
+        if (!enabled || registry == null) {
+            return 0.0;
+        }
+        return counterValue(name, Tags.of("type", type));
+    }
+
+    /**
+     * Return the current value of a named gauge, or 0 if metrics are disabled or the gauge doesn't exist.
+     */
+    public double getGaugeValue(String name) {
+        if (!enabled || registry == null) {
+            return 0.0;
+        }
+        var gauge = registry.find(name).gauge();
+        return gauge != null ? gauge.value() : 0.0;
+    }
+
+    /**
+     * Return the mean duration (in milliseconds) of a named timer tagged by type,
+     * or 0 if no samples have been recorded.
+     */
+    public double getTimerMeanMs(String name, String type) {
+        if (!enabled || registry == null) {
+            return 0.0;
+        }
+        return timerMeanSeconds(name, Tags.of("type", type)) * 1000.0;
     }
 
     private double counterValue(String name, Tags tags) {

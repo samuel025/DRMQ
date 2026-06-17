@@ -31,7 +31,7 @@ class MessageStoreTest {
     @BeforeEach
     void setUp() throws IOException {
         logManager = new LogManager(tempDir.toString());
-        store = new MessageStore(logManager);
+        store = new MessageStore(logManager, new BrokerConfig(9092, tempDir.toString()));
     }
 
     @AfterEach
@@ -162,7 +162,7 @@ class MessageStoreTest {
         logManager.close();
         
         try (LogManager newLogManager = new LogManager(tempDir.toString())) {
-            MessageStore newStore = new MessageStore(newLogManager);
+            MessageStore newStore = new MessageStore(newLogManager, new BrokerConfig(9092, tempDir.toString()));
             
             newStore.recover();
             
@@ -204,6 +204,51 @@ class MessageStoreTest {
         assertTrue(topics.contains("alpha"));
         assertTrue(topics.contains("beta"));
         assertTrue(topics.contains("gamma"));
+    }
+    @Test
+    void testLogRolling() throws Exception {
+        BrokerConfig config = new BrokerConfig(9092, tempDir.toString());
+        config.setLogSegmentBytes(100); 
+        
+        try (LogManager lm = new LogManager(config)) {
+            MessageStore testStore = new MessageStore(lm, config);
+            
+            testStore.append("roll-topic", new byte[40], null, System.currentTimeMillis());
+            testStore.append("roll-topic", new byte[40], null, System.currentTimeMillis());
+            testStore.append("roll-topic", new byte[40], null, System.currentTimeMillis());
+            
+            var segments = lm.getAllSegments().get("roll-topic");
+            assertTrue(segments.size() > 1, "Log should have rolled into multiple segments");
+        }
+    }
+
+    @Test
+    void testRetentionPolicy() throws Exception {
+        BrokerConfig config = new BrokerConfig(9092, tempDir.toString());
+        config.setLogSegmentBytes(100);
+        config.setLogRetentionMs(500); 
+        
+        try (LogManager lm = new LogManager(config)) {
+            MessageStore testStore = new MessageStore(lm, config);
+            
+            testStore.append("retention-topic", new byte[40], null, System.currentTimeMillis());
+            testStore.append("retention-topic", new byte[40], null, System.currentTimeMillis());
+            testStore.append("retention-topic", new byte[40], null, System.currentTimeMillis());
+            
+            var segmentsBefore = lm.getAllSegments().get("retention-topic");
+            int numSegmentsBefore = segmentsBefore.size();
+            assertTrue(numSegmentsBefore > 1, "Log should have rolled");
+            
+            Thread.sleep(1000); 
+            
+            testStore.append("retention-topic", new byte[10], null, System.currentTimeMillis());
+            
+            testStore.cleanupOldSegments();
+            
+            var segmentsAfter = lm.getAllSegments().get("retention-topic");
+            assertTrue(segmentsAfter.size() < numSegmentsBefore, "Old segments should be deleted");
+            assertEquals(1, segmentsAfter.size(), "Only the active segment should remain");
+        }
     }
 }
 

@@ -10,3 +10,13 @@ data-*/
 BROKER_CODE_EXPLAINED.md
 CODE_REVIEW_FIXES_EXPLANATION.md
 docs/
+
+# Python SDK
+drmq-python-client/venv/
+drmq-python-client/__pycache__/
+drmq-python-client/*.pyc
+
+# TypeScript SDK
+drmq-ts-client/node_modules/
+drmq-ts-client/dist/
+drmq-ts-client/build/

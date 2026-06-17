@@ -173,6 +173,40 @@ public class RaftPeer {
     }
 
     /**
+     * Send an InstallSnapshot RPC and wait for the response.
+     */
+    public InstallSnapshotResponse sendInstallSnapshot(InstallSnapshotRequest request) {
+        synchronized (lock) {
+            long startNanos = System.nanoTime();
+            try {
+                ensureConnected();
+
+                MessageEnvelope envelope = MessageEnvelope.newBuilder()
+                        .setType(MessageType.INSTALL_SNAPSHOT_REQUEST)
+                        .setPayload(request.toByteString())
+                        .build();
+
+                sendEnvelope(envelope);
+                MessageEnvelope response = receiveEnvelope();
+                requireResponseType(response, MessageType.INSTALL_SNAPSHOT_RESPONSE, "InstallSnapshot");
+                InstallSnapshotResponse parsed = InstallSnapshotResponse.parseFrom(response.getPayload());
+                BrokerMetrics.get().recordRaftRpc("install_snapshot", true,
+                    System.nanoTime() - startNanos);
+                return parsed;
+
+            } catch (Exception e) {
+                close();
+                logger.debug("InstallSnapshot to {} failed: {}", address, e.getMessage());
+                BrokerMetrics.get().recordRaftRpc("install_snapshot", false,
+                        System.nanoTime() - startNanos);
+                return InstallSnapshotResponse.newBuilder()
+                        .setTerm(0)
+                        .build();
+            }
+        }
+    }
+
+    /**
      * Send a length-prefixed envelope.
      */
     private void sendEnvelope(MessageEnvelope envelope) throws IOException {

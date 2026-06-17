@@ -98,6 +98,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
             case REQUEST_VOTE_REQUEST -> handleRequestVoteRequest(envelope);
             case PRE_VOTE_REQUEST -> handlePreVoteRequest(envelope);
             case APPEND_ENTRIES_REQUEST -> handleAppendEntriesRequest(envelope);
+            case INSTALL_SNAPSHOT_REQUEST -> handleInstallSnapshotRequest(envelope);
             default -> createErrorResponse("Unknown message type: " + envelope.getType());
         };
     }
@@ -362,6 +363,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
             case REQUEST_VOTE_RESPONSE -> createRequestVoteErrorResponse();
             case PRE_VOTE_RESPONSE -> createPreVoteErrorResponse();
             case APPEND_ENTRIES_RESPONSE -> createAppendEntriesErrorResponse();
+            case INSTALL_SNAPSHOT_RESPONSE -> createInstallSnapshotErrorResponse();
             case PRODUCE_RESPONSE -> createProduceErrorResponse(errorMessage);
             case CONSUME_RESPONSE -> createConsumeErrorResponse(errorMessage);
             case COMMIT_OFFSET_RESPONSE -> createCommitOffsetErrorResponse(errorMessage);
@@ -391,6 +393,17 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
 
         return MessageEnvelope.newBuilder()
                 .setType(MessageType.APPEND_ENTRIES_RESPONSE)
+                .setPayload(response.toByteString())
+                .build();
+    }
+
+    private MessageEnvelope createInstallSnapshotErrorResponse() {
+        InstallSnapshotResponse response = InstallSnapshotResponse.newBuilder()
+                .setTerm(0)
+                .build();
+
+        return MessageEnvelope.newBuilder()
+                .setType(MessageType.INSTALL_SNAPSHOT_RESPONSE)
                 .setPayload(response.toByteString())
                 .build();
     }
@@ -547,6 +560,51 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
                 future.cancel(true);
             }
             return createAppendEntriesErrorResponse();
+        }
+    }
+
+    private MessageEnvelope handleInstallSnapshotRequest(MessageEnvelope envelope) throws IOException {
+        long startNanos = System.nanoTime();
+        if (raftNode == null) {
+            BrokerMetrics.get().recordRaftRpc("install_snapshot", false,
+                    System.nanoTime() - startNanos);
+            return createInstallSnapshotErrorResponse();
+        }
+
+        InstallSnapshotRequest request = InstallSnapshotRequest.parseFrom(envelope.getPayload());
+        Future<InstallSnapshotResponse> future = null;
+        try {
+            future = rpcExecutor.submit(() -> raftNode.handleInstallSnapshot(request));
+            InstallSnapshotResponse response = future.get(10, TimeUnit.SECONDS);
+
+            BrokerMetrics.get().recordRaftRpc("install_snapshot", true,
+                    System.nanoTime() - startNanos);
+
+            return MessageEnvelope.newBuilder()
+                    .setType(MessageType.INSTALL_SNAPSHOT_RESPONSE)
+                    .setPayload(response.toByteString())
+                    .build();
+        } catch (TimeoutException e) {
+            logger.error("InstallSnapshot handler timed out");
+            BrokerMetrics.get().recordRaftRpc("install_snapshot", false,
+                    System.nanoTime() - startNanos);
+            if (future != null) {
+                future.cancel(true);
+            }
+            return createInstallSnapshotErrorResponse();
+        } catch (RejectedExecutionException e) {
+            logger.error("InstallSnapshot handler rejected: {}", e.getMessage());
+            BrokerMetrics.get().recordRaftRpc("install_snapshot", false,
+                    System.nanoTime() - startNanos);
+            return createInstallSnapshotErrorResponse();
+        } catch (Exception e) {
+            logger.error("InstallSnapshot handler failed: {}", e.getMessage());
+            BrokerMetrics.get().recordRaftRpc("install_snapshot", false,
+                    System.nanoTime() - startNanos);
+            if (future != null) {
+                future.cancel(true);
+            }
+            return createInstallSnapshotErrorResponse();
         }
     }
 
