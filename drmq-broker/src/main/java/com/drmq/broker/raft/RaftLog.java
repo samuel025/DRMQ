@@ -210,13 +210,17 @@ public class RaftLog {
      * Compact the Raft log by removing entries from memory up to the given index,
      * and rewriting the log file on disk to reclaim space.
      */
-    public synchronized void compact(long upToIndex) throws IOException {
-        if (upToIndex <= startIndex || upToIndex > getLastIndex()) {
-            return;
-        }
-        int removeCount = (int) (upToIndex - startIndex + 1);
+    public void compact(long upToIndex) throws IOException {
+        int removeCount;
+        List<RaftEntry> remainingEntries;
         
-        List<RaftEntry> remainingEntries = new ArrayList<>(entries.subList(removeCount, entries.size()));
+        synchronized(this) {
+            if (upToIndex <= startIndex || upToIndex > getLastIndex()) {
+                return;
+            }
+            removeCount = (int) (upToIndex - startIndex + 1);
+            remainingEntries = new ArrayList<>(entries.subList(removeCount, entries.size()));
+        }
         
         java.io.File tempFile = new java.io.File(logPath.getParent().toFile(), logPath.getFileName().toString() + ".tmp");
         List<Long> newPositions = new ArrayList<>(remainingEntries.size());
@@ -231,23 +235,56 @@ public class RaftLog {
             tempRaf.getFD().sync();
         }
         
-        // Swap files
-        raf.close();
-        java.nio.file.Files.move(tempFile.toPath(), logPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
-        try {
-            raf = new RandomAccessFile(logPath.toFile(), "rw");
-        } catch (IOException e) {
-            throw new IOException("Failed to reopen compacted log: " + logPath, e);
+        synchronized(this) {
+            int currentExpectedSize = remainingEntries.size() + removeCount;
+            if (entries.size() < currentExpectedSize) {
+                // Truncation happened during compaction! Abort to avoid restoring truncated entries.
+                tempFile.delete();
+                return;
+            }
+            
+            int addedCount = entries.size() - currentExpectedSize;
+            if (addedCount > 0) {
+                List<RaftEntry> newlyAdded = entries.subList(entries.size() - addedCount, entries.size());
+                try (RandomAccessFile tempRaf = new RandomAccessFile(tempFile, "rw")) {
+                    tempRaf.seek(tempRaf.length());
+                    for (RaftEntry entry : newlyAdded) {
+                        newPositions.add(tempRaf.getFilePointer());
+                        byte[] data = entry.toByteArray();
+                        tempRaf.writeInt(data.length);
+                        tempRaf.write(data);
+                    }
+                    tempRaf.getFD().sync();
+                }
+            }
+
+            // Swap files
+            raf.close();
+            try {
+                java.nio.file.Files.move(tempFile.toPath(), logPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            } catch (Exception e) {
+                try {
+                    raf = new RandomAccessFile(logPath.toFile(), "rw");
+                    raf.seek(raf.length());
+                } catch (Exception ignore) {
+                }
+                throw e;
+            }
+
+            try {
+                raf = new RandomAccessFile(logPath.toFile(), "rw");
+            } catch (IOException e) {
+                throw new IOException("Failed to reopen compacted log: " + logPath, e);
+            }
+            raf.seek(raf.length());
+            
+            entries.subList(0, removeCount).clear();
+            filePositions.clear();
+            filePositions.addAll(newPositions);
+            startIndex = upToIndex + 1;
+            
+            logger.debug("Compacted Raft log on disk up to index {}", upToIndex);
         }
-        raf.seek(raf.length());
-        
-        entries.clear();
-        entries.addAll(remainingEntries);
-        filePositions.clear();
-        filePositions.addAll(newPositions);
-        startIndex = upToIndex + 1;
-        
-        logger.debug("Compacted Raft log on disk up to index {}", upToIndex);
     }
 
     /**

@@ -58,6 +58,7 @@ public class RaftNode {
     // Leader-only volatile state 
     private final Map<String, Long> nextIndex;   
     private final Map<String, Long> matchIndex; 
+    private final Map<String, Boolean> snapshotInProgress = new ConcurrentHashMap<>();
 
     private final String nodeId;
     private final int port;
@@ -68,6 +69,8 @@ public class RaftNode {
     private final Path dataDir;
     private final Path stateFilePath;
     private final long raftCompactThreshold;
+
+    private final AtomicBoolean isCompacting = new AtomicBoolean(false);
 
     private final Map<String, Function<RequestVoteRequest, RequestVoteResponse>> voteRpcHandlers = new ConcurrentHashMap<>();
     private final Map<String, Function<AppendEntriesRequest, AppendEntriesResponse>> appendRpcHandlers = new ConcurrentHashMap<>();
@@ -290,19 +293,24 @@ public class RaftNode {
      * If the timer fires, the node starts an election.
      */
     private void resetElectionTimer() {
-        if (electionTimer != null) {
-            electionTimer.cancel(false);
+        lock.lock();
+        try {
+            if (electionTimer != null) {
+                electionTimer.cancel(false);
+            }
+            long timeout;
+            if (startupGrace) {
+                timeout = ELECTION_TIMEOUT_MAX_MS * 3;
+                startupGrace = false;
+                logger.info("[{}] Startup grace: election timeout set to {}ms", nodeId, timeout);
+            } else {
+                timeout = ELECTION_TIMEOUT_MIN_MS +
+                        ThreadLocalRandom.current().nextLong(ELECTION_TIMEOUT_MAX_MS - ELECTION_TIMEOUT_MIN_MS);
+            }
+            electionTimer = scheduler.schedule(this::startPreVote, timeout, TimeUnit.MILLISECONDS);
+        } finally {
+            lock.unlock();
         }
-        long timeout;
-        if (startupGrace) {
-            timeout = ELECTION_TIMEOUT_MAX_MS * 3;
-            startupGrace = false;
-            logger.info("[{}] Startup grace: election timeout set to {}ms", nodeId, timeout);
-        } else {
-            timeout = ELECTION_TIMEOUT_MIN_MS +
-                    ThreadLocalRandom.current().nextLong(ELECTION_TIMEOUT_MAX_MS - ELECTION_TIMEOUT_MIN_MS);
-        }
-        electionTimer = scheduler.schedule(this::startPreVote, timeout, TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -341,7 +349,7 @@ public class RaftNode {
         if (votesReceived.get() >= votesNeeded) {
             if (electionStarted.compareAndSet(false, true)) {
                 logger.info("[{}] Pre-vote succeeded (single-node quorum), starting real election", nodeId);
-                startElection();
+                startElection(proposedTerm);
             }
         }
 
@@ -382,7 +390,7 @@ public class RaftNode {
                 }
                 // Release lock before startElection() to avoid holding it during disk I/O
                 if (shouldStartElection) {
-                    startElection();
+                    startElection(proposedTerm);
                 }
             });
         }
@@ -394,7 +402,7 @@ public class RaftNode {
      * Start a real election: transition to CANDIDATE, increment term, vote for self,
      * request votes from peers. Only called after a successful pre-vote.
      */
-    private void startElection() {
+    private void startElection(long proposedTerm) {
         if (!running) return;
 
         long myTerm;
@@ -404,8 +412,12 @@ public class RaftNode {
         try {
             if (!running || state == RaftState.LEADER) return;
 
+            if (currentTerm >= proposedTerm) {
+                return;
+            }
+
             electionStartNanos = System.nanoTime();
-            currentTerm++;
+            currentTerm = proposedTerm;
             state = RaftState.CANDIDATE;
             votedFor = nodeId;
             leaderId = null;
@@ -427,8 +439,8 @@ public class RaftNode {
             lock.unlock();
         }
 
-
         savePersistentState();
+        resetElectionTimer();
 
         int votesNeeded = (peers.size() + 1) / 2 + 1;  
         AtomicLong votesReceived = new AtomicLong(1);   // self-vote
@@ -558,6 +570,10 @@ public class RaftNode {
             int activePeers = 1; 
 
             for (PeerAddress peer : peers) {
+                if (snapshotInProgress.getOrDefault(peer.id(), false)) {
+                    activePeers++;
+                    continue;
+                }
                 Long lastContact = lastContactTime.get(peer.id());
                 if (lastContact != null && (now - lastContact) <= quorumWindow) {
                     activePeers++;
@@ -601,31 +617,27 @@ public class RaftNode {
      */
     private void replicateTo(PeerAddress peer) {
         boolean needsSnapshot = false;
-        AppendEntriesRequest request;
+        long peerNextIndex;
+        long prevLogIndex;
+        long currentTermLocal;
+        long commitIndexLocal;
+        String leaderIdLocal;
+        
         lock.lock();
         try {
             if (state != RaftState.LEADER) return;
 
-            long peerNextIndex = nextIndex.getOrDefault(peer.id(), raftLog.getLastIndex() + 1);
-            long prevLogIndex = peerNextIndex - 1;
+            peerNextIndex = nextIndex.getOrDefault(peer.id(), raftLog.getLastIndex() + 1);
+            prevLogIndex = peerNextIndex - 1;
             
             if (prevLogIndex > 0 && prevLogIndex < raftLog.getStartIndex()) {
                 needsSnapshot = true;
                 return;
             }
 
-            long prevLogTerm = raftLog.getTermAt(prevLogIndex);
-
-            List<RaftEntry> entries = raftLog.getEntriesFrom(peerNextIndex);
-
-            request = AppendEntriesRequest.newBuilder()
-                    .setTerm(currentTerm)
-                    .setLeaderId(nodeId)
-                    .setPrevLogIndex(prevLogIndex)
-                    .setPrevLogTerm(prevLogTerm)
-                    .addAllEntries(entries)
-                    .setLeaderCommit(commitIndex)
-                    .build();
+            currentTermLocal = currentTerm;
+            commitIndexLocal = commitIndex;
+            leaderIdLocal = nodeId;
         } finally {
             lock.unlock();
             if (needsSnapshot) {
@@ -633,6 +645,18 @@ public class RaftNode {
             }
         }
         if (needsSnapshot) return;
+
+        long prevLogTerm = raftLog.getTermAt(prevLogIndex);
+        List<RaftEntry> entries = raftLog.getEntriesFrom(peerNextIndex);
+
+        AppendEntriesRequest request = AppendEntriesRequest.newBuilder()
+                .setTerm(currentTermLocal)
+                .setLeaderId(leaderIdLocal)
+                .setPrevLogIndex(prevLogIndex)
+                .setPrevLogTerm(prevLogTerm)
+                .addAllEntries(entries)
+                .setLeaderCommit(commitIndexLocal)
+                .build();
 
         Function<AppendEntriesRequest, AppendEntriesResponse> handler = appendRpcHandlers.get(peer.id());
         if (handler == null) return;
@@ -689,13 +713,15 @@ public class RaftNode {
             lock.unlock();
         }
 
-        Path snapshotZip;
+        snapshotInProgress.put(peer.id(), true);
         try {
-            snapshotZip = snapshotManager.createSnapshot(snapshotIndex);
-        } catch (IOException e) {
-            logger.error("[{}] Failed to create snapshot for peer {}", nodeId, peer.id(), e);
-            return;
-        }
+            Path snapshotZip;
+            try {
+                snapshotZip = snapshotManager.createSnapshot(snapshotIndex);
+            } catch (IOException e) {
+                logger.error("[{}] Failed to create snapshot for peer {}", nodeId, peer.id(), e);
+                return;
+            }
 
         Function<InstallSnapshotRequest, InstallSnapshotResponse> handler = installSnapshotRpcHandlers.get(peer.id());
         if (handler == null) return;
@@ -722,6 +748,7 @@ public class RaftNode {
                         .build();
 
                 InstallSnapshotResponse response = handler.apply(request);
+                lastContactTime.put(peer.id(), System.currentTimeMillis());
                 
                 lock.lock();
                 try {
@@ -753,8 +780,10 @@ public class RaftNode {
         } catch (Exception e) {
             logger.debug("[{}] InstallSnapshot to {} failed: {}", nodeId, peer.id(), e.getMessage());
         }
+        } finally {
+            snapshotInProgress.put(peer.id(), false);
+        }
     }
-
 
     private void advanceCommitIndex() {
         long lastIndex = raftLog.getLastIndex();
@@ -875,10 +904,16 @@ public class RaftNode {
             long finalCompactIndex = Math.min(safeCompactIndex, lastApplied - raftCompactThreshold);
             
             if (finalCompactIndex > 0) {
-                try {
-                    raftLog.compact(finalCompactIndex);
-                } catch (IOException e) {
-                    logger.error("Failed to compact Raft log", e);
+                if (isCompacting.compareAndSet(false, true)) {
+                    raftExecutor.execute(() -> {
+                        try {
+                            raftLog.compact(finalCompactIndex);
+                        } catch (IOException e) {
+                            logger.error("Failed to compact Raft log", e);
+                        } finally {
+                            isCompacting.set(false);
+                        }
+                    });
                 }
             }
         }

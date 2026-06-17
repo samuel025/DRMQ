@@ -20,3 +20,6 @@ drmq-python-client/*.pyc
 drmq-ts-client/node_modules/
 drmq-ts-client/dist/
 drmq-ts-client/build/
+
+.agent/
+drmq-docs/
