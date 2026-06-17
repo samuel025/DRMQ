@@ -66,7 +66,8 @@ public class BrokerServer {
                     config.getPeers(),
                     messageStore,
                     offsetManager,
-                    Paths.get(config.getDataDir())
+                    Paths.get(config.getDataDir()),
+                    config.getRaftCompactThreshold()
             );
 
             for (BrokerConfig.PeerAddress peer : config.getPeers()) {

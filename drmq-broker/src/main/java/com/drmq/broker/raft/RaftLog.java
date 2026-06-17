@@ -233,8 +233,12 @@ public class RaftLog {
         
         // Swap files
         raf.close();
-        java.nio.file.Files.move(tempFile.toPath(), logPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-        raf = new RandomAccessFile(logPath.toFile(), "rw");
+        java.nio.file.Files.move(tempFile.toPath(), logPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        try {
+            raf = new RandomAccessFile(logPath.toFile(), "rw");
+        } catch (IOException e) {
+            throw new IOException("Failed to reopen compacted log: " + logPath, e);
+        }
         raf.seek(raf.length());
         
         entries.clear();

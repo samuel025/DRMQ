@@ -6,6 +6,7 @@ import com.drmq.protocol.DRMQProtocol.StoredMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -24,7 +25,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 /**
  * Message storage for the broker.
  */
-public class MessageStore {
+public class MessageStore implements Closeable {
     private static final Logger logger = LoggerFactory.getLogger(MessageStore.class);
 
     private final AtomicLong globalOffset = new AtomicLong(0);
@@ -427,6 +428,21 @@ public class MessageStore {
         messageCache.clear();
         globalOffset.set(0);
         logger.info("Message store memory state cleared");
+    }
+
+    @Override
+    public void close() throws IOException {
+        if (cleanerScheduler != null) {
+            cleanerScheduler.shutdown();
+            try {
+                if (!cleanerScheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                    cleanerScheduler.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                cleanerScheduler.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     void cleanupOldSegments() {

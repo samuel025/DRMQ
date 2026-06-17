@@ -61,10 +61,16 @@ public class BrokerConfig {
     public long getRaftCompactThreshold() { return raftCompactThreshold; }
 
     public void setLogSegmentBytes(long logSegmentBytes) {
+        if (logSegmentBytes <= 0) {
+            throw new IllegalArgumentException("logSegmentBytes must be positive");
+        }
         this.logSegmentBytes = logSegmentBytes;
     }
 
     public void setLogRetentionMs(long logRetentionMs) {
+        if (logRetentionMs <= 0) {
+            throw new IllegalArgumentException("logRetentionMs must be positive");
+        }
         this.logRetentionMs = logRetentionMs;
     }
 

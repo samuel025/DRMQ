@@ -27,7 +27,11 @@ public class LogSegment implements AutoCloseable {
     public LogSegment(Path filePath) throws IOException {
         this.filePath = filePath;
         String fileName = filePath.getFileName().toString();
-        this.baseOffset = Long.parseLong(fileName.substring(0, fileName.indexOf('.')));
+        try {
+            this.baseOffset = Long.parseLong(fileName.substring(0, fileName.indexOf('.')));
+        } catch (NumberFormatException e) {
+            throw new IOException("Invalid log segment filename format: " + fileName, e);
+        }
         this.fileChannel = FileChannel.open(filePath,
                 StandardOpenOption.CREATE,
                 StandardOpenOption.READ,

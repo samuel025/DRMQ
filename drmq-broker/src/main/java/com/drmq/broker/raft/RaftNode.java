@@ -52,6 +52,7 @@ public class RaftNode {
     private RaftState state;
     private long commitIndex; 
     private long lastApplied;   
+    private long lastAppliedTerm;
     private String leaderId;  
 
     // Leader-only volatile state 
@@ -681,7 +682,7 @@ public class RaftNode {
         try {
             if (state != RaftState.LEADER) return;
             snapshotIndex = lastApplied;
-            snapshotTerm = raftLog.getTermAt(snapshotIndex);
+            snapshotTerm = lastAppliedTerm;
             term = currentTerm;
         } finally {
             lock.unlock();
@@ -794,6 +795,7 @@ public class RaftNode {
                 logger.error("[{}] Missing raft entry at index {} during apply", nodeId, lastApplied);
                 break;
             }
+            lastAppliedTerm = entry.getTerm();
 
             long completionValue = lastApplied;
             boolean applySucceeded = true;
@@ -1250,6 +1252,7 @@ public class RaftNode {
                     }
                     raftLog.setStartIndex(snapshotIndex + 1);
                     lastApplied = snapshotIndex;
+                    lastAppliedTerm = request.getLastIncludedTerm();
                     commitIndex = Math.max(commitIndex, snapshotIndex);
                     logger.info("[{}] Successfully applied snapshot. lastApplied={}, commitIndex={}",
                             nodeId, lastApplied, commitIndex);
@@ -1287,12 +1290,14 @@ public class RaftNode {
         long term;
         String voted;
         long applied;
+        long appliedTerm;
         
         lock.lock();
         try {
             term = currentTerm;
             voted = votedFor;
             applied = lastApplied;
+            appliedTerm = lastAppliedTerm;
             stateSaveNeeded = false;
         } finally {
             lock.unlock();
@@ -1304,6 +1309,7 @@ public class RaftNode {
             props.setProperty("currentTerm", String.valueOf(term));
             props.setProperty("votedFor", voted != null ? voted : "");
             props.setProperty("lastApplied", String.valueOf(applied));
+            props.setProperty("lastAppliedTerm", String.valueOf(appliedTerm));
             tempPath = Files.createTempFile(stateFilePath.getParent(), stateFilePath.getFileName().toString(), ".tmp");
             try (FileOutputStream fos = new FileOutputStream(tempPath.toFile())) {
                 props.store(fos, "Raft persistent state");
@@ -1352,6 +1358,7 @@ public class RaftNode {
             String vf = props.getProperty("votedFor", "");
             votedFor = vf.isEmpty() ? null : vf;
             lastApplied = Long.parseLong(props.getProperty("lastApplied", "0"));
+            lastAppliedTerm = Long.parseLong(props.getProperty("lastAppliedTerm", "0"));
             if (raftLog.getLastIndex() == 0 && lastApplied > 0) {
                 raftLog.setStartIndex(lastApplied + 1);
             }
