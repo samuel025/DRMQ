@@ -21,10 +21,13 @@ public class LogSegment implements AutoCloseable {
 
     private final Path filePath;
     private final FileChannel fileChannel;
+    private final long baseOffset;
     private volatile long currentSize; 
 
     public LogSegment(Path filePath) throws IOException {
         this.filePath = filePath;
+        String fileName = filePath.getFileName().toString();
+        this.baseOffset = Long.parseLong(fileName.substring(0, fileName.indexOf('.')));
         this.fileChannel = FileChannel.open(filePath,
                 StandardOpenOption.CREATE,
                 StandardOpenOption.READ,
@@ -115,6 +118,24 @@ public class LogSegment implements AutoCloseable {
 
     public long getSize() {
         return currentSize;
+    }
+
+    public long getBaseOffset() {
+        return baseOffset;
+    }
+
+    public Path getFilePath() {
+        return filePath;
+    }
+
+    public long getLastModified() throws IOException {
+        return java.nio.file.Files.getLastModifiedTime(filePath).toMillis();
+    }
+
+    public void delete() throws IOException {
+        close();
+        java.nio.file.Files.deleteIfExists(filePath);
+        logger.info("Deleted log segment: {}", filePath);
     }
 
     @Override

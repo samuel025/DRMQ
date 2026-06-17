@@ -19,9 +19,13 @@ public class BrokerConfig {
     private final boolean metricsEnabled;
     private final int metricsPort;
     private final String metricsPath;
+    private long logSegmentBytes;
+    private long logRetentionMs;
+    private final long raftCompactThreshold;
 
     public BrokerConfig(String nodeId, int port, String dataDir, List<PeerAddress> peers,
-                        boolean metricsEnabled, int metricsPort, String metricsPath) {
+                        boolean metricsEnabled, int metricsPort, String metricsPath,
+                        long logSegmentBytes, long logRetentionMs, long raftCompactThreshold) {
         this.nodeId = nodeId;
         this.port = port;
         this.dataDir = dataDir;
@@ -29,15 +33,20 @@ public class BrokerConfig {
         this.metricsEnabled = metricsEnabled;
         this.metricsPort = metricsPort;
         this.metricsPath = metricsPath != null ? metricsPath : "/metrics";
+        this.logSegmentBytes = logSegmentBytes;
+        this.logRetentionMs = logRetentionMs;
+        this.raftCompactThreshold = raftCompactThreshold;
     }
 
     public BrokerConfig(String nodeId, int port, String dataDir, List<PeerAddress> peers) {
-        this(nodeId, port, dataDir, peers, true, 9096, "/metrics");
+        this(nodeId, port, dataDir, peers, true, 9096, "/metrics", 
+             100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L);
     }
 
     /** Single-node config (backward compatible) */
     public BrokerConfig(int port, String dataDir) {
-        this("standalone", port, dataDir, List.of(), true, 9096, "/metrics");
+        this("standalone", port, dataDir, List.of(), true, 9096, "/metrics",
+             100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L);
     }
 
     public String getNodeId() { return nodeId; }
@@ -47,6 +56,17 @@ public class BrokerConfig {
     public boolean isMetricsEnabled() { return metricsEnabled; }
     public int getMetricsPort() { return metricsPort; }
     public String getMetricsPath() { return metricsPath; }
+    public long getLogSegmentBytes() { return logSegmentBytes; }
+    public long getLogRetentionMs() { return logRetentionMs; }
+    public long getRaftCompactThreshold() { return raftCompactThreshold; }
+
+    public void setLogSegmentBytes(long logSegmentBytes) {
+        this.logSegmentBytes = logSegmentBytes;
+    }
+
+    public void setLogRetentionMs(long logRetentionMs) {
+        this.logRetentionMs = logRetentionMs;
+    }
 
     /** True if this broker is part of a Raft cluster */
     public boolean isClusterMode() {
@@ -65,6 +85,9 @@ public class BrokerConfig {
      *   --metrics-disabled
      *   --metrics-port <port>
      *   --metrics-path </metrics>
+     *   --log-segment-bytes <bytes>
+     *   --log-retention-ms <ms>
+     *   --raft-compact-threshold <count>
      */
     public static BrokerConfig fromArgs(String[] args) {
         String nodeId = "standalone";
@@ -74,10 +97,13 @@ public class BrokerConfig {
         boolean metricsEnabled = true;
         int metricsPort = 9096;
         String metricsPath = "/metrics";
+        long logSegmentBytes = 100 * 1024 * 1024L; // 100MB
+        long logRetentionMs = 7L * 24 * 60 * 60 * 1000; // 7 days
+        long raftCompactThreshold = 1000L;
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
-                case "--id" -> nodeId = args[++i];
+                case "--id", "--node-id" -> nodeId = args[++i];
                 case "--port" -> port = Integer.parseInt(args[++i]);
                 case "--data-dir" -> dataDir = args[++i];
                 case "--peers" -> {
@@ -90,6 +116,9 @@ public class BrokerConfig {
                 case "--metrics-disabled" -> metricsEnabled = false;
                 case "--metrics-port" -> metricsPort = parsePortArg(args, ++i, "--metrics-port");
                 case "--metrics-path" -> metricsPath = parsePathArg(args, ++i, "--metrics-path");
+                case "--log-segment-bytes" -> logSegmentBytes = parseLongArg(args, ++i, "--log-segment-bytes");
+                case "--log-retention-ms" -> logRetentionMs = parseLongArg(args, ++i, "--log-retention-ms");
+                case "--raft-compact-threshold" -> raftCompactThreshold = parseLongArg(args, ++i, "--raft-compact-threshold");
                 default -> {
                     if (i == 0) {
                         try {
@@ -104,7 +133,8 @@ public class BrokerConfig {
             }
         }
 
-        return new BrokerConfig(nodeId, port, dataDir, peers, metricsEnabled, metricsPort, metricsPath);
+        return new BrokerConfig(nodeId, port, dataDir, peers, metricsEnabled, metricsPort, metricsPath,
+                                logSegmentBytes, logRetentionMs, raftCompactThreshold);
     }
 
     private static boolean parseBooleanArg(String[] args, int index, String flag) {
@@ -128,6 +158,15 @@ public class BrokerConfig {
             return port;
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException(flag + " must be a valid integer port, got: " + value, e);
+        }
+    }
+
+    private static long parseLongArg(String[] args, int index, String flag) {
+        String value = requireValue(args, index, flag);
+        try {
+            return Long.parseLong(value);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(flag + " must be a valid long integer, got: " + value, e);
         }
     }
 

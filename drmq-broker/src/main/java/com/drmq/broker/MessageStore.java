@@ -15,6 +15,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -26,6 +29,8 @@ public class MessageStore {
 
     private final AtomicLong globalOffset = new AtomicLong(0);
     private final LogManager logManager;
+    private final BrokerConfig config;
+    private final ScheduledExecutorService cleanerScheduler = Executors.newSingleThreadScheduledExecutor();
 
     // Topic -> Offset -> Byte Position in log file (Sparse Index)
     private final ConcurrentHashMap<String, ConcurrentSkipListMap<Long, Long>> topicIndex = new ConcurrentHashMap<>();
@@ -36,55 +41,100 @@ public class MessageStore {
     // In-memory cache for recent messages (Topic -> BoundedMessageCache)
     private final ConcurrentHashMap<String, BoundedMessageCache> messageCache = new ConcurrentHashMap<>();
     
+    // Per-topic write locks to make segment-check + rollover + append atomic
+    private final ConcurrentHashMap<String, Object> topicWriteLocks = new ConcurrentHashMap<>();
+    
     private static final int MAX_CACHE_SIZE_PER_TOPIC = 1000;
     private static final int INDEX_INTERVAL = 1000;
     private static final int MAX_INDEX_ENTRIES = 10000;
 
+    // Global lock to pause appends during snapshot generation
+    private final ReentrantReadWriteLock globalLock = new ReentrantReadWriteLock();
+
     private final Object messageMonitor = new Object();
     private final AtomicLong messageSignal = new AtomicLong(0);
 
-    public MessageStore(LogManager logManager) {
+    public MessageStore(LogManager logManager, BrokerConfig config) {
         this.logManager = logManager;
+        this.config = config;
+        
+        long retentionMs = config.getLogRetentionMs();
+        if (retentionMs > 0) {
+            cleanerScheduler.scheduleWithFixedDelay(this::cleanupOldSegments, 1, 1, TimeUnit.MINUTES);
+        }
     }
 
     /**
      * Recovery: Rebuild the index from log files on disk.
      */
     public void recover() throws IOException {
+        globalLock.writeLock().lock();
+        try {
+            recoverInternal();
+        } finally {
+            globalLock.writeLock().unlock();
+        }
+    }
+
+    private void recoverInternal() throws IOException {
         logger.info("Starting message store recovery...");
-        Map<String, Path> segments = logManager.discoverSegments();
+        // Discover segments triggers loading them into LogManager
+        Map<String, List<Path>> segments = logManager.discoverSegments();
         long maxOffset = -1;
 
-        for (Map.Entry<String, Path> entry : segments.entrySet()) {
+        Map<String, ConcurrentSkipListMap<Long, LogSegment>> allSegments = logManager.getAllSegments();
+
+        for (Map.Entry<String, ConcurrentSkipListMap<Long, LogSegment>> entry : allSegments.entrySet()) {
             String topic = entry.getKey();
-            Path logPath = entry.getValue();
             
-            try (LogSegment segment = new LogSegment(logPath)) {
-                long position = 0;
-                long segmentSize = segment.getSize();
-                while (position < segmentSize) {
-                    StoredMessage message = segment.read(position);
-                    long offset = message.getOffset();
-                    
-                    indexMessage(topic, offset, position);
-                    addToCache(topic, message);
-                    topicMessageCounts.computeIfAbsent(topic, k -> new AtomicLong()).incrementAndGet();
-                    
-                    if (offset > maxOffset) {
-                        maxOffset = offset;
+            for (LogSegment segment : entry.getValue().values()) {
+                try {
+                    long position = 0;
+                    long segmentSize = segment.getSize();
+                    while (position < segmentSize) {
+                        StoredMessage message = segment.read(position);
+                        long offset = message.getOffset();
+                        
+                        indexMessage(topic, offset, position);
+                        addToCache(topic, message);
+                        topicMessageCounts.computeIfAbsent(topic, k -> new AtomicLong()).incrementAndGet();
+                        
+                        if (offset > maxOffset) {
+                            maxOffset = offset;
+                        }
+                        
+                        position += 4 + message.getSerializedSize();
                     }
-                    
-                   
-                    position += 4 + message.getSerializedSize();
+                } catch (IOException ioe) {
+                    logger.error("Error recovering topic {} segment {}: {}", topic, segment.getFilePath(), ioe.getMessage(), ioe);
+                    throw ioe;
                 }
-            } catch (IOException ioe) {
-                logger.error("Error recovering topic {}: {}", topic, ioe.getMessage(), ioe);
-                throw ioe;
             }
         }
 
         globalOffset.set(maxOffset + 1);
         logger.info("Recovery complete. Global offset set to {}", globalOffset.get());
+    }
+
+    /**
+     * Completely clear in-memory state and close file handles, then rebuild from disk.
+     * Used after installing a Raft snapshot.
+     */
+    public void reload() throws IOException {
+        globalLock.writeLock().lock();
+        try {
+            logger.info("Reloading MessageStore state from disk...");
+            topicIndex.clear();
+            topicMessageCounts.clear();
+            messageCache.clear();
+            topicWriteLocks.clear();
+            
+            logManager.close();
+            
+            recoverInternal();
+        } finally {
+            globalLock.writeLock().unlock();
+        }
     }
 
     private void indexMessage(String topic, long offset, long position) {
@@ -122,21 +172,35 @@ public class MessageStore {
 
         StoredMessage message = builder.build();
 
+        globalLock.readLock().lock();
         try {
-            LogSegment segment = logManager.getOrCreateSegment(topic);
-            long position = segment.append(message);
+            Object topicLock = topicWriteLocks.computeIfAbsent(topic, k -> new Object());
+            long position;
+            LogSegment segment;
+            synchronized (topicLock) {
+                segment = logManager.getOrCreateActiveSegment(topic);
+                
+                // Check if we need to roll over
+                if (segment.getSize() >= config.getLogSegmentBytes()) {
+                    segment = logManager.rollNewSegment(topic, offset);
+                }
+                
+                position = segment.append(message);
+            }
 
             indexMessage(topic, offset, position);
 
             addToCache(topic, message);
             topicMessageCounts.computeIfAbsent(topic, k -> new AtomicLong()).incrementAndGet();
 
-            logger.debug("Persisted and indexed message: topic={}, offset={}, position={}", 
-                    topic, offset, position);
+            logger.debug("Persisted and indexed message: topic={}, offset={}, position={}, segment={}", 
+                    topic, offset, position, segment.getFilePath().getFileName());
 
         } catch (IOException e) {
-            logger.error("Failed to persist message for topic {}: {}", topic, e.getMessage());
-            throw new RuntimeException("Persistence failure", e);
+            logger.error("Failed to persist message for topic {}", topic, e);
+            throw new RuntimeException("Failed to persist message", e);
+        } finally {
+            globalLock.readLock().unlock();
         }
 
         // 4. Wake any long-polling consumers waiting for new messages
@@ -146,6 +210,18 @@ public class MessageStore {
         }
 
         return offset;
+    }
+
+    /**
+     * Lock the store exclusively to safely take a snapshot of the log segments.
+     */
+    public void lockForSnapshot(Runnable task) {
+        globalLock.writeLock().lock();
+        try {
+            task.run();
+        } finally {
+            globalLock.writeLock().unlock();
+        }
     }
 
     /**
@@ -159,12 +235,18 @@ public class MessageStore {
         }
 
         ConcurrentSkipListMap<Long, Long> index = topicIndex.get(topic);
-        if (index != null) {
+        LogSegment segment = logManager.getSegmentForOffset(topic, offset);
+        
+        if (segment != null) {
             try {
-                Map.Entry<Long, Long> floorEntry = index.floorEntry(offset);
-                long startPosition = floorEntry != null ? floorEntry.getValue() : 0;
+                long startPosition = 0;
+                if (index != null) {
+                    java.util.Map.Entry<Long, Long> floorEntry = index.floorEntry(offset);
+                    if (floorEntry != null && floorEntry.getKey() >= segment.getBaseOffset()) {
+                        startPosition = floorEntry.getValue();
+                    }
+                }
                 
-                LogSegment segment = logManager.getOrCreateSegment(topic);
                 long segmentSize = segment.getSize();
                 long position = startPosition;
 
@@ -204,29 +286,67 @@ public class MessageStore {
         }
         
         ConcurrentSkipListMap<Long, Long> index = topicIndex.get(topic);
-        long startPosition = 0;
-        if (index != null) {
-            Map.Entry<Long, Long> floorEntry = index.floorEntry(fromOffset);
-            if (floorEntry != null) {
-                startPosition = floorEntry.getValue();
-            }
-        }
         
         List<StoredMessage> result = new ArrayList<>();
-        try {
-            LogSegment segment = logManager.getOrCreateSegment(topic);
-            long segmentSize = segment.getSize();
-            long position = startPosition;
-            
-            while (position < segmentSize && result.size() < maxCount) {
-                StoredMessage message = segment.read(position);
-                if (message.getOffset() >= fromOffset) {
-                    result.add(message);
+        long currentOffset = fromOffset;
+        
+        while (result.size() < maxCount) {
+            LogSegment segment = logManager.getSegmentForOffset(topic, currentOffset);
+            if (segment == null) {
+                // Try to find the next available segment if there is a gap
+                ConcurrentSkipListMap<Long, LogSegment> allTopicSegments = logManager.getAllSegments().get(topic);
+                if (allTopicSegments != null) {
+                    java.util.Map.Entry<Long, LogSegment> higherEntry = allTopicSegments.higherEntry(currentOffset);
+                    if (higherEntry != null) {
+                        segment = higherEntry.getValue();
+                        currentOffset = segment.getBaseOffset();
+                    } else {
+                        break; // No more segments
+                    }
+                } else {
+                    break;
                 }
-                position += 4 + message.getSerializedSize();
             }
-        } catch (IOException e) {
-            logger.warn("Error reading messages from disk for topic {}: {}", topic, e.getMessage());
+            
+            long startPosition = 0;
+            if (index != null) {
+                java.util.Map.Entry<Long, Long> floorEntry = index.floorEntry(currentOffset);
+                if (floorEntry != null && floorEntry.getKey() >= segment.getBaseOffset()) {
+                    startPosition = floorEntry.getValue();
+                }
+            }
+            
+            try {
+                long segmentSize = segment.getSize();
+                long position = startPosition;
+                
+                while (position < segmentSize && result.size() < maxCount) {
+                    StoredMessage message = segment.read(position);
+                    if (message.getOffset() >= currentOffset) {
+                        result.add(message);
+                        currentOffset = message.getOffset() + 1;
+                    }
+                    position += 4 + message.getSerializedSize();
+                }
+                
+                if (position >= segmentSize) {
+                    // Reached end of segment, will loop and fetch next segment
+                    ConcurrentSkipListMap<Long, LogSegment> allTopicSegments = logManager.getAllSegments().get(topic);
+                    if (allTopicSegments != null) {
+                        java.util.Map.Entry<Long, LogSegment> higherEntry = allTopicSegments.higherEntry(segment.getBaseOffset());
+                        if (higherEntry != null) {
+                            currentOffset = higherEntry.getKey();
+                        } else {
+                            break; // No more segments
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            } catch (IOException e) {
+                logger.warn("Error reading messages from disk for topic {} segment {}: {}", topic, segment.getFilePath(), e.getMessage());
+                break;
+            }
         }
         
         return result;
@@ -307,6 +427,60 @@ public class MessageStore {
         messageCache.clear();
         globalOffset.set(0);
         logger.info("Message store memory state cleared");
+    }
+
+    void cleanupOldSegments() {
+        long retentionMs = config.getLogRetentionMs();
+        if (retentionMs <= 0) return;
+
+        long cutoffTime = System.currentTimeMillis() - retentionMs;
+        Map<String, ConcurrentSkipListMap<Long, LogSegment>> allSegments = logManager.getAllSegments();
+
+        for (Map.Entry<String, ConcurrentSkipListMap<Long, LogSegment>> entry : allSegments.entrySet()) {
+            String topic = entry.getKey();
+            ConcurrentSkipListMap<Long, LogSegment> segments = entry.getValue();
+            
+            // Never delete the currently active (last) segment
+            if (segments.size() <= 1) continue;
+            
+            Long activeBaseOffset = segments.lastKey();
+            
+            List<Long> toDelete = new ArrayList<>();
+            for (Map.Entry<Long, LogSegment> segEntry : segments.entrySet()) {
+                long baseOffset = segEntry.getKey();
+                if (baseOffset == activeBaseOffset) continue; // Skip active
+                
+                LogSegment segment = segEntry.getValue();
+                try {
+                    if (segment.getLastModified() < cutoffTime) {
+                        toDelete.add(baseOffset);
+                    }
+                } catch (IOException e) {
+                    logger.warn("Failed to check last modified time for segment {}", segment.getFilePath(), e);
+                }
+            }
+            
+            for (Long baseOffset : toDelete) {
+                LogSegment segment = segments.remove(baseOffset);
+                if (segment != null) {
+                    try {
+                        segment.delete();
+                        // Also cleanup the index
+                        ConcurrentSkipListMap<Long, Long> index = topicIndex.get(topic);
+                        if (index != null) {
+                            // Find next segment's base offset to know how far to delete
+                            Long nextBaseOffset = segments.higherKey(baseOffset);
+                            long endOffset = (nextBaseOffset != null) ? nextBaseOffset : Long.MAX_VALUE;
+                            index.subMap(baseOffset, endOffset).clear();
+                        }
+                    } catch (IOException e) {
+                        logger.error("Failed to delete old log segment {}", segment.getFilePath(), e);
+                        // Put it back so we try again later
+                        segments.put(baseOffset, segment);
+                    }
+                }
+            }
+        }
     }
 
 
