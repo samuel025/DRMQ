@@ -108,7 +108,20 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
    */
   private merge(): TelemetryState {
     const frames = Array.from(this.latestFrames.values());
-    if (frames.length === 0) return frames[0];
+    if (frames.length === 0) {
+      return {
+        nodes: [],
+        metrics: {
+          totalThroughputMB: 0, produceThroughputMB: 0, consumeThroughputMB: 0,
+          produceRate: 0, consumeRate: 0, errorRate: 0, produceLatencyMs: 0, consumeLatencyMs: 0,
+          activeProducers: 0, activeConsumers: 0, totalConnections: 0,
+          health: 'CRITICAL', term: 0, commitIndex: 0, lastApplied: 0, followerSync: 0,
+          globalOffset: 0, topicCount: 0, logSegments: 0, cachedMessages: 0, throughputHistory: []
+        },
+        latencies: { alphaBeta: 0, betaGamma: 0, raftRpcMs: 0 }
+      };
+    }
+    if (frames.length === 1) return frames[0];
 
     // Find the most authoritative frame (leader with highest term)
     const maxTerm = Math.max(...frames.map(f => f.metrics.term ?? 0));
@@ -136,11 +149,10 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
       const local = frame.nodes[0];
       if (local) {
         const isStaleLeader = local.status === 'LEADER' && (frame.metrics.term ?? 0) < maxTerm;
-        if (isStaleLeader) {
-          local.status = 'FOLLOWER';
-          local.color = '#a855f7'; // Follower color
-        }
-        nodeMap.set(local.id, local);
+        const nodeToStore = isStaleLeader 
+          ? { ...local, status: 'FOLLOWER' as const, color: '#a855f7' } 
+          : local;
+        nodeMap.set(local.id, nodeToStore);
       }
     }
 

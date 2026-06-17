@@ -131,11 +131,10 @@ export default function Documentation() {
           <P>
             DRMQ (Distributed Reliable Message Queue) is a from-scratch implementation of a distributed
             event streaming broker built on the Raft consensus algorithm. It is designed for workloads
-            that demand strict, globally ordered message delivery with durability guarantees equivalent
-            to Kafka's <code className="text-cyan-400 text-sm">acks=all</code>.
+            that demand strict, globally ordered message delivery with durability guarantees.
           </P>
           <P>
-            Unlike Kafka's partition-based model, DRMQ replicates the entire topic log across all nodes
+            Unlike partition-based models, DRMQ replicates the entire topic log across all nodes
             in the Raft cluster. This sacrifices horizontal write scalability in exchange for
             much simpler operational semantics — every message is linearizable, every consumer sees the
             same global order, and there is no concept of partition reassignment or consumer rebalancing.
@@ -144,7 +143,7 @@ export default function Documentation() {
           <SubHeader title="When to use DRMQ" />
           <div className="bg-white/3 border border-white/5 rounded-lg divide-y divide-white/5 my-4 overflow-hidden">
             {[
-              ['Strictly ordered event logs',     'Audit trails, financial ledgers, state-machine replication.'],
+              ['Strictly ordered event logs',     'Audit trails, state-machine replication.'],
               ['Small-to-medium throughput',       'Single-partition write path means writes serialize through the Raft leader.'],
               ['Simple operational model',         'No partition maps, no ISR, no consumer group rebalancing protocol.'],
               ['High availability with 3+ nodes', 'Survives minority node failures with automatic leader failover.'],
