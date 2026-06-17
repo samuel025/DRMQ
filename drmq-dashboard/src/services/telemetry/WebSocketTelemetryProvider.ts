@@ -85,7 +85,8 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
       ws.onclose = () => {
         console.log(`[DRMQ] Disconnected: ${url}`);
         this.sockets.set(url, null);
-        if (this.onErrorCallback && Array.from(this.sockets.values()).every(s => !s || s.readyState !== WebSocket.OPEN)) {
+        this.latestFrames.delete(url);
+        if (!this.stopped && this.onErrorCallback && Array.from(this.sockets.values()).every(s => !s || s.readyState !== WebSocket.OPEN)) {
           this.onErrorCallback('Cluster offline. Retrying connection...');
         }
         this.scheduleReconnect(url);
@@ -109,22 +110,38 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
     const frames = Array.from(this.latestFrames.values());
     if (frames.length === 0) return frames[0];
 
-    // ── 1. Collect nodes ─────────────────────────────────────────────────────
-    // Each broker's frame has its LOCAL node first (with real metrics), then
-    // peers (with limited info). Prefer a node's own broker's data.
+    // Find the most authoritative frame (leader with highest term)
+    const maxTerm = Math.max(...frames.map(f => f.metrics.term ?? 0));
+    const leaderFrame = frames.find(f => f.nodes[0]?.status === 'LEADER' && f.metrics.term === maxTerm)
+                     ?? frames.find(f => f.nodes[0]?.status === 'LEADER')
+                     ?? frames[0];
+
     const nodeMap = new Map<string, BrokerNode>();
 
-    // First pass: add peer entries as a baseline
+    // First pass: use the authoritative frame to set the baseline for all nodes
+    for (const node of leaderFrame.nodes) {
+      nodeMap.set(node.id, { ...node });
+    }
+
+    // Second pass: add any missing nodes from other frames (just in case)
     for (const frame of frames) {
       for (const node of frame.nodes) {
-        if (!nodeMap.has(node.id)) nodeMap.set(node.id, node);
+        if (!nodeMap.has(node.id)) nodeMap.set(node.id, { ...node });
       }
     }
 
-    // Second pass: overwrite with each broker's own (more accurate) self-report
+    // Third pass: overwrite with each broker's own self-report, BUT
+    // downgrade stale leaders to followers to prevent multi-leader ghosting.
     for (const frame of frames) {
       const local = frame.nodes[0];
-      if (local) nodeMap.set(local.id, local);
+      if (local) {
+        const isStaleLeader = local.status === 'LEADER' && (frame.metrics.term ?? 0) < maxTerm;
+        if (isStaleLeader) {
+          local.status = 'FOLLOWER';
+          local.color = '#a855f7'; // Follower color
+        }
+        nodeMap.set(local.id, local);
+      }
     }
 
     // Sort by id and pin to fixed SVG positions
@@ -133,12 +150,6 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
       ...node,
       ...WebSocketTelemetryProvider.POSITIONS[i] ?? { x: 500, y: 500 },
     }));
-
-    // ── 2. Pick metrics from the leader frame ────────────────────────────────
-    // The leader has all the produce/consume counters. Followers have zeros.
-    const leaderFrame = frames.find(f => f.nodes[0]?.status === 'LEADER')
-                     ?? frames.find(f => f.metrics.produceRate > 0)
-                     ?? frames[0];
 
     const metrics: ClusterMetrics = { ...leaderFrame.metrics };
 
