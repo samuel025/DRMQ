@@ -112,6 +112,7 @@ public class RaftNode {
     private long snapshotReceiveOffset = 0;
     private java.io.OutputStream snapshotReceiveStream = null;
     private Path snapshotTempFile = null;
+    private long expectedSnapshotIndex = -1;
 
     private final Map<String, AtomicBoolean> isReplicating;
 
@@ -1200,8 +1201,8 @@ public class RaftNode {
             leaderId = request.getLeaderId();
             state = RaftState.FOLLOWER;
 
-            // Initialize or reset receive state for the first chunk
-            if (request.getOffset() == 0) {
+            // Initialize or reset receive state for the first chunk or if index changes
+            if (request.getOffset() == 0 || request.getLastIncludedIndex() != expectedSnapshotIndex) {
                 if (snapshotReceiveStream != null) {
                     try { snapshotReceiveStream.close(); } catch (Exception ignored) {}
                 }
@@ -1211,6 +1212,7 @@ public class RaftNode {
                 snapshotReceiveStream = Files.newOutputStream(snapshotTempFile, 
                         StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
                 snapshotReceiveOffset = 0;
+                expectedSnapshotIndex = request.getLastIncludedIndex();
             }
 
             // Verify offset
