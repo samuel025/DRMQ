@@ -27,14 +27,14 @@ function Sidebar({ telemetryState }: { telemetryState: any }) {
       <nav className="flex-1 p-3 space-y-1">
         <Link to="/" aria-label="Telemetry"
           className={`flex items-center justify-center lg:justify-start gap-3 px-3 py-2.5 rounded-lg text-sm transition-all ${
-            location.pathname === '/' ? 'bg-cyan-500/10 text-white border border-cyan-500/20 shadow-[inset_2px_0_0_#06b6d4]'
+            location.pathname === '/' ? 'bg-cyan-500/10 text-white border border-cyan-500/20'
                    : 'text-zinc-500 hover:text-zinc-300 hover:bg-white/5'}`}>
           <LayoutDashboard className={`w-4 h-4 shrink-0 ${location.pathname === '/' ? 'text-cyan-400' : ''}`} />
           <span className="hidden lg:block font-medium tracking-wide">Telemetry</span>
         </Link>
         <Link to="/docs" aria-label="Documentation"
           className={`flex items-center justify-center lg:justify-start gap-3 px-3 py-2.5 rounded-lg text-sm transition-all ${
-            location.pathname === '/docs' ? 'bg-cyan-500/10 text-white border border-cyan-500/20 shadow-[inset_2px_0_0_#06b6d4]'
+            location.pathname === '/docs' ? 'bg-cyan-500/10 text-white border border-cyan-500/20'
                    : 'text-zinc-500 hover:text-zinc-300 hover:bg-white/5'}`}>
           <Book className={`w-4 h-4 shrink-0 ${location.pathname === '/docs' ? 'text-cyan-400' : ''}`} />
           <span className="hidden lg:block font-medium tracking-wide">Documentation</span>

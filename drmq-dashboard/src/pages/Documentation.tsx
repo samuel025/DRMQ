@@ -24,7 +24,7 @@ function P({ children, className }: { children: React.ReactNode; className?: str
 function CodeBlock({ lang, children }: { lang: string; children: string }) {
   // Map doc lang labels to Prism language identifiers
   const prismLang: Record<string, string> = {
-    java: 'java', bash: 'bash', text: 'text', json: 'json', protobuf: 'protobuf',
+    java: 'java', bash: 'bash', text: 'text', json: 'json', protobuf: 'protobuf', python: 'python', typescript: 'typescript'
   };
   return (
     <div className="rounded-lg overflow-hidden border border-white/10 my-4">
@@ -71,12 +71,14 @@ const TOC = [
   { id: 'raft',           label: '5. Raft Consensus' },
   { id: 'producer',       label: '6. Producer API' },
   { id: 'consumer',       label: '7. Consumer API' },
-  { id: 'storage',        label: '8. Storage Engine' },
-  { id: 'groups',         label: '9. Consumer Groups' },
-  { id: 'telemetry',      label: '10. Telemetry' },
-  { id: 'production',     label: '11. Production' },
-  { id: 'faults',         label: '12. Fault Tolerance' },
-  { id: 'cli',            label: '13. CLI Reference' },
+  { id: 'python',         label: '8. Python Client (SDK)' },
+  { id: 'typescript',     label: '9. TypeScript Client (SDK)' },
+  { id: 'storage',        label: '10. Storage Engine' },
+  { id: 'groups',         label: '11. Consumer Groups' },
+  { id: 'telemetry',      label: '12. Telemetry' },
+  { id: 'production',     label: '13. Production' },
+  { id: 'faults',         label: '14. Fault Tolerance' },
+  { id: 'cli',            label: '15. CLI Reference' },
 ];
 
 // ─── Main Page ─────────────────────────────────────────────────────────────
@@ -580,7 +582,7 @@ DRMQProducer.SendResult result = producer.send("metrics", payload, "sensor-01");
           <SectionHeader id="consumer" title="7. Consumer API" />
           <P>
             The <code className="text-cyan-400 text-sm">DRMQConsumer</code> is used to read messages from topics.
-            Unlike Kafka, DRMQ supports two distinct consumption modes: <strong>Group Mode</strong> (default)
+            DRMQ supports two distinct consumption modes: <strong>Group Mode</strong> (default)
             and <strong>Single Mode</strong>.
           </P>
 
@@ -692,8 +694,82 @@ while (true) {
             </li>
           </ul>
 
-          {/* ── Section 8: Storage Engine ───────────────────────────────── */}
-          <SectionHeader id="storage" title="8. Storage Engine" />
+          {/* ── Section 8: Python Client (SDK) ──────────────────────────── */}
+          <SectionHeader id="python" title="8. Python Client (SDK)" />
+          <P>
+            Because DRMQ relies entirely on raw TCP framing and Google Protocol Buffers, 
+            building clients in other languages is incredibly easy. A native Python SDK is 
+            available in the <code className="text-cyan-400 text-sm">drmq-python-client</code> directory. 
+            The SDK natively handles automatic leader failovers, transparent retries, and offset auto-committing.
+          </P>
+          <SubHeader title="Python Producer" />
+          <CodeBlock lang="python">
+{`from drmq_client import DRMQProducer
+
+producer = DRMQProducer("localhost:9092,localhost:9093")
+producer.connect()
+
+# The payload must be bytes
+res = producer.send("python-topic", b"Hello from Python!")
+if res.success:
+    print(f"Message sent successfully at offset {res.offset}")
+else:
+    print(f"Failed: {res.error_message}")`}
+          </CodeBlock>
+
+          <SubHeader title="Python Consumer" />
+          <CodeBlock lang="python">
+{`from drmq_client import DRMQConsumer
+
+consumer = DRMQConsumer("localhost:9092,localhost:9093", group_id="python-workers")
+consumer.auto_commit = True
+consumer.connect()
+consumer.subscribe("python-topic")
+
+# Long-poll the broker for new messages
+messages = consumer.poll(max_messages=10, timeout_ms=5000)
+for msg in messages:
+    print(f"Received (offset {msg.offset}): {msg.payload.decode('utf-8')}")`}
+          </CodeBlock>
+
+          {/* ── Section 9: TypeScript Client (SDK) ──────────────────────── */}
+          <SectionHeader id="typescript" title="9. TypeScript Client (SDK)" />
+          <P>
+            A native Node.js/TypeScript SDK is also available in the 
+            <code className="text-cyan-400 text-sm">drmq-ts-client</code> directory. It uses 
+            the <code className="text-cyan-400 text-sm">net</code> module to interact natively 
+            with the broker without requiring heavy HTTP libraries, and features exactly the 
+            same automatic leader redirection and failover capabilities as the Java client.
+          </P>
+          <SubHeader title="TypeScript Producer" />
+          <CodeBlock lang="typescript">
+{`import { DRMQProducer } from './client';
+
+const producer = new DRMQProducer("localhost:9092,localhost:9093");
+await producer.connect();
+
+const payload = Buffer.from("Hello from TypeScript!");
+const res = await producer.send("ts-topic", payload);
+console.log(\`Sent at offset \${res.offset}\`);`}
+          </CodeBlock>
+
+          <SubHeader title="TypeScript Consumer" />
+          <CodeBlock lang="typescript">
+{`import { DRMQConsumer } from './client';
+
+const consumer = new DRMQConsumer("localhost:9092,localhost:9093", "ts-workers");
+consumer.autoCommit = true;
+await consumer.connect();
+await consumer.subscribe("ts-topic");
+
+// Long-poll the broker for new messages
+const messages = await consumer.poll(10, 5000);
+for (const msg of messages) {
+  console.log(\`Received: \${Buffer.from(msg.payload).toString('utf-8')}\`);
+}`}
+          </CodeBlock>
+          {/* ── Section 10: Storage Engine ───────────────────────────────── */}
+          <SectionHeader id="storage" title="10. Storage Engine" />
           <P>
             Once a message is committed by the Raft consensus layer, it is handed off to the{' '}
             <code className="text-cyan-400 text-sm">MessageStore</code>. The storage layer uses a
@@ -722,8 +798,8 @@ while (true) {
             nearest byte boundary before performing a short linear scan on disk.
           </P>
 
-          {/* ── Section 9: Consumer Groups ──────────────────────────────── */}
-          <SectionHeader id="groups" title="9. Consumer Groups" />
+          {/* ── Section 11: Consumer Groups ─────────────────────────────── */}
+          <SectionHeader id="groups" title="11. Consumer Groups" />
           <P>
             DRMQ uses a server-coordinated consumer group model to provide exact load-balancing without the
             need for complex client-side partition rebalancing protocols (like ZooKeeper or Kafka's GroupCoordinator).
@@ -763,8 +839,8 @@ while (true) {
             to reconstruct the exact state of all consumer groups.
           </P>
 
-          {/* ── Section 10: Telemetry ───────────────────────────────────── */}
-          <SectionHeader id="telemetry" title="10. Telemetry & Dashboard" />
+          {/* ── Section 12: Telemetry & Dashboard ───────────────────────── */}
+          <SectionHeader id="telemetry" title="12. Telemetry & Dashboard" />
           <P>
             Every DRMQ broker runs an embedded WebSocket server (port <code className="text-cyan-400 text-sm">9093</code> by default)
             that streams real-time JSON telemetry frames.
@@ -788,8 +864,8 @@ while (true) {
             network partitions, leader failovers, and follower lag without relying on external metric scrapers like Prometheus.
           </P>
 
-          {/* ── Section 11: Production Deployment ───────────────────────── */}
-          <SectionHeader id="production" title="11. Production Deployment" />
+          {/* ── Section 13: Production Deployment ───────────────────────── */}
+          <SectionHeader id="production" title="13. Production Deployment" />
           <P>
             While DRMQ runs easily on a laptop for development, running a distributed consensus-based 
             system in production requires specific hardware and OS-level considerations to guarantee 
@@ -828,8 +904,8 @@ while (true) {
             </li>
           </ul>
 
-          {/* ── Section 12: Fault Tolerance ───────────────────────────── */}
-          <SectionHeader id="faults" title="12. Fault Tolerance" />
+          {/* ── Section 14: Fault Tolerance ───────────────────────────── */}
+          <SectionHeader id="faults" title="14. Fault Tolerance" />
           <P>
             DRMQ is built to survive failures gracefully. The following scenarios describe how the cluster 
             behaves under duress.
@@ -848,8 +924,8 @@ while (true) {
             ))}
           </div>
 
-          {/* ── Section 13: CLI Reference ─────────────────────────────── */}
-          <SectionHeader id="cli" title="13. CLI Reference" />
+          {/* ── Section 15: CLI Reference ─────────────────────────────── */}
+          <SectionHeader id="cli" title="15. CLI Reference" />
           <P>
             The <code className="text-cyan-400 text-sm">drmq-client</code> module includes interactive REPL
             (Read-Eval-Print Loop) applications for testing clusters without writing Java code.
