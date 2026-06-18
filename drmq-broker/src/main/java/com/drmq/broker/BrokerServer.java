@@ -24,6 +24,9 @@ import java.io.IOException;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 
 public class BrokerServer {
@@ -50,7 +53,7 @@ public class BrokerServer {
     private EventExecutorGroup businessGroup;
     private Channel serverChannel;
     private final ChannelGroup activeChannels = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
-    private final java.util.concurrent.ThreadPoolExecutor rpcExecutor;
+    private final ThreadPoolExecutor rpcExecutor;
 
     public BrokerServer(BrokerConfig config) throws IOException {
         this.config = config;
@@ -61,14 +64,15 @@ public class BrokerServer {
         this.metrics = BrokerMetrics.init(config);
         
         int rpcThreadCount = Math.max(4, Runtime.getRuntime().availableProcessors());
-        this.rpcExecutor = new java.util.concurrent.ThreadPoolExecutor(
+        java.util.concurrent.atomic.AtomicInteger rpcThreadId = new java.util.concurrent.atomic.AtomicInteger(1);
+        this.rpcExecutor = new ThreadPoolExecutor(
                 rpcThreadCount,
                 rpcThreadCount,
                 0L,
-                java.util.concurrent.TimeUnit.MILLISECONDS,
-                new java.util.concurrent.ArrayBlockingQueue<>(1000),
+                TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(1000),
                 r -> {
-                    Thread t = new Thread(r, "raft-rpc-handler-" + config.getPort());
+                    Thread t = new Thread(r, "raft-rpc-handler-" + config.getPort() + "-" + rpcThreadId.getAndIncrement());
                     t.setDaemon(true);
                     return t;
                 },
@@ -232,8 +236,11 @@ public class BrokerServer {
         if (rpcExecutor != null) {
             rpcExecutor.shutdown();
             try {
-                rpcExecutor.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS);
+                if (!rpcExecutor.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                    rpcExecutor.shutdownNow();
+                }
             } catch (InterruptedException e) {
+                rpcExecutor.shutdownNow();
                 Thread.currentThread().interrupt();
             }
         }

@@ -495,9 +495,12 @@ public class DRMQConsumer implements AutoCloseable {
 
     private void commitOffsetToBrokerInternal(String topic, long offset) throws IOException {
         CommitOffsetRequest.Builder requestBuilder = CommitOffsetRequest.newBuilder()
-                .setConsumerGroup(consumerGroup)
                 .setTopic(topic)
                 .setOffset(offset);
+
+        if (consumerGroup != null) {
+            requestBuilder.setConsumerGroup(consumerGroup);
+        }
 
         if (groupMode) {
             requestBuilder.setConsumerId(consumerId);
