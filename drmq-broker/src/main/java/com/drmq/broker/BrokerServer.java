@@ -50,6 +50,7 @@ public class BrokerServer {
     private EventExecutorGroup businessGroup;
     private Channel serverChannel;
     private final ChannelGroup activeChannels = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
+    private final java.util.concurrent.ThreadPoolExecutor rpcExecutor;
 
     public BrokerServer(BrokerConfig config) throws IOException {
         this.config = config;
@@ -58,6 +59,20 @@ public class BrokerServer {
         this.offsetManager = new OffsetManager(config.getDataDir());
         this.raftPeers = new ArrayList<>();
         this.metrics = BrokerMetrics.init(config);
+        
+        int rpcThreadCount = Math.max(4, Runtime.getRuntime().availableProcessors());
+        this.rpcExecutor = new java.util.concurrent.ThreadPoolExecutor(
+                rpcThreadCount,
+                rpcThreadCount,
+                0L,
+                java.util.concurrent.TimeUnit.MILLISECONDS,
+                new java.util.concurrent.ArrayBlockingQueue<>(1000),
+                r -> {
+                    Thread t = new Thread(r, "raft-rpc-handler-" + config.getPort());
+                    t.setDaemon(true);
+                    return t;
+                },
+                new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
 
         if (config.isClusterMode()) {
             this.raftNode = new RaftNode(
@@ -135,7 +150,7 @@ public class BrokerServer {
                      p.addLast(new ByteArrayDecoder());
                      p.addLast(new LengthFieldPrepender(4));
                      p.addLast(new ByteArrayEncoder());
-                     p.addLast(businessGroup, "clientHandler", new ClientHandler(messageStore, offsetManager, raftNode, activeChannels, groupCoordinator));
+                     p.addLast(businessGroup, "clientHandler", new ClientHandler(messageStore, offsetManager, raftNode, activeChannels, groupCoordinator, rpcExecutor));
                  }
              });
 
@@ -214,7 +229,14 @@ public class BrokerServer {
             Thread.currentThread().interrupt();
         }
 
-        ClientHandler.shutdownRpcExecutor();
+        if (rpcExecutor != null) {
+            rpcExecutor.shutdown();
+            try {
+                rpcExecutor.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
 
         if (raftPeers != null) {
             for (RaftPeer peer : raftPeers) {

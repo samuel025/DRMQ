@@ -285,7 +285,7 @@ class RaftIntegrationTest {
                 assertEquals(0, result.getOffset());
             }
 
-            try (DRMQConsumer consumer = new DRMQConsumer("localhost", 19110)) {
+            try (DRMQConsumer consumer = new DRMQConsumer("localhost", 19110, "test-group")) {
                 consumer.connect();
                 consumer.subscribe("standalone-topic");
                 var messages = consumer.poll(10);
@@ -323,7 +323,7 @@ class RaftIntegrationTest {
         BrokerServer follower = findFollower();
         assertNotNull(follower);
 
-        try (DRMQConsumer consumer = new DRMQConsumer("localhost", follower.getPort())) {
+        try (DRMQConsumer consumer = new DRMQConsumer("localhost", follower.getPort(), "follower-test-group")) {
             consumer.connect();
             consumer.subscribe("consumer-raft");
             var messages = consumer.poll(10);

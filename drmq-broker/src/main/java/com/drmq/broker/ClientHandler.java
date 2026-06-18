@@ -25,36 +25,17 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
     private static final int RPC_THREAD_COUNT = Math.max(4, Runtime.getRuntime().availableProcessors());
     private static final int RPC_QUEUE_CAPACITY = 1000;
 
-    private static final ThreadPoolExecutor rpcExecutor = new ThreadPoolExecutor(
-            RPC_THREAD_COUNT,
-            RPC_THREAD_COUNT,
-            0L,
-            TimeUnit.MILLISECONDS,
-            new ArrayBlockingQueue<>(RPC_QUEUE_CAPACITY),
-            r -> {
-                Thread t = new Thread(r, "raft-rpc-handler");
-                t.setDaemon(true);
-                return t;
-            },
-            new ThreadPoolExecutor.AbortPolicy());
-
-    public static void shutdownRpcExecutor() {
-        rpcExecutor.shutdown();
-        try {
-            rpcExecutor.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-    }
+    private final ThreadPoolExecutor rpcExecutor;
 
     public ClientHandler(MessageStore messageStore, OffsetManager offsetManager,
                          RaftNode raftNode, ChannelGroup activeChannels,
-                         ConsumerGroupCoordinator groupCoordinator) {
+                         ConsumerGroupCoordinator groupCoordinator, ThreadPoolExecutor rpcExecutor) {
         this.messageStore = messageStore;
         this.offsetManager = offsetManager;
         this.raftNode = raftNode;
         this.activeChannels = activeChannels;
         this.groupCoordinator = groupCoordinator;
+        this.rpcExecutor = rpcExecutor;
     }
 
     @Override
