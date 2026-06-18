@@ -49,7 +49,7 @@ class ConsumerIntegrationTest {
         }
 
         // Consume the messages
-        try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT)) {
+        try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT, "default-test-group")) {
             consumer.connect();
             consumer.subscribe("test-topic");
 
@@ -76,7 +76,7 @@ class ConsumerIntegrationTest {
         }
 
         // Consume starting from offset 5 (requires single mode for explicit offset)
-        try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT)) {
+        try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT, "default-test-group")) {
             consumer.setGroupMode(false);
             consumer.connect();
             consumer.subscribe("offset-test", 5);
@@ -147,7 +147,7 @@ class ConsumerIntegrationTest {
 
     @Test
     void consumerReturnsEmptyListForEmptyTopic() throws Exception {
-        try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT)) {
+        try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT, "default-test-group")) {
             consumer.connect();
             consumer.subscribe("empty-topic");
 
@@ -164,7 +164,7 @@ class ConsumerIntegrationTest {
             producer.send("multi-poll", "First".getBytes());
         }
 
-        try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT)) {
+        try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT, "default-test-group")) {
             consumer.connect();
             consumer.subscribe("multi-poll");
 
@@ -195,7 +195,7 @@ class ConsumerIntegrationTest {
             producer.send("offset-tracking", "C".getBytes());
         }
 
-        try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT)) {
+        try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT, "default-test-group")) {
             consumer.setGroupMode(false);
             consumer.connect();
             consumer.subscribe("offset-tracking");
@@ -220,7 +220,7 @@ class ConsumerIntegrationTest {
             producer.send("keyed-topic", "Value".getBytes(), "my-key");
         }
 
-        try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT)) {
+        try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT, "default-test-group")) {
             consumer.connect();
             consumer.subscribe("keyed-topic");
 

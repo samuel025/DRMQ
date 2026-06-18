@@ -75,4 +75,28 @@ class SnapshotManagerTest {
         assertTrue(Files.exists(offsetsDir.resolve("offsets.properties")));
         assertEquals("mygroup-mytopic-0=100", Files.readString(offsetsDir.resolve("offsets.properties")));
     }
+
+    @Test
+    void testZipSlipPrevention() throws IOException {
+        // 1. Create a malicious zip file
+        Path zipFile = tempDir.resolve("malicious.zip");
+        try (java.io.OutputStream fos = Files.newOutputStream(zipFile);
+             java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(fos)) {
+            
+            // Create a malicious entry pointing outside the target directory
+            java.util.zip.ZipEntry maliciousEntry = new java.util.zip.ZipEntry("../../../../../tmp/hacked.txt");
+            zos.putNextEntry(maliciousEntry);
+            zos.write("You've been hacked!".getBytes());
+            zos.closeEntry();
+        }
+
+        // 2. Attempt to restore it, which should throw an IOException
+        IOException exception = assertThrows(IOException.class, () -> {
+            snapshotManager.restoreSnapshot(zipFile);
+        });
+
+        // 3. Verify the exception message
+        assertTrue(exception.getMessage().contains("outside of target dir") || 
+                   exception.getMessage().contains("Zip entry is outside"));
+    }
 }

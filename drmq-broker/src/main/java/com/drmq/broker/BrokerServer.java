@@ -24,6 +24,9 @@ import java.io.IOException;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 
 public class BrokerServer {
@@ -50,6 +53,7 @@ public class BrokerServer {
     private EventExecutorGroup businessGroup;
     private Channel serverChannel;
     private final ChannelGroup activeChannels = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
+    private final ThreadPoolExecutor rpcExecutor;
 
     public BrokerServer(BrokerConfig config) throws IOException {
         this.config = config;
@@ -58,6 +62,21 @@ public class BrokerServer {
         this.offsetManager = new OffsetManager(config.getDataDir());
         this.raftPeers = new ArrayList<>();
         this.metrics = BrokerMetrics.init(config);
+        
+        int rpcThreadCount = Math.max(4, Runtime.getRuntime().availableProcessors());
+        java.util.concurrent.atomic.AtomicInteger rpcThreadId = new java.util.concurrent.atomic.AtomicInteger(1);
+        this.rpcExecutor = new ThreadPoolExecutor(
+                rpcThreadCount,
+                rpcThreadCount,
+                0L,
+                TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(1000),
+                r -> {
+                    Thread t = new Thread(r, "raft-rpc-handler-" + config.getPort() + "-" + rpcThreadId.getAndIncrement());
+                    t.setDaemon(true);
+                    return t;
+                },
+                new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
 
         if (config.isClusterMode()) {
             this.raftNode = new RaftNode(
@@ -135,7 +154,7 @@ public class BrokerServer {
                      p.addLast(new ByteArrayDecoder());
                      p.addLast(new LengthFieldPrepender(4));
                      p.addLast(new ByteArrayEncoder());
-                     p.addLast(businessGroup, "clientHandler", new ClientHandler(messageStore, offsetManager, raftNode, activeChannels, groupCoordinator));
+                     p.addLast(businessGroup, "clientHandler", new ClientHandler(messageStore, offsetManager, raftNode, activeChannels, groupCoordinator, rpcExecutor));
                  }
              });
 
@@ -214,7 +233,17 @@ public class BrokerServer {
             Thread.currentThread().interrupt();
         }
 
-        ClientHandler.shutdownRpcExecutor();
+        if (rpcExecutor != null) {
+            rpcExecutor.shutdown();
+            try {
+                if (!rpcExecutor.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                    rpcExecutor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                rpcExecutor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
 
         if (raftPeers != null) {
             for (RaftPeer peer : raftPeers) {

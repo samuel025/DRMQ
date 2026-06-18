@@ -33,7 +33,6 @@ public class DRMQConsumer implements AutoCloseable {
     private static final Logger logger = LoggerFactory.getLogger(DRMQConsumer.class);
     private static final int DEFAULT_PORT = 9092;
     private static final int DEFAULT_MAX_MESSAGES = 100;
-    private static final String DEFAULT_CONSUMER_GROUP = "default";
     private static final long DEFAULT_POLL_TIMEOUT_MS = 1000;
     private static final int MAX_RETRIES = 5;
     private static final long RECONNECT_DELAY_MS = 500;  // Brief pause between retries to allow leader election
@@ -53,24 +52,28 @@ public class DRMQConsumer implements AutoCloseable {
     private final Map<String, Long> topicOffsets = new HashMap<>();
     private final Object pollLock = new Object();
     private volatile boolean autoCommit = false;
-    private volatile boolean groupMode = true;
+    private volatile boolean groupMode = false;
 
 
 
     public DRMQConsumer() {
-        this("localhost", DEFAULT_PORT, DEFAULT_CONSUMER_GROUP);
+        this("localhost", DEFAULT_PORT, null);
     }
 
-    public DRMQConsumer(String consumerGroup) {
-        this("localhost", DEFAULT_PORT, consumerGroup);
+    /**
+     * Create a consumer with multiple bootstrap servers for failover (Single Mode).
+     */
+    public DRMQConsumer(String bootstrapServersStr) {
+        this(bootstrapServersStr, null);
     }
 
     public DRMQConsumer(String host, int port) {
-        this(host, port, DEFAULT_CONSUMER_GROUP);
+        this(host, port, null);
     }
 
     public DRMQConsumer(String host, int port, String consumerGroup) {
         this.consumerGroup = consumerGroup;
+        this.groupMode = (consumerGroup != null && !consumerGroup.trim().isEmpty());
         this.consumerId = UUID.randomUUID().toString();
         List<String[]> parsed = host != null && host.contains(",") ? parseBootstrapServers(host) : List.of();
         if (!parsed.isEmpty()) {
@@ -87,12 +90,15 @@ public class DRMQConsumer implements AutoCloseable {
         }
     }
 
+
+
     /**
-     * Create a consumer with multiple bootstrap servers for failover.
+     * Create a consumer with multiple bootstrap servers for failover (Group Mode if consumerGroup is provided).
      * Format: "host1:port1,host2:port2,host3:port3"
      */
     public DRMQConsumer(String bootstrapServersStr, String consumerGroup) {
         this.consumerGroup = consumerGroup;
+        this.groupMode = (consumerGroup != null && !consumerGroup.trim().isEmpty());
         this.consumerId = UUID.randomUUID().toString();
         this.bootstrapServers = new ArrayList<>(parseBootstrapServers(bootstrapServersStr));
         if (bootstrapServers.isEmpty()) {
@@ -295,9 +301,9 @@ public class DRMQConsumer implements AutoCloseable {
             logger.info("Subscribed to topic '{}' in group mode (group='{}', consumerId='{}')",
                     topic, consumerGroup, consumerId);
         } else {
-            long offset = fetchOffsetFromBroker(topic);
-            topicOffsets.put(topic, offset);
-            logger.info("Subscribed to topic '{}' from offset {} (group='{}')", topic, offset, consumerGroup);
+            // In single mode, default to 0 if no offset is provided.
+            topicOffsets.put(topic, 0L);
+            logger.info("Subscribed to topic '{}' from offset 0 (Single Mode)", topic);
         }
     }
 
@@ -394,6 +400,7 @@ public class DRMQConsumer implements AutoCloseable {
      * Automatically retries with failover if the connection fails.
      */
     private long fetchOffsetFromBroker(String topic) throws IOException {
+        if (consumerGroup == null) return 0L;
         return fetchOffsetFromBrokerWithRetry(topic, MAX_RETRIES);
     }
 
@@ -423,10 +430,12 @@ public class DRMQConsumer implements AutoCloseable {
     }
 
     private long fetchOffsetFromBrokerInternal(String topic) throws IOException {
-        FetchOffsetRequest request = FetchOffsetRequest.newBuilder()
-                .setConsumerGroup(consumerGroup)
-                .setTopic(topic)
-                .build();
+        FetchOffsetRequest.Builder builder = FetchOffsetRequest.newBuilder()
+                .setTopic(topic);
+        if (consumerGroup != null) {
+            builder.setConsumerGroup(consumerGroup);
+        }
+        FetchOffsetRequest request = builder.build();
 
         MessageEnvelope envelope = MessageEnvelope.newBuilder()
                 .setType(MessageType.FETCH_OFFSET_REQUEST)
@@ -486,9 +495,12 @@ public class DRMQConsumer implements AutoCloseable {
 
     private void commitOffsetToBrokerInternal(String topic, long offset) throws IOException {
         CommitOffsetRequest.Builder requestBuilder = CommitOffsetRequest.newBuilder()
-                .setConsumerGroup(consumerGroup)
                 .setTopic(topic)
                 .setOffset(offset);
+
+        if (consumerGroup != null) {
+            requestBuilder.setConsumerGroup(consumerGroup);
+        }
 
         if (groupMode) {
             requestBuilder.setConsumerId(consumerId);
