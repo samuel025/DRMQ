@@ -21,6 +21,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import com.drmq.broker.persistence.CorruptRecordException;
 
 /**
  * Message storage for the broker.
@@ -106,8 +107,8 @@ public class MessageStore implements Closeable {
                         
                         position += 4 + message.getSerializedSize();
                     }
-                } catch (IOException ioe) {
-                    logger.warn("Corruption detected in topic {} segment {} at position {}. Truncating: {}", topic, segment.getFilePath(), position, ioe.getMessage());
+                } catch (CorruptRecordException cre) {
+                    logger.warn("Corruption detected in topic {} segment {} at position {}. Truncating: {}", topic, segment.getFilePath(), position, cre.getMessage());
                     try {
                         segment.truncate(position);
                     } catch (IOException truncateEx) {
