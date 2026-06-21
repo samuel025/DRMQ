@@ -86,7 +86,7 @@ public class LogSegment implements AutoCloseable {
         while (lengthBuffer.hasRemaining()) {
             int read = fileChannel.read(lengthBuffer, position + bytesRead);
             if (read == -1) {
-                throw new IOException("Unexpected EOF while reading message length at position " + position);
+                throw new CorruptRecordException("Unexpected EOF while reading message length at position " + position);
             }
             bytesRead += read;
         }
@@ -94,11 +94,11 @@ public class LogSegment implements AutoCloseable {
         int length = lengthBuffer.getInt();
         
         if (length <= 0) {
-            throw new IOException("Invalid message length " + length + " at position " + position + 
+            throw new CorruptRecordException("Invalid message length " + length + " at position " + position + 
                                   ". Possible data corruption.");
         }
         if (length > MAX_MESSAGE_SIZE) {
-            throw new IOException("Message length " + length + " exceeds maximum allowed size " + 
+            throw new CorruptRecordException("Message length " + length + " exceeds maximum allowed size " + 
                                   MAX_MESSAGE_SIZE + " at position " + position + 
                                   ". Possible data corruption or OOM attack.");
         }
@@ -108,14 +108,19 @@ public class LogSegment implements AutoCloseable {
         while (messageBuffer.hasRemaining()) {
             int read = fileChannel.read(messageBuffer, position + 4 + bytesRead);
             if (read == -1) {
-                throw new IOException("Unexpected EOF while reading message body at position " + 
+                throw new CorruptRecordException("Unexpected EOF while reading message body at position " + 
                                       (position + 4) + ", expected " + length + " bytes, got " + bytesRead);
             }
             bytesRead += read;
         }
         messageBuffer.flip();
 
-        StoredMessage message = StoredMessage.parseFrom(messageBuffer.array());
+        StoredMessage message;
+        try {
+            message = StoredMessage.parseFrom(messageBuffer.array());
+        } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+            throw new CorruptRecordException("Failed to parse message at position " + position, e);
+        }
         BrokerMetrics.get().recordLogRead(4L + length, System.nanoTime() - startNanos);
         return message;
     }
@@ -140,6 +145,15 @@ public class LogSegment implements AutoCloseable {
         close();
         java.nio.file.Files.deleteIfExists(filePath);
         logger.info("Deleted log segment: {}", filePath);
+    }
+
+    public synchronized void truncate(long size) throws IOException {
+        if (size < currentSize) {
+            logger.warn("Truncating log segment {} from {} to {}", filePath, currentSize, size);
+            fileChannel.truncate(size);
+            fileChannel.force(true);
+            this.currentSize = size;
+        }
     }
 
     @Override
