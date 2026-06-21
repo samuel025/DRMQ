@@ -142,6 +142,15 @@ public class LogSegment implements AutoCloseable {
         logger.info("Deleted log segment: {}", filePath);
     }
 
+    public synchronized void truncate(long size) throws IOException {
+        if (size < currentSize) {
+            logger.warn("Truncating log segment {} from {} to {}", filePath, currentSize, size);
+            fileChannel.truncate(size);
+            fileChannel.force(true);
+            this.currentSize = size;
+        }
+    }
+
     @Override
     public void close() throws IOException {
         if (fileChannel.isOpen()) {

@@ -89,8 +89,8 @@ public class MessageStore implements Closeable {
             String topic = entry.getKey();
             
             for (LogSegment segment : entry.getValue().values()) {
+                long position = 0;
                 try {
-                    long position = 0;
                     long segmentSize = segment.getSize();
                     while (position < segmentSize) {
                         StoredMessage message = segment.read(position);
@@ -107,8 +107,13 @@ public class MessageStore implements Closeable {
                         position += 4 + message.getSerializedSize();
                     }
                 } catch (IOException ioe) {
-                    logger.error("Error recovering topic {} segment {}: {}", topic, segment.getFilePath(), ioe.getMessage(), ioe);
-                    throw ioe;
+                    logger.warn("Corruption detected in topic {} segment {} at position {}. Truncating: {}", topic, segment.getFilePath(), position, ioe.getMessage());
+                    try {
+                        segment.truncate(position);
+                    } catch (IOException truncateEx) {
+                        logger.error("Failed to truncate segment {}", segment.getFilePath(), truncateEx);
+                        throw truncateEx;
+                    }
                 }
             }
         }

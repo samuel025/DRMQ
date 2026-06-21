@@ -91,7 +91,6 @@ public class LogManager implements AutoCloseable {
         }
 
         synchronized (segments) {
-            // Check if already rolled
             if (!segments.isEmpty() && segments.lastKey() >= baseOffset) {
                 return segments.lastEntry().getValue();
             }
