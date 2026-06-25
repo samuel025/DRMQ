@@ -27,6 +27,7 @@ import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 
 public class BrokerServer {
@@ -64,7 +65,7 @@ public class BrokerServer {
         this.metrics = BrokerMetrics.init(config);
         
         int rpcThreadCount = Math.max(4, Runtime.getRuntime().availableProcessors());
-        java.util.concurrent.atomic.AtomicInteger rpcThreadId = new java.util.concurrent.atomic.AtomicInteger(1);
+        AtomicInteger rpcThreadId = new AtomicInteger(1);
         this.rpcExecutor = new ThreadPoolExecutor(
                 rpcThreadCount,
                 rpcThreadCount,
@@ -76,7 +77,7 @@ public class BrokerServer {
                     t.setDaemon(true);
                     return t;
                 },
-                new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
+                new ThreadPoolExecutor.AbortPolicy());
 
         if (config.isClusterMode()) {
             this.raftNode = new RaftNode(

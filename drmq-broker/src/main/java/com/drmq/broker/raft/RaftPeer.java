@@ -11,12 +11,6 @@ import java.net.Socket;
 
 /**
  * Manages a TCP connection to a single remote Raft peer.
- *
- * Sends RequestVote and AppendEntries RPCs using the same length-prefixed
- * protobuf MessageEnvelope framing as client traffic. This is a deliberate
- * design choice: Raft peer connections reuse the existing ClientHandler on
- * the remote broker, so no separate port or server is needed for peer
- * communication.
  */
 public class RaftPeer {
     private static final Logger logger = LoggerFactory.getLogger(RaftPeer.class);

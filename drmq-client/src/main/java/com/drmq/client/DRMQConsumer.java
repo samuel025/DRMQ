@@ -296,12 +296,10 @@ public class DRMQConsumer implements AutoCloseable {
     public void subscribe(String topic) throws IOException {
         ensureConnectedWithRetry();
         if (groupMode) {
-            // In group mode, the broker manages offsets — just register the topic
-            topicOffsets.put(topic, -1L); // sentinel: broker will assign
+            topicOffsets.put(topic, -1L); 
             logger.info("Subscribed to topic '{}' in group mode (group='{}', consumerId='{}')",
                     topic, consumerGroup, consumerId);
         } else {
-            // In single mode, default to 0 if no offset is provided.
             topicOffsets.put(topic, 0L);
             logger.info("Subscribed to topic '{}' from offset 0 (Single Mode)", topic);
         }
