@@ -1,52 +1,87 @@
 import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router-dom';
-import { LayoutDashboard, Book, Server } from 'lucide-react';
+import { LayoutDashboard, Book, Server, ChevronRight } from 'lucide-react';
 import Dashboard from './pages/Dashboard';
-import Documentation from './pages/Documentation';
 import { useClusterTelemetry } from './useClusterTelemetry';
 
 function Sidebar({ telemetryState }: { telemetryState: any }) {
   const location = useLocation();
-  
   const metrics = telemetryState?.metrics;
   const healthColor = metrics?.health === 'OPTIMAL' ? '#10b981' : metrics?.health === 'DEGRADED' ? '#f59e0b' : '#ef4444';
 
+  const navItems = [
+    { to: '/', icon: LayoutDashboard, label: 'Telemetry' },
+    { to: '/docs', icon: Book, label: 'Documentation' },
+  ];
+
   return (
-    <aside className="w-16 lg:w-60 shrink-0 bg-[#080d18]/90 border-r border-white/5 flex flex-col z-10 h-full">
+    <aside className="w-16 lg:w-[220px] shrink-0 flex flex-col z-10 h-full"
+      style={{
+        background: 'linear-gradient(180deg, rgba(7,10,18,0.95), rgba(0,0,0,0.98))',
+        borderRight: '1px solid rgba(255,255,255,0.04)',
+      }}>
+
       {/* Logo */}
-      <div className="px-4 py-5 flex items-center gap-3 border-b border-white/5">
-        <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-500 to-purple-600 flex items-center justify-center shrink-0 shadow-[0_0_16px_rgba(6,182,212,0.4)]">
+      <div className="px-4 py-5 flex items-center gap-3" style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+        <div className="w-8 h-8 rounded-xl flex items-center justify-center shrink-0"
+          style={{
+            background: 'linear-gradient(135deg, #52525b, #3f3f46)',
+            boxShadow: '0 0 20px rgba(113,113,122,0.25)',
+          }}>
           <Server className="w-4 h-4 text-white" />
         </div>
         <div className="hidden lg:block">
-          <h1 className="text-sm font-black tracking-widest text-white">DRMQ</h1>
-          <p className="text-[9px] text-cyan-500 uppercase tracking-[0.2em] font-semibold">Message Broker</p>
+          <h1 className="text-sm font-black tracking-[0.15em] text-white">DRMQ</h1>
+          <p className="text-[9px] uppercase tracking-[0.2em] font-semibold"
+            style={{ color: '#a1a1aa' }}>Message Broker</p>
         </div>
       </div>
 
-      {/* Nav */}
+      {/* Navigation */}
       <nav className="flex-1 p-3 space-y-1">
-        <Link to="/" aria-label="Telemetry"
-          className={`flex items-center justify-center lg:justify-start gap-3 px-3 py-2.5 rounded-lg text-sm transition-all ${
-            location.pathname === '/' ? 'bg-cyan-500/10 text-white border border-cyan-500/20'
-                   : 'text-zinc-500 hover:text-zinc-300 hover:bg-white/5'}`}>
-          <LayoutDashboard className={`w-4 h-4 shrink-0 ${location.pathname === '/' ? 'text-cyan-400' : ''}`} />
-          <span className="hidden lg:block font-medium tracking-wide">Telemetry</span>
-        </Link>
-        <Link to="/docs" aria-label="Documentation"
-          className={`flex items-center justify-center lg:justify-start gap-3 px-3 py-2.5 rounded-lg text-sm transition-all ${
-            location.pathname === '/docs' ? 'bg-cyan-500/10 text-white border border-cyan-500/20'
-                   : 'text-zinc-500 hover:text-zinc-300 hover:bg-white/5'}`}>
-          <Book className={`w-4 h-4 shrink-0 ${location.pathname === '/docs' ? 'text-cyan-400' : ''}`} />
-          <span className="hidden lg:block font-medium tracking-wide">Documentation</span>
-        </Link>
+        {navItems.map(({ to, icon: Icon, label }) => {
+          const active = location.pathname === to;
+          return (
+            <Link key={to} to={to} aria-label={label}
+              className="flex items-center justify-center lg:justify-start gap-3 px-3 py-2.5 rounded-xl text-sm transition-all duration-200 cursor-pointer group"
+              style={active ? {
+                background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.1)',
+                color: '#fff',
+              } : {
+                background: 'transparent',
+                border: '1px solid transparent',
+                color: '#71717a',
+              }}
+              onMouseEnter={e => {
+                if (!active) {
+                  e.currentTarget.style.color = '#a1a1aa';
+                  e.currentTarget.style.background = 'rgba(255,255,255,0.03)';
+                }
+              }}
+              onMouseLeave={e => {
+                if (!active) {
+                  e.currentTarget.style.color = '#71717a';
+                  e.currentTarget.style.background = 'transparent';
+                }
+              }}>
+              <Icon className={`w-4 h-4 shrink-0 ${active ? 'text-zinc-100' : ''}`} />
+              <span className="hidden lg:block font-medium tracking-wide">{label}</span>
+              {active && <ChevronRight className="hidden lg:block w-3 h-3 ml-auto text-zinc-500/50" />}
+            </Link>
+          );
+        })}
       </nav>
 
-      {/* Cluster status badge */}
+      {/* Cluster status */}
       {metrics && (
-        <div className="p-4 border-t border-white/5">
-          <div className="hidden lg:flex items-center gap-2 px-3 py-2 rounded-lg bg-black/30 border border-white/5">
-            <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ backgroundColor: healthColor, boxShadow: `0 0 6px ${healthColor}` }} />
-            <span className="text-[10px] font-mono text-zinc-400">Term <span className="text-white font-bold">{metrics.term}</span></span>
+        <div className="p-3" style={{ borderTop: '1px solid rgba(255,255,255,0.04)' }}>
+          <div className="hidden lg:flex items-center gap-2.5 px-3 py-2.5 rounded-xl"
+            style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)' }}>
+            <span className="w-1.5 h-1.5 rounded-full animate-pulse"
+              style={{ backgroundColor: healthColor, boxShadow: `0 0 6px ${healthColor}` }} />
+            <span className="mono text-[10px] text-zinc-500">
+              Term <span className="text-white font-bold">{metrics.term}</span>
+            </span>
           </div>
         </div>
       )}
@@ -58,12 +93,11 @@ export default function App() {
   const { data: telemetryState, error: telemetryError } = useClusterTelemetry();
   return (
     <BrowserRouter>
-      <div className="h-screen bg-[#06080f] flex text-zinc-300 font-sans overflow-hidden">
+      <div className="h-screen flex overflow-hidden" style={{ background: '#000', color: '#d4d4d8', fontFamily: "'Inter', sans-serif" }}>
         <Sidebar telemetryState={telemetryState} />
         <main className="flex-1 min-w-0 overflow-y-auto">
           <Routes>
             <Route path="/" element={<Dashboard telemetryState={telemetryState} telemetryError={telemetryError} />} />
-            <Route path="/docs" element={<Documentation />} />
           </Routes>
         </main>
       </div>

@@ -1,368 +1,261 @@
-import { Activity, Zap, Users, AlertTriangle, HardDrive } from 'lucide-react';
+import { Activity, Zap, Users, AlertTriangle, HardDrive, Clock, Radio, GitBranch, Wifi, Camera, XCircle } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
-// ─── Sub-components ───────────────────────────────────────────────────────────
+import ClusterTopology from '../components/ClusterTopology';
+import { StatCard, SparkLine, Panel, LabeledProgress, formatNum } from '../components/DashboardWidgets';
+import type { ClusterEvent } from '../types/telemetry';
 
-function HexagonNode({ x, y, color, label, subLabel, status }: any) {
-  const isLeader    = status === 'LEADER';
-  const isCandidate = status === 'CANDIDATE';
-  const points      = '50,5 95,27 95,73 50,95 5,73 5,27';
-  const innerPoints = '50,22 80,38 80,62 50,78 20,62 20,38';
-  const glowId      = `glow-${color.replace('#', '')}`;
+/* ── Event Icon Map ──────────────────────────────────────────────────── */
+const EVENT_ICON: Record<ClusterEvent['type'], typeof Radio> = {
+  REPLICATION: GitBranch,
+  ELECTION: Radio,
+  CONNECTION: Wifi,
+  SNAPSHOT: Camera,
+  ERROR: XCircle,
+};
+const EVENT_COLOR: Record<ClusterEvent['severity'], string> = {
+  info: '#3f3f46',
+  warn: '#f59e0b',
+  error: '#ef4444',
+};
 
-  return (
-    <g transform={`translate(${x - 50}, ${y - 55})`}>
-      <motion.g initial={{ scale: 0, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} transition={{ type: 'spring', stiffness: 100, damping: 15 }}>
-        <filter id={glowId}>
-          <feGaussianBlur stdDeviation={isLeader ? '10' : '5'} result="blur" />
-          <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
-        </filter>
-
-        {isLeader && (
-          <motion.circle cx="50" cy="50" r="62" fill="none" stroke={color} strokeWidth="1"
-            initial={{ scale: 0.8, opacity: 0.7 }} animate={{ scale: 1.6, opacity: 0 }}
-            transition={{ repeat: Infinity, duration: 2.2, ease: 'easeOut' }} />
-        )}
-        {isCandidate && (
-          <motion.circle cx="50" cy="50" r="60" fill="none" stroke="#f59e0b" strokeWidth="1"
-            animate={{ opacity: [0.8, 0.1, 0.8] }} transition={{ repeat: Infinity, duration: 1 }} />
-        )}
-
-        <polygon points={points} fill="#08101a" stroke={color} strokeWidth={isLeader ? '2.5' : '1.5'} filter={`url(#${glowId})`} />
-        <motion.polygon points={innerPoints} fill={color}
-          animate={{ opacity: isLeader ? [0.35, 0.75, 0.35] : isCandidate ? [0.5, 0.9, 0.5] : 0.2 }}
-          transition={{ repeat: Infinity, duration: isLeader ? 2.5 : 1 }} />
-
-        <text x="50" y="128" textAnchor="middle" fill="#ffffff" fontSize="11" fontFamily="monospace" fontWeight="bold" letterSpacing="1">{label}</text>
-        <text x="50" y="144" textAnchor="middle" fill={color} fontSize="9" fontFamily="monospace">{subLabel}</text>
-
-        {isLeader && (
-          <motion.text x="50" y="-12" textAnchor="middle" fill="#06b6d4" fontSize="9" fontFamily="monospace" fontWeight="bold"
-            animate={{ y: [-14, -10, -14] }} transition={{ repeat: Infinity, duration: 1.5 }}>
-            ★ LEADER
-          </motion.text>
-        )}
-        {isCandidate && (
-          <text x="50" y="-12" textAnchor="middle" fill="#f59e0b" fontSize="9" fontFamily="monospace" fontWeight="bold">CANDIDATE</text>
-        )}
-      </motion.g>
-    </g>
-  );
+function timeAgo(ts: number): string {
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 5) return 'just now';
+  if (s < 60) return `${s}s ago`;
+  return `${Math.floor(s / 60)}m ago`;
 }
 
-function Particle({ path, color, delay, duration, reverse }: any) {
-  return (
-    <g>
-      <path d={path} fill="none" stroke={color} strokeWidth="1" strokeDasharray="4 8" opacity="0.25" />
-      <g>
-        {reverse
-          ? <animateMotion dur={`${duration}s`} repeatCount="indefinite" begin={`${delay}s`} keyPoints="1;0" keyTimes="0;1" calcMode="linear" path={path} />
-          : <animateMotion dur={`${duration}s`} repeatCount="indefinite" begin={`${delay}s`} path={path} />
-        }
-        <circle r="2.5" fill="#fff" opacity="0.9" />
-        <circle r="5" fill={color} opacity="0.4" />
-      </g>
-    </g>
-  );
-}
+/* ═══════════════════════════════════════════════════════════════════════
+   Dashboard Page
+   ═══════════════════════════════════════════════════════════════════════ */
+export default function Dashboard({ telemetryState, telemetryError }: { telemetryState: any; telemetryError?: string | null }) {
 
-function StatCard({ icon: Icon, label, value, unit, color = '#06b6d4', sub }: any) {
-  return (
-    <div className="bg-[#0b1120]/80 border border-white/5 rounded-xl p-4 flex flex-col gap-1 shadow-lg hover:border-white/10 transition-colors">
-      <div className="flex items-center justify-between mb-1">
-        <span className="text-[9px] font-bold tracking-[0.2em] text-zinc-500 uppercase">{label}</span>
-        <Icon className="w-3.5 h-3.5" style={{ color }} />
-      </div>
-      <div className="text-2xl font-light text-white flex items-baseline gap-1.5">
-        {value}
-        {unit && <span className="text-xs font-mono text-zinc-500">{unit}</span>}
-      </div>
-      {sub && <div className="text-[10px] text-zinc-600 font-mono">{sub}</div>}
-    </div>
-  );
-}
-
-function SparkLine({ data, color }: { data: number[]; color: string }) {
-  if (!data || data.length < 2) return null;
-  const w = 100, h = 36;
-  const max = Math.max(...data, 1);
-  const step = w / (data.length - 1);
-  let path = `M 0 ${h - (data[0] / max) * h}`;
-  for (let i = 1; i < data.length; i++) {
-    const x = i * step;
-    const y = h - (data[i] / max) * h;
-    const px = (i - 1) * step;
-    const py = h - (data[i - 1] / max) * h;
-    path += ` C ${px + step / 2} ${py}, ${x - step / 2} ${y}, ${x} ${y}`;
-  }
-  const fill = `${path} L ${w} ${h} L 0 ${h} Z`;
-  return (
-    <svg className="w-full h-10" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none">
-      <defs>
-        <linearGradient id={`sg-${color.replace('#','')}`} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor={color} stopOpacity="0.4" />
-          <stop offset="100%" stopColor={color} stopOpacity="0" />
-        </linearGradient>
-      </defs>
-      <path d={fill} fill={`url(#sg-${color.replace('#','')})`} />
-      <path d={path} fill="none" stroke={color} strokeWidth="1.2" />
-    </svg>
-  );
-}
-
-function formatNum(n: number, decimals = 0) {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
-  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
-  return n.toFixed(decimals);
-}
-
-// ─── App ──────────────────────────────────────────────────────────────────────
-
-export default function Dashboard({ telemetryState, telemetryError }: { telemetryState: any, telemetryError?: string | null }) {
+  /* ── Error state ───────────────────────────────────────────────── */
   if (telemetryError) {
     return (
-      <div className="flex h-full bg-[#06080f] items-center justify-center">
+      <div className="flex h-full items-center justify-center" style={{ background: '#000' }}>
         <div className="flex flex-col items-center gap-4">
-          <AlertTriangle className="w-10 h-10 text-red-500" />
-          <p className="text-[10px] font-mono tracking-[0.3em] text-red-400 uppercase">{telemetryError}</p>
+          <div className="w-14 h-14 rounded-2xl flex items-center justify-center"
+            style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.2)' }}>
+            <AlertTriangle className="w-6 h-6 text-red-500" />
+          </div>
+          <p className="mono text-[10px] tracking-[0.3em] text-red-400 uppercase">{telemetryError}</p>
         </div>
       </div>
     );
   }
 
+  /* ── Loading state ─────────────────────────────────────────────── */
   if (!telemetryState) {
     return (
-      <div className="flex h-full bg-[#06080f] items-center justify-center">
-        <div className="flex flex-col items-center gap-4">
-          <motion.div animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 1.5, ease: 'linear' }}
-            className="w-10 h-10 rounded-full border-2 border-white/5 border-t-cyan-500" />
-          <p className="text-[10px] font-mono tracking-[0.3em] text-cyan-600 uppercase">Connecting to Cluster…</p>
+      <div className="flex h-full items-center justify-center" style={{ background: '#000' }}>
+        <div className="flex flex-col items-center gap-5">
+          <motion.div animate={{ rotate: 360 }}
+            transition={{ repeat: Infinity, duration: 1.2, ease: 'linear' }}
+            className="w-10 h-10 rounded-full"
+            style={{ border: '2px solid rgba(255,255,255,0.04)', borderTopColor: '#06b6d4' }} />
+          <p className="mono text-[10px] tracking-[0.3em] text-cyan-700 uppercase">Connecting to Cluster…</p>
         </div>
       </div>
     );
   }
 
-  const { nodes, metrics, latencies } = telemetryState;
-  const sortedNodes = [...nodes].sort((a, b) => a.id.localeCompare(b.id));
-  const [n1, n2, n3] = sortedNodes;
-
+  const { nodes, metrics, latencies, events = [] } = telemetryState;
+  const sortedNodes = [...nodes].sort((a: any, b: any) => a.id.localeCompare(b.id));
   const healthColor = metrics.health === 'OPTIMAL' ? '#10b981' : metrics.health === 'DEGRADED' ? '#f59e0b' : '#ef4444';
+  const leaderName = nodes.find((n: any) => n.status === 'LEADER')?.name ?? 'No Leader';
 
   return (
-    <div className="flex-1 flex flex-col min-w-0 p-3 gap-3 overflow-hidden h-full">
+    <div className="flex flex-col h-full p-3 gap-3 overflow-hidden" style={{ background: '#000' }}>
 
-        {/* Header */}
-        <header className="h-14 shrink-0 bg-[#080d18]/80 border border-white/5 rounded-xl flex items-center justify-between px-6">
-          <div className="flex items-center gap-3">
-            <span className="w-2 h-2 rounded-full animate-pulse" style={{ backgroundColor: healthColor, boxShadow: `0 0 8px ${healthColor}` }} />
-            <span className="text-xs font-bold tracking-widest text-white uppercase">Live Telemetry</span>
-            <span className="text-zinc-700 text-xs">/</span>
-            <span className="text-xs font-mono text-zinc-500">
-              {nodes.find((n: any) => n.status === 'LEADER')?.name ?? 'No Leader'}
-            </span>
-          </div>
-          <div className="flex items-center gap-3">
-            <span className={`text-[9px] font-bold tracking-widest px-3 py-1 rounded-full border ${
-              metrics.health === 'OPTIMAL'  ? 'text-emerald-400 border-emerald-500/30 bg-emerald-500/10' :
-              metrics.health === 'DEGRADED' ? 'text-amber-400   border-amber-500/30   bg-amber-500/10'   :
-                                              'text-red-400     border-red-500/30     bg-red-500/10'
-            }`}>{metrics.health}</span>
-            <span className="text-[10px] font-mono text-zinc-600 border border-white/5 px-2 py-1 rounded bg-black/30">
-              {metrics.logSegments} segments · {metrics.topicCount} topics
-            </span>
-          </div>
-        </header>
+      {/* ── Header ────────────────────────────────────────────────── */}
+      <header className="glass-panel h-14 shrink-0 flex items-center justify-between px-6">
+        <div className="flex items-center gap-3">
+          <div className="live-dot" style={{ backgroundColor: healthColor, boxShadow: `0 0 8px ${healthColor}` }} />
+          <span className="text-[11px] font-bold tracking-[0.15em] text-white uppercase">Live Telemetry</span>
+          <span className="text-zinc-700 text-xs select-none">/</span>
+          <span className="mono text-[11px] text-zinc-500">{leaderName}</span>
+        </div>
+        <div className="flex items-center gap-2.5">
+          <span className={`mono text-[9px] font-bold tracking-[0.12em] px-3 py-1 rounded-md border ${
+            metrics.health === 'OPTIMAL'  ? 'text-emerald-400 border-emerald-500/20 bg-emerald-500/8' :
+            metrics.health === 'DEGRADED' ? 'text-amber-400 border-amber-500/20 bg-amber-500/8' :
+                                            'text-red-400 border-red-500/20 bg-red-500/8'
+          }`}>{metrics.health}</span>
+          <span className="mono text-[10px] text-zinc-600 bg-white/[0.03] border border-white/5 px-2.5 py-1 rounded-md">
+            {metrics.logSegments} seg · {metrics.topicCount} topics
+          </span>
+        </div>
+      </header>
 
-        {/* Body */}
-        <div className="flex-1 flex gap-3 min-h-0">
+      {/* ── Body ──────────────────────────────────────────────────── */}
+      <div className="flex-1 flex gap-3 min-h-0">
 
-          {/* ── Left: Canvas + Quick stats ──────────────────────────────── */}
-          <div className="flex-[3] flex flex-col gap-3 min-h-0 min-w-0">
+        {/* Left column: topology + stats */}
+        <div className="flex-[3] flex flex-col gap-3 min-h-0 min-w-0">
 
-            {/* Cluster Topology Canvas */}
-            <div className="flex-1 bg-[#080d18]/80 border border-white/5 rounded-xl overflow-hidden relative min-h-0">
-              <div className="absolute inset-0 bg-[linear-gradient(to_right,#ffffff04_1px,transparent_1px),linear-gradient(to_bottom,#ffffff04_1px,transparent_1px)] bg-[size:36px_36px]" />
-              <svg className="w-full h-full" viewBox="0 0 1000 700" preserveAspectRatio="xMidYMid meet">
-                <defs>
-                  <filter id="pglow"><feGaussianBlur stdDeviation="2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
-                  <linearGradient id="lg1" x1="0%" y1="0%" x2="100%" y2="100%">
-                    <stop offset="0%" stopColor="#06b6d4" stopOpacity="0.7" />
-                    <stop offset="100%" stopColor="#a855f7" stopOpacity="0.7" />
-                  </linearGradient>
-                </defs>
+          {/* Cluster topology (draggable + clickable) */}
+          <ClusterTopology nodes={nodes} metrics={metrics} latencies={latencies} />
 
-                {/* Edges */}
-                {n1 && n2 && (<g>
-                  <path d={`M ${n1.x} ${n1.y} L ${n2.x} ${n2.y}`} fill="none" stroke="url(#lg1)" strokeWidth="1.5" strokeDasharray="5 7" opacity="0.3" />
-                  {metrics.produceRate > 0 && <Particle path={`M ${n1.x} ${n1.y} L ${n2.x} ${n2.y}`} color="#06b6d4" delay={0} duration={1.8} />}
-                  {metrics.consumeRate > 0 && <Particle path={`M ${n1.x} ${n1.y} L ${n2.x} ${n2.y}`} color="#a855f7" delay={0.9} duration={1.8} reverse />}
-                  {(latencies.raftRpcMs > 0) && (
-                    <text x={(n1.x + n2.x) / 2 - 20} y={(n1.y + n2.y) / 2 - 12} fill="#4b5563" fontSize="11" fontFamily="monospace">
-                      {latencies.raftRpcMs.toFixed(1)}ms
-                    </text>
-                  )}
-                </g>)}
-                {n2 && n3 && (<g>
-                  <path d={`M ${n2.x} ${n2.y} L ${n3.x} ${n3.y}`} fill="none" stroke="url(#lg1)" strokeWidth="1.5" strokeDasharray="5 7" opacity="0.3" />
-                  {metrics.produceRate > 0 && <Particle path={`M ${n2.x} ${n2.y} L ${n3.x} ${n3.y}`} color="#a855f7" delay={0} duration={2.2} />}
-                  {metrics.consumeRate > 0 && <Particle path={`M ${n2.x} ${n2.y} L ${n3.x} ${n3.y}`} color="#06b6d4" delay={1.1} duration={2.2} reverse />}
-                </g>)}
-                {n1 && n3 && (<g>
-                  <path d={`M ${n1.x} ${n1.y} L ${n3.x} ${n3.y}`} fill="none" stroke="#06b6d4" strokeWidth="1.5" strokeDasharray="5 7" opacity="0.2" />
-                  {metrics.consumeRate > 0 && <Particle path={`M ${n1.x} ${n1.y} L ${n3.x} ${n3.y}`} color="#06b6d4" delay={0.4} duration={1.5} reverse />}
-                  {metrics.produceRate > 0 && <Particle path={`M ${n1.x} ${n1.y} L ${n3.x} ${n3.y}`} color="#a855f7" delay={1.0} duration={1.5} />}
-                </g>)}
-
-                {/* Nodes */}
-                {n1 && <HexagonNode x={n1.x} y={n1.y} color={n1.color} label={n1.name} status={n1.status}
-                  subLabel={`${formatNum(n1.produceRate)}/s`} />}
-                {n2 && <HexagonNode x={n2.x} y={n2.y} color={n2.color} label={n2.name} status={n2.status}
-                  subLabel={n2.replicationLag !== undefined ? `lag: ${n2.replicationLag}` : 'synced'} />}
-                {n3 && <HexagonNode x={n3.x} y={n3.y} color={n3.color} label={n3.name} status={n3.status}
-                  subLabel={n3.replicationLag !== undefined ? `lag: ${n3.replicationLag}` : 'synced'} />}
-              </svg>
-            </div>
-
-            {/* Stats row */}
-            <div className="shrink-0 grid grid-cols-5 gap-3">
-              <StatCard icon={Zap}           label="Produce Rate"     value={formatNum(metrics.produceRate)}    unit="msg/s"  color="#06b6d4"
-                sub={`${metrics.produceThroughputMB.toFixed(2)} MB/s`} />
-              <StatCard icon={Activity}      label="Consume Rate"     value={formatNum(metrics.consumeRate)}    unit="msg/s"  color="#a855f7"
-                sub={`${metrics.consumeThroughputMB.toFixed(2)} MB/s`} />
-              <StatCard icon={Users}         label="Connections"      value={metrics.totalConnections}          color="#f59e0b"
-                sub={`${metrics.activeProducers}P · ${metrics.activeConsumers}C`} />
-              <StatCard icon={HardDrive}     label="Global Offset"    value={formatNum(metrics.globalOffset)}   color="#10b981"
-                sub={`${metrics.logSegments} segments`} />
-              <StatCard icon={AlertTriangle} label="Error Rate"       value={metrics.errorRate}                 unit="err/s"
-                color={metrics.errorRate > 0 ? '#ef4444' : '#4b5563'}
-                sub={metrics.errorRate > 0 ? 'check logs' : 'clean'} />
-            </div>
-          </div>
-
-          {/* ── Right Panel ──────────────────────────────────────────────── */}
-          <div className="w-72 shrink-0 flex flex-col gap-3 min-h-0">
-
-            {/* Health */}
-            <div className="bg-[#080d18]/80 border border-white/5 rounded-xl p-5 shrink-0 relative overflow-hidden">
-              <div className="absolute top-0 right-0 w-28 h-28 rounded-full blur-[40px] opacity-20 pointer-events-none"
-                style={{ backgroundColor: healthColor }} />
-              <h3 className="text-[9px] font-bold tracking-[0.25em] text-zinc-600 uppercase mb-3">System Health</h3>
-              <div className="flex items-center justify-between mb-4">
-                <div>
-                  <div className="text-xl font-black tracking-widest" style={{ color: healthColor }}>{metrics.health}</div>
-                  <div className="text-[10px] text-zinc-600 font-mono mt-0.5">Term {metrics.term}</div>
-                </div>
-                <div className="w-10 h-10 rounded-full flex items-center justify-center border" style={{ borderColor: `${healthColor}40`, backgroundColor: `${healthColor}15` }}>
-                  <div className="w-3.5 h-3.5 rounded-full animate-pulse" style={{ backgroundColor: healthColor }} />
-                </div>
-              </div>
-
-              {/* Follower Sync */}
-              <div>
-                <div className="flex justify-between text-[10px] mb-1.5">
-                  <span className="text-zinc-500">Follower Sync</span>
-                  <span className="font-mono font-bold" style={{ color: metrics.followerSync >= 95 ? '#10b981' : '#f59e0b' }}>
-                    {metrics.followerSync}%
-                  </span>
-                </div>
-                <div className="h-1.5 bg-black/50 rounded-full overflow-hidden border border-white/5">
-                  <motion.div className="h-full rounded-full"
-                    style={{ backgroundColor: metrics.followerSync >= 95 ? '#10b981' : '#f59e0b' }}
-                    initial={{ width: 0 }} animate={{ width: `${metrics.followerSync}%` }} transition={{ duration: 0.8 }} />
-                </div>
-              </div>
-
-              {/* Commit index */}
-              <div className="mt-3 pt-3 border-t border-white/5 grid grid-cols-2 gap-2 text-[10px] font-mono">
-                <div>
-                  <div className="text-zinc-600">Commit Index</div>
-                  <div className="text-zinc-300 font-bold">{formatNum(metrics.commitIndex)}</div>
-                </div>
-                <div>
-                  <div className="text-zinc-600">Last Applied</div>
-                  <div className="text-zinc-300 font-bold">{formatNum(metrics.lastApplied)}</div>
-                </div>
-              </div>
-            </div>
-
-            {/* Latency card */}
-            <div className="bg-[#080d18]/80 border border-white/5 rounded-xl p-5 shrink-0">
-              <h3 className="text-[9px] font-bold tracking-[0.25em] text-zinc-600 uppercase mb-3">Latency</h3>
-              <div className="space-y-3">
-                {[
-                  { label: 'Produce p50',  value: metrics.produceLatencyMs, color: '#06b6d4', max: 50 },
-                  { label: 'Consume p50',  value: metrics.consumeLatencyMs, color: '#a855f7', max: 50 },
-                  { label: 'Raft RPC',     value: latencies.raftRpcMs,      color: '#f59e0b', max: 20 },
-                ].map(({ label, value, color, max }) => (
-                  <div key={label}>
-                    <div className="flex justify-between text-[10px] mb-1">
-                      <span className="text-zinc-500">{label}</span>
-                      <span className="font-mono font-bold" style={{ color }}>
-                        {value > 0 ? `${value.toFixed(2)}ms` : '--'}
-                      </span>
-                    </div>
-                    <div className="h-1 bg-black/50 rounded-full overflow-hidden">
-                      <motion.div className="h-full rounded-full"
-                        style={{ backgroundColor: color }}
-                        initial={{ width: 0 }} animate={{ width: `${Math.min(100, (value / max) * 100)}%` }} transition={{ duration: 0.6 }} />
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* Throughput chart */}
-            <div className="bg-[#080d18]/80 border border-white/5 rounded-xl p-5 flex-1 flex flex-col min-h-0">
-              <div className="flex justify-between items-center mb-3">
-                <h3 className="text-[9px] font-bold tracking-[0.25em] text-zinc-600 uppercase">I/O Throughput</h3>
-                <div className="flex items-center gap-1.5 text-[9px] font-mono text-cyan-500 bg-cyan-500/10 px-2 py-0.5 rounded border border-cyan-500/20">
-                  <span className="w-1 h-1 rounded-full bg-cyan-500 animate-pulse" />LIVE
-                </div>
-              </div>
-              <div className="text-2xl font-light text-white mb-1">
-                {metrics.totalThroughputMB.toFixed(2)} <span className="text-xs text-zinc-500 font-mono">MB/s</span>
-              </div>
-              <div className="text-[10px] text-zinc-600 font-mono mb-3">
-                ↑ {metrics.produceThroughputMB.toFixed(2)} produce · ↓ {metrics.consumeThroughputMB.toFixed(2)} consume
-              </div>
-              <div className="flex-1 min-h-0">
-                <SparkLine data={metrics.throughputHistory} color="#06b6d4" />
-              </div>
-            </div>
-
-            {/* Broker Roster */}
-            <div className="bg-[#080d18]/80 border border-white/5 rounded-xl p-5 shrink-0">
-              <h3 className="text-[9px] font-bold tracking-[0.25em] text-zinc-600 uppercase mb-3">Broker State</h3>
-              <div className="space-y-2">
-                <AnimatePresence>
-                  {sortedNodes.map(node => (
-                    <motion.div key={node.id}
-                      initial={{ opacity: 0, x: 16 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -16 }}
-                      className="flex justify-between items-center bg-black/30 px-3 py-2.5 rounded-lg border border-white/5">
-                      <div className="flex items-center gap-2.5">
-                        <div className="w-1.5 h-1.5 rounded-full" style={{
-                          backgroundColor: node.color,
-                          boxShadow: node.status === 'LEADER' ? `0 0 6px ${node.color}` : undefined
-                        }} />
-                        <span className="text-xs font-semibold text-zinc-300">{node.name}</span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        {node.replicationLag !== undefined && node.replicationLag > 0 && (
-                          <span className="text-[8px] font-mono text-amber-400">+{node.replicationLag}</span>
-                        )}
-                        <span className={`text-[8px] font-mono font-bold px-2 py-0.5 rounded border ${
-                          node.status === 'LEADER'    ? 'bg-cyan-500/10   text-cyan-400   border-cyan-500/30'   :
-                          node.status === 'CANDIDATE' ? 'bg-amber-500/10  text-amber-400  border-amber-500/30'  :
-                                                        'bg-zinc-800      text-zinc-500   border-zinc-700'
-                        }`}>{node.status}</span>
-                      </div>
-                    </motion.div>
-                  ))}
-                </AnimatePresence>
-              </div>
-            </div>
-
+          {/* Stats grid */}
+          <div className="shrink-0 grid grid-cols-5 gap-2.5">
+            <StatCard icon={Zap} label="Produce Rate"
+              value={formatNum(metrics.produceRate)} unit="msg/s" color="#06b6d4"
+              sub={`${metrics.produceThroughputMB.toFixed(2)} MB/s`} />
+            <StatCard icon={Activity} label="Consume Rate"
+              value={formatNum(metrics.consumeRate)} unit="msg/s" color="#a855f7"
+              sub={`${metrics.consumeThroughputMB.toFixed(2)} MB/s`} />
+            <StatCard icon={Users} label="Connections"
+              value={metrics.totalConnections} color="#f59e0b"
+              sub={`${metrics.activeProducers}P · ${metrics.activeConsumers}C`} />
+            <StatCard icon={HardDrive} label="Global Offset"
+              value={formatNum(metrics.globalOffset)} color="#10b981"
+              sub={`${metrics.logSegments} segments`} />
+            <StatCard icon={AlertTriangle} label="Error Rate"
+              value={metrics.errorRate} unit="err/s"
+              color={metrics.errorRate > 0 ? '#ef4444' : '#3f3f46'}
+              sub={metrics.errorRate > 0 ? 'check logs' : 'clean'} />
           </div>
         </div>
+
+        {/* ── Right panel ───────────────────────────────────────── */}
+        <div className="w-[280px] shrink-0 flex flex-col gap-2.5 min-h-0 overflow-y-auto">
+
+          {/* System Health */}
+          <Panel title="System Health" className="shrink-0 relative overflow-hidden">
+            <div className="absolute top-0 right-0 w-32 h-32 rounded-full blur-[50px] opacity-15 pointer-events-none"
+              style={{ backgroundColor: healthColor }} />
+            <div className="flex items-center justify-between mb-4 relative z-10">
+              <div>
+                <div className="text-xl font-extrabold tracking-widest" style={{ color: healthColor }}>
+                  {metrics.health}
+                </div>
+                <div className="mono text-[10px] text-zinc-600 mt-0.5">Term {metrics.term}</div>
+              </div>
+              <div className="w-11 h-11 rounded-xl flex items-center justify-center"
+                style={{ background: `${healthColor}12`, border: `1px solid ${healthColor}25` }}>
+                <div className="live-dot" style={{ backgroundColor: healthColor }} />
+              </div>
+            </div>
+            <div className="relative z-10">
+              <div className="flex justify-between text-[10px] mb-1.5">
+                <span className="text-zinc-500 font-medium">Follower Sync</span>
+                <span className="mono font-bold" style={{ color: metrics.followerSync >= 95 ? '#10b981' : '#f59e0b' }}>
+                  {metrics.followerSync}%
+                </span>
+              </div>
+              <div className="progress-track">
+                <motion.div className="progress-fill"
+                  style={{ backgroundColor: metrics.followerSync >= 95 ? '#10b981' : '#f59e0b' }}
+                  initial={{ width: 0 }} animate={{ width: `${metrics.followerSync}%` }}
+                  transition={{ duration: 0.8 }} />
+              </div>
+            </div>
+            <div className="mt-4 pt-3 border-t border-white/5 grid grid-cols-2 gap-3 text-[10px] mono relative z-10">
+              <div>
+                <div className="text-zinc-600 mb-0.5">Commit Index</div>
+                <div className="text-zinc-200 font-bold text-sm">{formatNum(metrics.commitIndex)}</div>
+              </div>
+              <div>
+                <div className="text-zinc-600 mb-0.5">Last Applied</div>
+                <div className="text-zinc-200 font-bold text-sm">{formatNum(metrics.lastApplied)}</div>
+              </div>
+            </div>
+          </Panel>
+
+          {/* Latency */}
+          <Panel title="Latency" badge={
+            <div className="flex items-center gap-1.5 mono text-[9px] text-zinc-600">
+              <Clock className="w-3 h-3" />p50
+            </div>
+          } className="shrink-0">
+            <div className="space-y-3">
+              <LabeledProgress label="Produce" value={metrics.produceLatencyMs} max={50} color="#06b6d4" suffix="ms" />
+              <LabeledProgress label="Consume" value={metrics.consumeLatencyMs} max={50} color="#a855f7" suffix="ms" />
+              <LabeledProgress label="Raft RPC" value={latencies.raftRpcMs} max={20} color="#f59e0b" suffix="ms" />
+            </div>
+          </Panel>
+
+          {/* I/O Throughput */}
+          <Panel title="I/O Throughput" badge={
+            <div className="flex items-center gap-1.5 mono text-[9px] text-cyan-500 bg-cyan-500/8 px-2 py-0.5 rounded border border-cyan-500/15">
+              <span className="live-dot" style={{ backgroundColor: '#06b6d4', width: 4, height: 4 }} />
+              LIVE
+            </div>
+          } className="shrink-0">
+            <div className="text-2xl font-semibold text-white tracking-tight mb-0.5">
+              {metrics.totalThroughputMB.toFixed(2)} <span className="mono text-xs text-zinc-500">MB/s</span>
+            </div>
+            <div className="mono text-[10px] text-zinc-600 mb-3">
+              ↑ {metrics.produceThroughputMB.toFixed(2)} · ↓ {metrics.consumeThroughputMB.toFixed(2)}
+            </div>
+            <SparkLine data={metrics.throughputHistory} color="#06b6d4" height={48} />
+          </Panel>
+
+          {/* Broker Roster */}
+          <Panel title="Broker Roster" className="shrink-0">
+            <div className="space-y-2">
+              <AnimatePresence>
+                {sortedNodes.map((node: any) => (
+                  <motion.div key={node.id}
+                    initial={{ opacity: 0, x: 12 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -12 }}
+                    className="flex justify-between items-center bg-white/[0.02] px-3 py-2.5 rounded-lg border border-white/[0.04] hover:border-white/[0.08] transition-colors cursor-default">
+                    <div className="flex items-center gap-2.5">
+                      <div className="w-[5px] h-[5px] rounded-full shrink-0"
+                        style={{ backgroundColor: node.color,
+                          boxShadow: node.status === 'LEADER' ? `0 0 6px ${node.color}` : undefined }} />
+                      <span className="text-xs font-semibold text-zinc-300">{node.name}</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {node.replicationLag !== undefined && node.replicationLag < 0 && (
+                        <span className="mono text-[8px] text-red-400">offline</span>
+                      )}
+                      {node.replicationLag !== undefined && node.replicationLag > 0 && (
+                        <span className="mono text-[8px] text-amber-400">+{node.replicationLag}</span>
+                      )}
+                      <span className={`node-badge ${
+                        node.status === 'LEADER' ? 'node-badge--leader' :
+                        node.status === 'CANDIDATE' ? 'node-badge--candidate' : 'node-badge--follower'
+                      }`}>{node.status}</span>
+                    </div>
+                  </motion.div>
+                ))}
+              </AnimatePresence>
+            </div>
+          </Panel>
+
+          {/* ── Event Feed ─────────────────────────────────────────── */}
+          <Panel title="Activity Feed" badge={
+            <span className="mono text-[9px] text-zinc-600">{events.length} events</span>
+          } className="flex-1 flex flex-col min-h-[400px]">
+            <div className="flex-1 overflow-y-auto space-y-1 pr-1 -mr-1">
+              <AnimatePresence initial={false}>
+                {(events as ClusterEvent[]).slice(0, 20).map((evt) => {
+                  const Icon = EVENT_ICON[evt.type] || Radio;
+                  const borderColor = EVENT_COLOR[evt.severity];
+                  return (
+                    <motion.div key={evt.id}
+                      initial={{ opacity: 0, height: 0, y: -4 }}
+                      animate={{ opacity: 1, height: 'auto', y: 0 }}
+                      exit={{ opacity: 0, height: 0 }}
+                      transition={{ duration: 0.2 }}
+                      className="flex items-start gap-2.5 py-2 border-b border-white/[0.03] last:border-0">
+                      <div className="w-5 h-5 rounded-md flex items-center justify-center shrink-0 mt-0.5"
+                        style={{ background: `${borderColor}12`, border: `1px solid ${borderColor}20` }}>
+                        <Icon className="w-2.5 h-2.5" style={{ color: borderColor }} />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-[10px] text-zinc-400 leading-relaxed truncate">{evt.message}</p>
+                        <span className="mono text-[8px] text-zinc-700">{timeAgo(evt.timestamp)}</span>
+                      </div>
+                    </motion.div>
+                  );
+                })}
+              </AnimatePresence>
+            </div>
+          </Panel>
+        </div>
+      </div>
     </div>
   );
 }

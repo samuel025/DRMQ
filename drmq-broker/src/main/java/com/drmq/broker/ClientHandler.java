@@ -1,6 +1,7 @@
 package com.drmq.broker;
 
 import com.drmq.broker.raft.RaftNode;
+import com.drmq.broker.ClusterEventBuffer;
 import com.drmq.protocol.DRMQProtocol.*;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
@@ -45,12 +46,14 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
         }
         BrokerMetrics.get().recordConnectionOpened();
         logger.info("Client connected: {}", ctx.channel().remoteAddress());
+        ClusterEventBuffer.emitConnection(String.format("Client connected from %s", ctx.channel().remoteAddress()));
     }
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) {
         BrokerMetrics.get().recordConnectionClosed();
         logger.info("Client disconnected: {}", ctx.channel().remoteAddress());
+        ClusterEventBuffer.emitConnection(String.format("Client disconnected: %s", ctx.channel().remoteAddress()));
     }
 
     @Override

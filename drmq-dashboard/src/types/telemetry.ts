@@ -54,10 +54,20 @@ export interface Latencies {
   raftRpcMs: number;   // real Raft RPC mean latency
 }
 
+export interface ClusterEvent {
+  id: string;
+  timestamp: number;
+  type: 'REPLICATION' | 'ELECTION' | 'ERROR' | 'SNAPSHOT' | 'CONNECTION';
+  message: string;
+  nodeId?: string;
+  severity: 'info' | 'warn' | 'error';
+}
+
 export interface TelemetryState {
   nodes: BrokerNode[];
   metrics: ClusterMetrics;
   latencies: Latencies;
+  events: ClusterEvent[];
 }
 
 export type TelemetryCallback = (state: TelemetryState) => void;

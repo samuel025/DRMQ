@@ -2,6 +2,7 @@ package com.drmq.broker.raft;
 
 import com.drmq.broker.MessageStore;
 import com.drmq.broker.OffsetManager;
+import com.drmq.broker.ClusterEventBuffer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -67,6 +68,7 @@ public class SnapshotManager {
 
         logger.info("Created snapshot {} (size: {} bytes, took: {} ms)", 
                 zipFile.getFileName(), Files.size(zipFile), System.currentTimeMillis() - startMs);
+        ClusterEventBuffer.emitSnapshot(String.format("Snapshot created at index %d", lastIncludedIndex), null);
 
         cleanupOldSnapshots(snapshotsDir, zipFile);
         

@@ -105,6 +105,15 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
 
   /**
    * Merge all latest frames into one coherent TelemetryState.
+   *
+   * Key invariants:
+   *  - Metrics (throughput, activeProducers, activeConsumers) come ONLY from
+   *    the leader frame. Followers don't receive client traffic, so their
+   *    counts are meaningless for the cluster-level view.
+   *  - Node list is a union of all frames, with each broker's self-report
+   *    preferred for its own entry (most accurate), but replicationLag from
+   *    the leader preserved via merge.
+   *  - followerSync uses a fixed scale: 0 lag = 100%, ≥1000 lag = 0%.
    */
   private merge(): TelemetryState {
     const frames = Array.from(this.latestFrames.values());
@@ -118,10 +127,11 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
           health: 'CRITICAL', term: 0, commitIndex: 0, lastApplied: 0, followerSync: 0,
           globalOffset: 0, topicCount: 0, logSegments: 0, cachedMessages: 0, throughputHistory: []
         },
-        latencies: { alphaBeta: 0, betaGamma: 0, raftRpcMs: 0 }
+        latencies: { alphaBeta: 0, betaGamma: 0, raftRpcMs: 0 },
+        events: [],
       };
     }
-    if (frames.length === 1) return frames[0];
+    if (frames.length === 1) return { ...frames[0], events: frames[0].events ?? [] };
 
     // Find the most authoritative frame (leader with highest term)
     const maxTerm = Math.max(...frames.map(f => f.metrics.term ?? 0));
@@ -129,30 +139,36 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
                      ?? frames.find(f => f.nodes[0]?.status === 'LEADER')
                      ?? frames[0];
 
+    // ── 1. Build unified node list ────────────────────────────────────────────
     const nodeMap = new Map<string, BrokerNode>();
 
-    // First pass: use the authoritative frame to set the baseline for all nodes
+    // First pass: use the authoritative (leader) frame to set baseline for all nodes.
+    // This gives us the leader's replicationLag computation for each follower.
     for (const node of leaderFrame.nodes) {
       nodeMap.set(node.id, { ...node });
     }
 
-    // Second pass: add any missing nodes from other frames (just in case)
+    // Second pass: add any nodes that only appear in non-leader frames
     for (const frame of frames) {
       for (const node of frame.nodes) {
         if (!nodeMap.has(node.id)) nodeMap.set(node.id, { ...node });
       }
     }
 
-    // Third pass: overwrite with each broker's own self-report, BUT
-    // downgrade stale leaders to followers to prevent multi-leader ghosting.
+    // Third pass: overwrite with each broker's own self-report for status
+    // accuracy, BUT merge with the leader's data to preserve replicationLag.
+    // Downgrade stale leaders to followers to prevent multi-leader ghosting.
     for (const frame of frames) {
       const local = frame.nodes[0];
       if (local) {
+        const existingNode = nodeMap.get(local.id) || {};
         const isStaleLeader = local.status === 'LEADER' && (frame.metrics.term ?? 0) < maxTerm;
-        const nodeToStore = isStaleLeader 
-          ? { ...local, status: 'FOLLOWER' as const, color: '#a855f7' } 
-          : local;
-        nodeMap.set(local.id, nodeToStore);
+        // Spread existing first (preserves leader-computed replicationLag),
+        // then overlay with local's self-report (more accurate status/throughput)
+        const nodeToStore = isStaleLeader
+          ? { ...existingNode, ...local, status: 'FOLLOWER' as const, color: '#a855f7' }
+          : { ...existingNode, ...local };
+        nodeMap.set(local.id, nodeToStore as BrokerNode);
       }
     }
 
@@ -163,24 +179,48 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
       ...WebSocketTelemetryProvider.POSITIONS[i] ?? { x: 500, y: 500 },
     }));
 
+    // ── 2. Metrics: exclusively from the leader frame ─────────────────────────
+    // This prevents doubling of activeProducers/activeConsumers when multiple
+    // surviving brokers each report their own Netty connection count.
     const metrics: ClusterMetrics = { ...leaderFrame.metrics };
 
-    // If we have more frames, compute the real follower sync from merged node
-    // matchIndexes vs the leader commit index.
+    // Recompute followerSync with a FIXED scale (not proportional to commitIndex).
+    // Scale: 0 lag = 100%, 1000+ lag = 0%.
+    // Skip unreachable followers (replicationLag=-1 or commitIndex=0 when leader is far ahead).
+    const LAG_FULL_SCALE = 1000;
     const leaderCommit = metrics.commitIndex;
     if (leaderCommit > 0 && nodes.length > 1) {
-      const followers = nodes.filter(n => n.status !== 'LEADER');
-      if (followers.length > 0) {
-        const maxLag = Math.max(...followers.map(n => leaderCommit - (n.commitIndex ?? 0)));
+      const reachableFollowers = nodes.filter(n =>
+        n.status !== 'LEADER' &&
+        (n.replicationLag === undefined || n.replicationLag >= 0) &&
+        (n.commitIndex ?? 0) > 0
+      );
+      if (reachableFollowers.length > 0) {
+        const maxLag = Math.max(...reachableFollowers.map(n => Math.max(0, leaderCommit - (n.commitIndex ?? 0))));
         metrics.followerSync = Math.max(0, Math.min(100,
-          Math.round(100 - (maxLag / leaderCommit) * 100)
+          Math.round(100 - (maxLag / LAG_FULL_SCALE) * 100)
         ));
+      } else {
+        // All followers are unreachable — show 0% sync
+        const hasUnreachable = nodes.some(n => n.status !== 'LEADER' && (n.replicationLag !== undefined && n.replicationLag < 0));
+        metrics.followerSync = hasUnreachable ? 0 : 100;
       }
     }
 
     // ── 3. Latencies from leader ─────────────────────────────────────────────
     const latencies: Latencies = leaderFrame.latencies;
 
-    return { nodes, metrics, latencies };
+    // ── 4. Merge events from all frames, deduplicate by id ───────────────────
+    const eventMap = new Map<string, any>();
+    for (const frame of frames) {
+      for (const evt of (frame.events ?? [])) {
+        eventMap.set(evt.id, evt);
+      }
+    }
+    const events = Array.from(eventMap.values())
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, 50);
+
+    return { nodes, metrics, latencies, events };
   }
 }
