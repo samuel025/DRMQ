@@ -1,6 +1,6 @@
 # DRMQ - Distributed Reliable Message Queue
 
-**Official Documentation:** [https://drmq-web.vercel.app](https://drmq-web.vercel.app)
+**Official Documentation:** [https://drmq.vercel.app](https://drmq.vercel.app)
 
 DRMQ is a fault-tolerant, high-performance distributed message broker built from first principles. It provides guaranteed message delivery, strict ordering, and high availability through the implementation of the Raft consensus algorithm for log replication and leader election. DRMQ supports scalable consumption via multi-consumer groups — multiple consumers can share a group to load-balance message processing without partitions.
 
