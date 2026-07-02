@@ -5,6 +5,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
+import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
@@ -38,6 +39,8 @@ public class ConsumerGroupCoordinator implements Closeable {
     private final OffsetManager offsetManager;
     private final RaftNode raftNode;
     private final long leaseTimeoutMs;
+    private final int maxDeliveries;
+    private final String dlqTopicPrefix;
 
     /** group/topic → GroupTopicState */
     private final ConcurrentHashMap<String, GroupTopicState> groupStates = new ConcurrentHashMap<>();
@@ -45,19 +48,27 @@ public class ConsumerGroupCoordinator implements Closeable {
     private final ScheduledExecutorService leaseReaper;
 
     public ConsumerGroupCoordinator(MessageStore messageStore, OffsetManager offsetManager) {
-        this(messageStore, offsetManager, null, DEFAULT_LEASE_TIMEOUT_MS);
+        this(messageStore, offsetManager, null, DEFAULT_LEASE_TIMEOUT_MS, 5, "dlq.");
     }
 
     public ConsumerGroupCoordinator(MessageStore messageStore, OffsetManager offsetManager, long leaseTimeoutMs) {
-        this(messageStore, offsetManager, null, leaseTimeoutMs);
+        this(messageStore, offsetManager, null, leaseTimeoutMs, 5, "dlq.");
     }
 
     public ConsumerGroupCoordinator(MessageStore messageStore, OffsetManager offsetManager,
                                      RaftNode raftNode, long leaseTimeoutMs) {
+        this(messageStore, offsetManager, raftNode, leaseTimeoutMs, 5, "dlq.");
+    }
+
+    public ConsumerGroupCoordinator(MessageStore messageStore, OffsetManager offsetManager,
+                                     RaftNode raftNode, long leaseTimeoutMs,
+                                     int maxDeliveries, String dlqTopicPrefix) {
         this.messageStore = messageStore;
         this.offsetManager = offsetManager;
         this.raftNode = raftNode;
         this.leaseTimeoutMs = leaseTimeoutMs;
+        this.maxDeliveries = maxDeliveries > 0 ? maxDeliveries : 5;
+        this.dlqTopicPrefix = dlqTopicPrefix != null ? dlqTopicPrefix : "dlq.";
 
         this.leaseReaper = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "lease-reaper");
@@ -207,13 +218,18 @@ public class ConsumerGroupCoordinator implements Closeable {
 
     /**
      * Periodic task: expire leases that have not been committed in time.
-     * Rewinds the dispatch offset so the expired range can be re-dispatched.
+     * Increments delivery counts and routes to DLQ if max deliveries exceeded,
+     * otherwise rewinds the dispatch offset so the expired range can be re-dispatched.
      */
     void expireLeases() {
         long now = System.currentTimeMillis();
 
         for (Map.Entry<String, GroupTopicState> entry : groupStates.entrySet()) {
             GroupTopicState state = entry.getValue();
+            String[] parts = parseGroupKey(entry.getKey());
+            String group = parts[0];
+            String topic = parts[1];
+
             state.lock.lock();
             try {
                 Iterator<Map.Entry<String, Lease>> it = state.activeLeases.entrySet().iterator();
@@ -222,10 +238,19 @@ public class ConsumerGroupCoordinator implements Closeable {
                     Lease lease = leaseEntry.getValue();
 
                     if (now >= lease.expiresAt) {
-                        logger.warn("Lease expired for consumer {} in {}: offsets [{}, {}). Rewinding dispatch offset.",
-                                leaseEntry.getKey(), entry.getKey(), lease.fromOffset, lease.toOffset);
-                        if (lease.fromOffset < state.dispatchOffset) {
-                            state.dispatchOffset = lease.fromOffset;
+                        long badOffset = lease.fromOffset;
+                        int attempts = state.deliveryCounts.merge(badOffset, 1, Integer::sum);
+
+                        logger.warn("Lease expired for consumer {} in {}: offsets [{}, {}). Attempt {} of {}.",
+                                leaseEntry.getKey(), entry.getKey(), lease.fromOffset, lease.toOffset,
+                                attempts, maxDeliveries);
+
+                        if (attempts >= maxDeliveries) {
+                            routeToDlq(state, group, topic, badOffset);
+                        } else {
+                            if (lease.fromOffset < state.dispatchOffset) {
+                                state.dispatchOffset = lease.fromOffset;
+                            }
                         }
                         state.members.remove(leaseEntry.getKey());
                         it.remove();
@@ -263,6 +288,115 @@ public class ConsumerGroupCoordinator implements Closeable {
         return total;
     }
 
+    // ---- Dead-Letter Queue (DLQ) Support ----
+
+    /**
+     * Explicitly reject (NACK) a message offset for a consumer within a group.
+     * Increments the delivery count for the offset. If the count exceeds
+     * {@code maxDeliveries}, the message is routed to the DLQ topic and the
+     * consumer group advances past it. Otherwise, the offset is rewound for
+     * immediate redelivery.
+     *
+     * @param group      the consumer group name
+     * @param topic      the topic
+     * @param consumerId the consumer instance ID
+     * @param offset     the offset of the message being rejected
+     * @return true if the message was routed to the DLQ, false if it was requeued
+     */
+    public boolean nackOffset(String group, String topic, String consumerId, long offset) {
+        String key = groupKey(group, topic);
+        GroupTopicState state = groupStates.get(key);
+
+        if (state == null) {
+            logger.warn("NACK for unknown group state: group={}, topic={}, offset={}", group, topic, offset);
+            return false;
+        }
+
+        state.lock.lock();
+        try {
+            // Remove the consumer's active lease
+            Lease lease = state.activeLeases.remove(consumerId);
+            if (lease != null) {
+                state.members.remove(consumerId);
+            }
+
+            int attempts = state.deliveryCounts.merge(offset, 1, Integer::sum);
+            logger.info("NACK received: group={}, topic={}, consumer={}, offset={}, attempt {} of {}",
+                    group, topic, consumerId, offset, attempts, maxDeliveries);
+
+            if (attempts >= maxDeliveries) {
+                routeToDlq(state, group, topic, offset);
+                return true;
+            } else {
+                // Rewind for redelivery
+                if (offset < state.dispatchOffset) {
+                    state.dispatchOffset = offset;
+                }
+                return false;
+            }
+        } finally {
+            state.lock.unlock();
+        }
+    }
+
+    /**
+     * Route a poison message to the Dead-Letter Queue topic.
+     * Fetches the original message, produces it to the DLQ topic, then
+     * advances the consumer group past the bad offset.
+     *
+     * Must be called while holding state.lock.
+     */
+    private void routeToDlq(GroupTopicState state, String group, String topic, long badOffset) {
+        String dlqTopic = dlqTopicPrefix + group + "." + topic;
+
+        try {
+            List<StoredMessage> messages = messageStore.getMessages(topic, badOffset, 1);
+            if (!messages.isEmpty()) {
+                StoredMessage original = messages.get(0);
+                byte[] payload = original.getPayload().toByteArray();
+                String key = original.hasKey() ? original.getKey() : null;
+
+                if (raftNode != null && raftNode.isLeader()) {
+                    raftNode.propose(dlqTopic, payload, key, original.getTimestamp());
+                } else {
+                    messageStore.append(dlqTopic, payload, key, original.getTimestamp());
+                }
+
+                logger.warn("Routed poison message to DLQ: offset={} from topic={} -> {}",
+                        badOffset, topic, dlqTopic);
+            } else {
+                logger.error("Failed to fetch poison message for DLQ routing: topic={}, offset={}",
+                        topic, badOffset);
+            }
+        } catch (IOException e) {
+            logger.error("Failed to route message to DLQ topic {}: {}", dlqTopic, e.getMessage(), e);
+        }
+
+        // Advance past the bad offset regardless — don't let a DLQ write failure block progress
+        long nextOffset = badOffset + 1;
+        state.committedRanges.add(new CommittedRange(badOffset, nextOffset));
+        advanceCommittedOffset(state, group, topic);
+        if (state.dispatchOffset <= badOffset) {
+            state.dispatchOffset = nextOffset;
+        }
+
+        // Clean up the delivery counter for this offset
+        state.deliveryCounts.remove(badOffset);
+    }
+
+    /**
+     * Build the DLQ topic name for a given group and topic.
+     */
+    public String getDlqTopicName(String group, String topic) {
+        return dlqTopicPrefix + group + "." + topic;
+    }
+
+    /** Parse a "group/topic" key back into its components. */
+    private static String[] parseGroupKey(String key) {
+        int idx = key.indexOf('/');
+        return new String[]{ key.substring(0, idx), key.substring(idx + 1) };
+    }
+
     @Override
     public void close() {
         leaseReaper.shutdownNow();
@@ -296,6 +430,9 @@ public class ConsumerGroupCoordinator implements Closeable {
 
         /** All consumer IDs currently participating in this group/topic. */
         final Set<String> members = new LinkedHashSet<>();
+
+        /** Delivery attempt counts per offset for DLQ tracking. */
+        final Map<Long, Integer> deliveryCounts = new HashMap<>();
 
         GroupTopicState(long startOffset) {
             this.dispatchOffset = startOffset;

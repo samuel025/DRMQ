@@ -22,10 +22,13 @@ public class BrokerConfig {
     private long logSegmentBytes;
     private long logRetentionMs;
     private final long raftCompactThreshold;
+    private final int maxDeliveries;
+    private final String dlqTopicPrefix;
 
     public BrokerConfig(String nodeId, int port, String dataDir, List<PeerAddress> peers,
                         boolean metricsEnabled, int metricsPort, String metricsPath,
-                        long logSegmentBytes, long logRetentionMs, long raftCompactThreshold) {
+                        long logSegmentBytes, long logRetentionMs, long raftCompactThreshold,
+                        int maxDeliveries, String dlqTopicPrefix) {
         this.nodeId = nodeId;
         this.port = port;
         this.dataDir = dataDir;
@@ -36,17 +39,19 @@ public class BrokerConfig {
         this.logSegmentBytes = logSegmentBytes;
         this.logRetentionMs = logRetentionMs;
         this.raftCompactThreshold = raftCompactThreshold;
+        this.maxDeliveries = maxDeliveries > 0 ? maxDeliveries : 5;
+        this.dlqTopicPrefix = dlqTopicPrefix != null ? dlqTopicPrefix : "dlq.";
     }
 
     public BrokerConfig(String nodeId, int port, String dataDir, List<PeerAddress> peers) {
         this(nodeId, port, dataDir, peers, true, 9096, "/metrics", 
-             100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L);
+             100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.");
     }
 
     /** Single-node config (backward compatible) */
     public BrokerConfig(int port, String dataDir) {
         this("standalone", port, dataDir, List.of(), true, 9096, "/metrics",
-             100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L);
+             100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.");
     }
 
     public String getNodeId() { return nodeId; }
@@ -59,6 +64,8 @@ public class BrokerConfig {
     public long getLogSegmentBytes() { return logSegmentBytes; }
     public long getLogRetentionMs() { return logRetentionMs; }
     public long getRaftCompactThreshold() { return raftCompactThreshold; }
+    public int getMaxDeliveries() { return maxDeliveries; }
+    public String getDlqTopicPrefix() { return dlqTopicPrefix; }
 
     public void setLogSegmentBytes(long logSegmentBytes) {
         if (logSegmentBytes <= 0) {
@@ -94,6 +101,8 @@ public class BrokerConfig {
      *   --log-segment-bytes <bytes>
      *   --log-retention-ms <ms>
      *   --raft-compact-threshold <count>
+     *   --max-deliveries <count>
+     *   --dlq-topic-prefix <prefix>
      */
     public static BrokerConfig fromArgs(String[] args) {
         String nodeId = "standalone";
@@ -106,6 +115,8 @@ public class BrokerConfig {
         long logSegmentBytes = 100 * 1024 * 1024L; // 100MB
         long logRetentionMs = 7L * 24 * 60 * 60 * 1000; // 7 days
         long raftCompactThreshold = 1000L;
+        int maxDeliveries = 5;
+        String dlqTopicPrefix = "dlq.";
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
@@ -125,6 +136,8 @@ public class BrokerConfig {
                 case "--log-segment-bytes" -> logSegmentBytes = parseLongArg(args, ++i, "--log-segment-bytes");
                 case "--log-retention-ms" -> logRetentionMs = parseLongArg(args, ++i, "--log-retention-ms");
                 case "--raft-compact-threshold" -> raftCompactThreshold = parseLongArg(args, ++i, "--raft-compact-threshold");
+                case "--max-deliveries" -> maxDeliveries = (int) parseLongArg(args, ++i, "--max-deliveries");
+                case "--dlq-topic-prefix" -> dlqTopicPrefix = args[++i];
                 default -> {
                     if (i == 0) {
                         try {
@@ -140,7 +153,8 @@ public class BrokerConfig {
         }
 
         return new BrokerConfig(nodeId, port, dataDir, peers, metricsEnabled, metricsPort, metricsPath,
-                                logSegmentBytes, logRetentionMs, raftCompactThreshold);
+                                logSegmentBytes, logRetentionMs, raftCompactThreshold,
+                                maxDeliveries, dlqTopicPrefix);
     }
 
     private static boolean parseBooleanArg(String[] args, int index, String flag) {

@@ -106,7 +106,8 @@ public class BrokerServer {
         }
 
         this.groupCoordinator = new ConsumerGroupCoordinator(messageStore, offsetManager,
-                raftNode, ConsumerGroupCoordinator.DEFAULT_LEASE_TIMEOUT_MS);
+                raftNode, ConsumerGroupCoordinator.DEFAULT_LEASE_TIMEOUT_MS,
+                config.getMaxDeliveries(), config.getDlqTopicPrefix());
 
         metrics.registerBroker(activeChannels::size, messageStore, offsetManager, logManager, raftNode);
     }

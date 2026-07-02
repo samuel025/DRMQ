@@ -10,7 +10,9 @@ import {
   CommitOffsetRequest,
   CommitOffsetResponse,
   FetchOffsetRequest,
-  FetchOffsetResponse
+  FetchOffsetResponse,
+  NackRequest,
+  NackResponse
 } from './messages';
 
 export class DRMQConnectionError extends Error {
@@ -352,5 +354,40 @@ export class DRMQConsumer extends DRMQClient {
         await this.reconnect();
       }
     }
+  }
+
+  public async nack(topic: string, offset: number): Promise<boolean> {
+    for (let attempt = 0; attempt < this.maxRetries; attempt++) {
+      try {
+        await this.ensureConnected();
+        const req = NackRequest.create({
+          consumerGroup: this.groupId || "single-mode-external",
+          topic,
+          offset,
+          consumerId: this.groupMode ? this.consumerId : undefined
+        });
+
+        const respBytes = await this.sendEnvelope(
+          MessageType.NACK_REQUEST,
+          NackRequest.encode(req).finish()
+        );
+
+        const resp = NackResponse.decode(respBytes);
+        
+        if (resp.success) {
+          return resp.routedToDlq;
+        } else if (await this.tryRedirectToLeader(resp.errorMessage)) {
+          continue;
+        } else {
+          throw new DRMQConnectionError(`NACK failed: ${resp.errorMessage}`);
+        }
+      } catch (err) {
+        if (err instanceof DRMQConnectionError && err.message.includes("NACK failed")) {
+          throw err;
+        }
+        await this.reconnect();
+      }
+    }
+    throw new DRMQConnectionError(`Failed to nack message after ${this.maxRetries} attempts`);
   }
 }

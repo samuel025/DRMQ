@@ -265,6 +265,38 @@ class DRMQConsumer(DRMQClient):
             except Exception:
                 self._reconnect()
 
+    def nack(self, topic: str, offset: int) -> bool:
+        """
+        Explicitly reject (NACK) an offset back to the broker.
+        Returns True if the message was routed to the DLQ, False if it was requeued.
+        """
+        for attempt in range(self.max_retries):
+            try:
+                self._ensure_connected()
+                req = pb.NackRequest()
+                req.consumer_group = self.group_id or "single-mode-external"
+                req.topic = topic
+                req.offset = offset
+                if self.group_mode:
+                    req.consumer_id = self.consumer_id
+                
+                resp_payload = self._send_envelope(pb.MessageType.NACK_REQUEST, req.SerializeToString())
+                resp = pb.NackResponse()
+                resp.ParseFromString(resp_payload)
+                
+                if resp.success:
+                    return resp.routed_to_dlq
+                elif self._try_redirect_to_leader(resp.error_message):
+                    continue
+                else:
+                    raise DRMQConnectionError(f"NACK failed: {resp.error_message}")
+                    
+            except Exception as e:
+                if isinstance(e, DRMQConnectionError) and "NACK failed" in str(e):
+                    raise
+                self._reconnect()
+        return False
+
 # ==========================================
 # Example Usage 
 # ==========================================

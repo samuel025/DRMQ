@@ -79,6 +79,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
             case CONSUME_REQUEST -> handleConsumeRequest(envelope);
             case COMMIT_OFFSET_REQUEST -> handleCommitOffsetRequest(envelope);
             case FETCH_OFFSET_REQUEST -> handleFetchOffsetRequest(envelope);
+            case NACK_REQUEST -> handleNackRequest(envelope);
             case REQUEST_VOTE_REQUEST -> handleRequestVoteRequest(envelope);
             case PRE_VOTE_REQUEST -> handlePreVoteRequest(envelope);
             case APPEND_ENTRIES_REQUEST -> handleAppendEntriesRequest(envelope);
@@ -237,6 +238,69 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
                 .build();
     }
 
+    private MessageEnvelope handleNackRequest(MessageEnvelope envelope) throws IOException {
+        long startNanos = System.nanoTime();
+        try {
+            NackRequest request = NackRequest.parseFrom(envelope.getPayload());
+
+            String group = request.getConsumerGroup();
+            String topic = request.getTopic();
+            long offset = request.getOffset();
+            String consumerId = request.hasConsumerId() ? request.getConsumerId() : group;
+
+            if (groupCoordinator == null) {
+                BrokerMetrics.get().recordRequest("nack", false,
+                        System.nanoTime() - startNanos, 0, 0);
+                return createNackErrorResponse("Consumer group coordination not available");
+            }
+
+            if (raftNode != null && !raftNode.isLeader()) {
+                String leaderAddr = raftNode.getLeaderAddress();
+                BrokerMetrics.get().recordRequest("nack", false,
+                        System.nanoTime() - startNanos, 0, 0);
+                return createNackErrorResponse("NOT_LEADER:" +
+                        (leaderAddr != null ? leaderAddr : "UNKNOWN"));
+            }
+
+            boolean routedToDlq = groupCoordinator.nackOffset(group, topic, consumerId, offset);
+
+            logger.info("NACK processed: group={}, topic={}, offset={}, routedToDlq={}",
+                    group, topic, offset, routedToDlq);
+
+            NackResponse response = NackResponse.newBuilder()
+                    .setSuccess(true)
+                    .setRoutedToDlq(routedToDlq)
+                    .build();
+
+            BrokerMetrics.get().recordRequest("nack", true,
+                    System.nanoTime() - startNanos, 0, 0);
+
+            return MessageEnvelope.newBuilder()
+                    .setType(MessageType.NACK_RESPONSE)
+                    .setPayload(response.toByteString())
+                    .build();
+
+        } catch (Exception e) {
+            logger.error("Error processing NACK request", e);
+            BrokerMetrics.get().recordRequest("nack", false,
+                    System.nanoTime() - startNanos, 0, 0);
+            return createNackErrorResponse(e.getMessage());
+        }
+    }
+
+    private MessageEnvelope createNackErrorResponse(String errorMessage) {
+        NackResponse response = NackResponse.newBuilder()
+                .setSuccess(false)
+                .setRoutedToDlq(false)
+                .setErrorMessage(errorMessage != null ? errorMessage : "Unknown error")
+                .build();
+
+        return MessageEnvelope.newBuilder()
+                .setType(MessageType.NACK_RESPONSE)
+                .setPayload(response.toByteString())
+                .build();
+    }
+
     private MessageEnvelope handleCommitOffsetRequest(MessageEnvelope envelope) throws IOException {
         long startNanos = System.nanoTime();
         try {
@@ -352,6 +416,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
             case CONSUME_RESPONSE -> createConsumeErrorResponse(errorMessage);
             case COMMIT_OFFSET_RESPONSE -> createCommitOffsetErrorResponse(errorMessage);
             case FETCH_OFFSET_RESPONSE -> createFetchOffsetErrorResponse(errorMessage);
+            case NACK_RESPONSE -> createNackErrorResponse(errorMessage);
             default -> createProduceErrorResponse(errorMessage);
         };
     }
