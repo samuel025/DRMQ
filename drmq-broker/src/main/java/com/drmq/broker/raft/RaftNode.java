@@ -4,6 +4,7 @@ import com.drmq.broker.BrokerConfig.PeerAddress;
 import com.drmq.broker.BrokerMetrics;
 import com.drmq.broker.MessageStore;
 import com.drmq.broker.OffsetManager;
+import com.drmq.broker.ClusterEventBuffer;
 import com.drmq.protocol.DRMQProtocol.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -517,6 +518,7 @@ public class RaftNode {
 
         logger.info("[{}] ★ Became LEADER for term {} (lastLogIndex={}, electionMs={})",
             nodeId, currentTerm, lastLogIndex, electionDuration);
+        ClusterEventBuffer.emitElection(String.format("Broker-%s became LEADER for term %d", nodeId, currentTerm));
 
         sendHeartbeats();
 
@@ -536,6 +538,7 @@ public class RaftNode {
         boolean wasCandidate = state == RaftState.CANDIDATE;
         long oldTerm = currentTerm;
         logger.info("[{}] Stepping down: term {} → {}", nodeId, oldTerm, newTerm);
+        ClusterEventBuffer.emitElection(String.format("Broker-%s stepped down to term %d", nodeId, newTerm));
         currentTerm = newTerm;
         state = RaftState.FOLLOWER;
         votedFor = null;
@@ -769,6 +772,7 @@ public class RaftNode {
                             matchIndex.put(peer.id(), snapshotIndex);
                             logger.info("[{}] InstallSnapshot to {} succeeded. NextIndex updated to {}", 
                                 nodeId, peer.id(), snapshotIndex + 1);
+                            ClusterEventBuffer.emitSnapshot(String.format("Broker-%s installed snapshot successfully", peer.id()), peer.id());
                         }
                     } finally {
                         lock.unlock();

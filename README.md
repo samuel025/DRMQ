@@ -1,6 +1,6 @@
 # DRMQ - Distributed Reliable Message Queue
 
-**Official Documentation:** [https://drmq-web.vercel.app](https://drmq-web.vercel.app)
+**Official Documentation:** [https://drmq.vercel.app](https://drmq.vercel.app)
 
 DRMQ is a fault-tolerant, high-performance distributed message broker built from first principles. It provides guaranteed message delivery, strict ordering, and high availability through the implementation of the Raft consensus algorithm for log replication and leader election. DRMQ supports scalable consumption via multi-consumer groups — multiple consumers can share a group to load-balance message processing without partitions.
 
@@ -13,6 +13,7 @@ The project is structured as a multi-module Maven build, separating the core bro
 ## Key Features
 
 - **Scalable Consumer Groups:** Scale your consumers dynamically without the complexity of partitions. Simply start multiple consumers with the same group name, and the broker will automatically distribute messages among them. Messages are load-balanced across consumers in a group with at-least-once delivery; a lease-based protocol ensures that uncommitted messages are redelivered if a consumer fails. Need to replay or read specific messages? Switch to single mode for full manual offset control.
+- **Dead-Letter Queues (DLQ):** Gracefully handle poison pill messages. Consumers can explicitly `nack()` unprocessable messages. After a configurable threshold of delivery failures, the broker automatically routes the message to an isolated DLQ topic and advances the consumer group, preventing blockages.
 - **Raft Consensus Integration:** Full implementation of the Raft protocol for distributed state replication, leader election, and high availability. Features **Quorum-Loss Stepdown** to detect network partitions and demote isolated leaders, preventing split-brain/ghost leadership data loss.
 - **Persistent Storage:** Custom Write-Ahead Log (WAL) and segment-based message storage ensure messages are durably persisted to disk. Features thread-safe, atomic consumer offset management with bounds locking designed to minimize data loss during concurrent background writes and handle shutdowns gracefully.
 - **Graceful Teardown Coordination:** Orchestrated, safe termination of Netty EventLoops, RPC executors, and disk storage guaranteeing state integrity without resource leaks during node shutdowns.
@@ -149,6 +150,35 @@ try (DRMQConsumer consumer = new DRMQConsumer("localhost:9092", "my-group")) {
         if (!messages.isEmpty()) {
             long lastOffset = messages.get(messages.size() - 1).offset();
             consumer.commit("my-topic", lastOffset + 1);
+        }
+    }
+} catch (IOException e) {
+    e.printStackTrace();
+}
+```
+
+#### 3. Dead-Letter Queues (DLQ) & Explicit NACK
+
+If a consumer encounters a "poison pill" (a message that always causes a crash or fails validation), it can explicitly reject it using `nack()`. If a message fails too many times (default 5), the broker will automatically route it to a DLQ topic (e.g., `dlq.my-group.my-topic`) so it doesn't block the rest of the queue.
+
+```java
+try (DRMQConsumer consumer = new DRMQConsumer("localhost:9092", "order-processors")) {
+    consumer.connect();
+    consumer.subscribe("orders");
+
+    while (true) {
+        List<DRMQConsumer.ConsumedMessage> messages = consumer.poll();
+        for (DRMQConsumer.ConsumedMessage msg : messages) {
+            try {
+                processOrder(msg); // Your business logic
+                consumer.commit("orders", msg.offset() + 1); 
+            } catch (Exception e) {
+                // Explicitly reject the message on failure
+                boolean routedToDlq = consumer.nack("orders", msg.offset());
+                if (routedToDlq) {
+                    System.err.println("Poison pill routed to DLQ: " + msg.offset());
+                }
+            }
         }
     }
 } catch (IOException e) {

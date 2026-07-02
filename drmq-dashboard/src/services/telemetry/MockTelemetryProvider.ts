@@ -1,9 +1,37 @@
-import type { TelemetryProvider, TelemetryCallback, TelemetryState } from '../../types/telemetry';
+import type { TelemetryProvider, TelemetryCallback, TelemetryState, ClusterEvent } from '../../types/telemetry';
+
+const EVENT_TEMPLATES: Array<{ type: ClusterEvent['type']; severity: ClusterEvent['severity']; messages: string[] }> = [
+  { type: 'REPLICATION', severity: 'info', messages: [
+    'AppendEntries replicated to {node}',
+    '{node} caught up to commit index',
+    'Batch replicated 128 entries to {node}',
+  ]},
+  { type: 'ELECTION', severity: 'warn', messages: [
+    'Heartbeat timeout — {node} starting election',
+    '{node} voted for Broker-1 in term {term}',
+    'Leader re-elected in term {term}',
+  ]},
+  { type: 'SNAPSHOT', severity: 'info', messages: [
+    'Snapshot triggered at index {offset}',
+    '{node} installed snapshot successfully',
+    'Log compacted — removed 3 segments',
+  ]},
+  { type: 'CONNECTION', severity: 'info', messages: [
+    'Producer connected from 192.168.1.{ip}',
+    'Consumer group "analytics" joined',
+    'Client disconnected gracefully',
+  ]},
+  { type: 'ERROR', severity: 'error', messages: [
+    'Produce timeout on partition 0',
+    'Replication stalled to {node}',
+  ]},
+];
 
 export class MockTelemetryProvider implements TelemetryProvider {
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private state: TelemetryState;
   private tick = 0;
+  private eventCounter = 0;
 
   constructor() {
     this.state = {
@@ -38,14 +66,19 @@ export class MockTelemetryProvider implements TelemetryProvider {
         ),
       },
       latencies: { alphaBeta: 3.2, betaGamma: 2.8, raftRpcMs: 3.2 },
+      events: [],
     };
   }
 
   connect(onData: TelemetryCallback, _onError?: (error: string) => void): void {
+    // Seed a few initial events
+    for (let i = 0; i < 5; i++) {
+      this.state.events.push(this.generateEvent());
+    }
     onData(this.state);
     this.intervalId = setInterval(() => {
       this.simulateTick();
-      onData({ ...this.state, metrics: { ...this.state.metrics } });
+      onData({ ...this.state, metrics: { ...this.state.metrics }, events: [...this.state.events] });
     }, 1000);
   }
 
@@ -54,6 +87,27 @@ export class MockTelemetryProvider implements TelemetryProvider {
       clearInterval(this.intervalId);
       this.intervalId = null;
     }
+  }
+
+  private generateEvent(): ClusterEvent {
+    const template = EVENT_TEMPLATES[Math.floor(Math.random() * EVENT_TEMPLATES.length)];
+    const msg = template.messages[Math.floor(Math.random() * template.messages.length)];
+    const nodes = ['Broker-2', 'Broker-3'];
+    const node = nodes[Math.floor(Math.random() * nodes.length)];
+    const formatted = msg
+      .replace('{node}', node)
+      .replace('{term}', String(this.state.metrics.term))
+      .replace('{offset}', String(this.state.metrics.globalOffset))
+      .replace('{ip}', String(Math.floor(Math.random() * 254) + 1));
+
+    return {
+      id: `evt-${++this.eventCounter}`,
+      timestamp: Date.now() - Math.floor(Math.random() * 2000),
+      type: template.type,
+      severity: template.severity,
+      message: formatted,
+      nodeId: node.toLowerCase().replace('-', ''),
+    };
   }
 
   private simulateTick() {
@@ -112,5 +166,10 @@ export class MockTelemetryProvider implements TelemetryProvider {
       alphaBeta: Math.max(0.5, latencies.alphaBeta  + (Math.random() - 0.5) * 0.5),
       betaGamma: Math.max(0.5, latencies.betaGamma  + (Math.random() - 0.5) * 0.5),
     };
+
+    // Generate 0-2 events per tick
+    if (Math.random() < 0.6) {
+      this.state.events = [this.generateEvent(), ...this.state.events].slice(0, 50);
+    }
   }
 }

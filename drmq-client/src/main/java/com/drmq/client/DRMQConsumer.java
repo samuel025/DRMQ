@@ -296,12 +296,10 @@ public class DRMQConsumer implements AutoCloseable {
     public void subscribe(String topic) throws IOException {
         ensureConnectedWithRetry();
         if (groupMode) {
-            // In group mode, the broker manages offsets — just register the topic
-            topicOffsets.put(topic, -1L); // sentinel: broker will assign
+            topicOffsets.put(topic, -1L); 
             logger.info("Subscribed to topic '{}' in group mode (group='{}', consumerId='{}')",
                     topic, consumerGroup, consumerId);
         } else {
-            // In single mode, default to 0 if no offset is provided.
             topicOffsets.put(topic, 0L);
             logger.info("Subscribed to topic '{}' from offset 0 (Single Mode)", topic);
         }
@@ -384,6 +382,26 @@ public class DRMQConsumer implements AutoCloseable {
         topicOffsets.put(topic, offset);
         commitOffsetToBroker(topic, offset);
         logger.debug("Manually committed offset {} for topic '{}'", offset, topic);
+    }
+
+    /**
+     * Explicitly reject (NACK) a specific offset for a topic.
+     * This signals the broker that processing failed. The broker will either
+     * redeliver the message to another consumer or route it to the Dead-Letter Queue
+     * if the maximum delivery attempts threshold has been reached.
+     */
+    public boolean nack(String topic, long offset) throws IOException {
+        if (!groupMode) {
+            throw new IllegalStateException("NACK is only supported in consumer group mode");
+        }
+        ensureConnectedWithRetry();
+        boolean routedToDlq = nackOffsetToBrokerWithRetry(topic, offset, MAX_RETRIES);
+        if (routedToDlq) {
+            logger.info("NACKed offset {} for topic '{}' - message routed to DLQ", offset, topic);
+        } else {
+            logger.debug("NACKed offset {} for topic '{}' - message requeued", offset, topic);
+        }
+        return routedToDlq;
     }
 
     public long getCurrentOffset(String topic) {
@@ -529,9 +547,68 @@ public class DRMQConsumer implements AutoCloseable {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Message fetching
-    // -------------------------------------------------------------------------
+    private boolean nackOffsetToBrokerWithRetry(String topic, long offset, int retriesLeft) throws IOException {
+        IOException lastException = null;
+
+        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+            try {
+                ensureConnectedWithRetry();
+                return nackOffsetToBrokerInternal(topic, offset);
+            } catch (IOException e) {
+                lastException = e;
+                logger.warn("Failed to NACK offset {} for topic '{}' to {}:{} (attempt {}/{}): {}",
+                        offset, topic, host, port, attempt + 1, MAX_RETRIES, e.getMessage());
+                closeConnection();
+                rotateToNextServer();
+                try { Thread.sleep(RECONNECT_DELAY_MS); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted during NACK retry", ie);
+                }
+            }
+        }
+
+        logger.error("Failed to NACK offset {} for topic '{}' after {} attempts", offset, topic, MAX_RETRIES);
+        throw new IOException("Failed to NACK offset after " + MAX_RETRIES + " attempts: " +
+                (lastException != null ? lastException.getMessage() : "unknown error"));
+    }
+
+    private boolean nackOffsetToBrokerInternal(String topic, long offset) throws IOException {
+        NackRequest.Builder requestBuilder = NackRequest.newBuilder()
+                .setTopic(topic)
+                .setOffset(offset);
+
+        if (consumerGroup != null) {
+            requestBuilder.setConsumerGroup(consumerGroup);
+        }
+
+        if (groupMode) {
+            requestBuilder.setConsumerId(consumerId);
+        }
+
+        NackRequest request = requestBuilder.build();
+
+        MessageEnvelope envelope = MessageEnvelope.newBuilder()
+                .setType(MessageType.NACK_REQUEST)
+                .setPayload(request.toByteString())
+                .build();
+
+        sendEnvelope(envelope);
+
+        MessageEnvelope responseEnvelope = receiveEnvelope();
+        NackResponse response = NackResponse.parseFrom(responseEnvelope.getPayload());
+
+        if (!response.getSuccess()) {
+            if (tryRedirectToLeader(response.getErrorMessage())) {
+                return nackOffsetToBrokerInternal(topic, offset);
+            }
+            logger.warn("Failed to NACK offset {} for topic '{}': {}", offset, topic, response.getErrorMessage());
+            throw new IOException("NACK failed: " + response.getErrorMessage());
+        }
+        
+        return response.getRoutedToDlq();
+    }
+
+
 
     private List<ConsumedMessage> fetchMessages(String topic, long fromOffset, int maxMessages) throws IOException {
         return fetchMessages(topic, fromOffset, maxMessages, 0);
@@ -614,9 +691,7 @@ public class DRMQConsumer implements AutoCloseable {
         return messages;
     }
 
-    // -------------------------------------------------------------------------
-    // Low-level transport helpers
-    // -------------------------------------------------------------------------
+
 
     private void sendEnvelope(MessageEnvelope envelope) throws IOException {
         byte[] bytes = envelope.toByteArray();

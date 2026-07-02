@@ -75,6 +75,23 @@ message FetchOffsetResponse {
     string error_message = 3;
 }
 
+// --- Dead-Letter Queue (DLQ) support ---
+
+// Request to negatively acknowledge (NACK) a message, triggering redelivery or DLQ routing
+message NackRequest {
+    string consumer_group = 1;
+    string topic = 2;
+    int64 offset = 3;                  // The offset of the message being rejected
+    optional string consumer_id = 4;   // Consumer instance ID (for group coordination)
+}
+
+// Response to a NACK request
+message NackResponse {
+    bool success = 1;
+    bool routed_to_dlq = 2;            // True if the message was sent to the DLQ instead of being requeued
+    string error_message = 3;
+}
+
 // Envelope for TCP framing - wraps all messages with type info
 message MessageEnvelope {
     MessageType type = 1;
@@ -179,4 +196,6 @@ enum MessageType {
     PRE_VOTE_RESPONSE = 15;
     INSTALL_SNAPSHOT_REQUEST = 16;
     INSTALL_SNAPSHOT_RESPONSE = 17;
+    NACK_REQUEST = 18;
+    NACK_RESPONSE = 19;
 }

@@ -174,18 +174,33 @@ public class TelemetryWebSocketServer extends WebSocketServer {
 
         // Active connections: real handler count from Netty
         int totalHandlers = brokerServer.getActiveChannelsCount();
+        
+        // Estimate client connections by subtracting internal ones (1 WS + roughly 1-2 per peer)
+        int peerCount = raftNode != null ? raftNode.getPeerIds().size() : 0;
+        int assumedInternal = 1 + peerCount; // conservative estimate for dead/alive peers
+        int clientConns = Math.max(0, totalHandlers - assumedInternal);
+
         // Real request rate gives us the producer/consumer split
         long totalRequests = Math.round(currentProduceRecordRate + currentConsumeRecordRate);
-        int activeProducers, activeConsumers;
+        int activeProducers = 0, activeConsumers = 0;
+        
         if (totalRequests > 0) {
             // Weight connections by relative traffic
-            double produceFraction = currentProduceRecordRate / Math.max(1, totalRequests);
-            activeProducers = (int) Math.round(totalHandlers * produceFraction);
-            activeConsumers = Math.max(0, totalHandlers - activeProducers);
+            double produceFraction = currentProduceRecordRate / Math.max(1.0, totalRequests);
+            activeProducers = (int) Math.round(clientConns * produceFraction);
+            activeConsumers = Math.max(0, clientConns - activeProducers);
+            
+            // Guarantee at least 1 if there is active traffic
+            if (currentProduceRecordRate > 0 && activeProducers == 0) {
+                activeProducers = 1;
+                activeConsumers = Math.max(0, activeConsumers - 1);
+            }
+            if (currentConsumeRecordRate > 0 && activeConsumers == 0) {
+                activeConsumers = 1;
+                activeProducers = Math.max(0, activeProducers - 1);
+            }
         } else {
-            // No traffic yet — fall back to even split of non-Raft connections
-            int peerCount = raftNode != null ? raftNode.getPeerIds().size() : 0;
-            int clientConns = Math.max(0, totalHandlers - peerCount * 2);
+            // No traffic yet — fall back to even split
             activeProducers = clientConns / 2 + (clientConns % 2);
             activeConsumers = clientConns / 2;
         }
@@ -199,7 +214,9 @@ public class TelemetryWebSocketServer extends WebSocketServer {
         long lastApplied = raftNode != null ? raftNode.getLastApplied() : 0;
 
         // followerSync: real replication lag from matchIndex
+        // Fixed scale: 0 lag = 100%, >=1000 lag = 0%
         int followerSync = 100;
+        long LAG_FULL_SCALE = 1000;
         if (raftNode != null && raftNode.isLeader() && commitIndex > 0) {
             long maxLag = 0;
             for (String peerId : raftNode.getPeerIds()) {
@@ -207,8 +224,7 @@ public class TelemetryWebSocketServer extends WebSocketServer {
                 long lag = commitIndex - (matchIdx != null ? matchIdx : 0);
                 if (lag > maxLag) maxLag = lag;
             }
-            // 0 lag = 100%, 1000+ lag = 0%
-            followerSync = (int) Math.max(0, Math.min(100, 100 - (maxLag / Math.max(1.0, commitIndex)) * 100));
+            followerSync = (int) Math.max(0, Math.min(100, 100 - (maxLag * 100 / LAG_FULL_SCALE)));
         }
 
         String health;
@@ -284,8 +300,16 @@ public class TelemetryWebSocketServer extends WebSocketServer {
                 Long matchIdx = raftNode.getMatchIndexMap().get(peerId);
                 long peerApplied = matchIdx != null ? matchIdx : 0;
 
-                // Replication lag for this peer
-                long replicationLag = Math.max(0, commitIndex - peerApplied);
+                // Replication lag for this peer.
+                // If matchIndex is unconfirmed (null/0) and commitIndex is large,
+                // the new leader simply hasn't heard from this peer since election.
+                // Report -1 to signal "unreachable" rather than a fictitious huge lag.
+                long replicationLag;
+                if ((matchIdx == null || matchIdx == 0) && commitIndex > 100) {
+                    replicationLag = -1; // unreachable / unknown
+                } else {
+                    replicationLag = Math.max(0, commitIndex - peerApplied);
+                }
 
                 peerNode.addProperty("id",              peerId);
                 peerNode.addProperty("name",            "Broker-" + peerId.toUpperCase());
@@ -319,6 +343,9 @@ public class TelemetryWebSocketServer extends WebSocketServer {
         latencies.addProperty("betaGamma",   round2(raftRpcLatencyMs > 0 ? raftRpcLatencyMs : 0));
         latencies.addProperty("raftRpcMs",   round2(raftRpcLatencyMs));
         state.add("latencies", latencies);
+
+        // ── EVENTS ────────────────────────────────────────────────────────────
+        state.add("events", ClusterEventBuffer.get().toJsonArray());
 
         return gson.toJson(state);
     }
