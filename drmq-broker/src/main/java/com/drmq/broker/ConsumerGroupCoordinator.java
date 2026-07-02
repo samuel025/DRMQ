@@ -47,17 +47,20 @@ public class ConsumerGroupCoordinator implements Closeable {
 
     private final ScheduledExecutorService leaseReaper;
 
+    public static final int DEFAULT_MAX_DELIVERIES = 5;
+    public static final String DEFAULT_DLQ_PREFIX = "dlq.";
+
     public ConsumerGroupCoordinator(MessageStore messageStore, OffsetManager offsetManager) {
-        this(messageStore, offsetManager, null, DEFAULT_LEASE_TIMEOUT_MS, 5, "dlq.");
+        this(messageStore, offsetManager, null, DEFAULT_LEASE_TIMEOUT_MS, DEFAULT_MAX_DELIVERIES, DEFAULT_DLQ_PREFIX);
     }
 
     public ConsumerGroupCoordinator(MessageStore messageStore, OffsetManager offsetManager, long leaseTimeoutMs) {
-        this(messageStore, offsetManager, null, leaseTimeoutMs, 5, "dlq.");
+        this(messageStore, offsetManager, null, leaseTimeoutMs, DEFAULT_MAX_DELIVERIES, DEFAULT_DLQ_PREFIX);
     }
 
     public ConsumerGroupCoordinator(MessageStore messageStore, OffsetManager offsetManager,
                                      RaftNode raftNode, long leaseTimeoutMs) {
-        this(messageStore, offsetManager, raftNode, leaseTimeoutMs, 5, "dlq.");
+        this(messageStore, offsetManager, raftNode, leaseTimeoutMs, DEFAULT_MAX_DELIVERIES, DEFAULT_DLQ_PREFIX);
     }
 
     public ConsumerGroupCoordinator(MessageStore messageStore, OffsetManager offsetManager,
@@ -96,7 +99,7 @@ public class ConsumerGroupCoordinator implements Closeable {
             long committed = offsetManager.fetch(group, topic);
             long startOffset = committed >= 0 ? committed : 0;
             logger.info("Initializing group state: group={}, topic={}, startOffset={}", group, topic, startOffset);
-            return new GroupTopicState(startOffset);
+            return new GroupTopicState(group, topic, startOffset);
         });
 
         long fromOffset;
@@ -166,6 +169,9 @@ public class ConsumerGroupCoordinator implements Closeable {
 
             if (lease != null) {
                 state.committedRanges.add(new CommittedRange(lease.fromOffset, offset));
+                for (long i = lease.fromOffset; i < offset; i++) {
+                    state.deliveryCounts.remove(i);
+                }
                 state.members.remove(consumerId);
                 logger.debug("Consumer {} committed offset {} for group={}, topic={} (lease [{}, {}))",
                         consumerId, offset, group, topic, lease.fromOffset, lease.toOffset);
@@ -226,9 +232,8 @@ public class ConsumerGroupCoordinator implements Closeable {
 
         for (Map.Entry<String, GroupTopicState> entry : groupStates.entrySet()) {
             GroupTopicState state = entry.getValue();
-            String[] parts = parseGroupKey(entry.getKey());
-            String group = parts[0];
-            String topic = parts[1];
+            String group = state.group;
+            String topic = state.topic;
 
             state.lock.lock();
             try {
@@ -328,9 +333,10 @@ public class ConsumerGroupCoordinator implements Closeable {
                 routeToDlq(state, group, topic, offset);
                 return true;
             } else {
-                // Rewind for redelivery
-                if (offset < state.dispatchOffset) {
-                    state.dispatchOffset = offset;
+                // Rewind for redelivery using the lease's fromOffset to not skip messages
+                long rewindOffset = (lease != null) ? lease.fromOffset : offset;
+                if (rewindOffset < state.dispatchOffset) {
+                    state.dispatchOffset = rewindOffset;
                 }
                 return false;
             }
@@ -348,29 +354,30 @@ public class ConsumerGroupCoordinator implements Closeable {
      */
     private void routeToDlq(GroupTopicState state, String group, String topic, long badOffset) {
         String dlqTopic = dlqTopicPrefix + group + "." + topic;
+        java.util.concurrent.CompletableFuture.runAsync(() -> {
+            try {
+                List<StoredMessage> messages = messageStore.getMessages(topic, badOffset, 1);
+                if (!messages.isEmpty()) {
+                    StoredMessage original = messages.get(0);
+                    byte[] payload = original.getPayload().toByteArray();
+                    String key = original.hasKey() ? original.getKey() : null;
 
-        try {
-            List<StoredMessage> messages = messageStore.getMessages(topic, badOffset, 1);
-            if (!messages.isEmpty()) {
-                StoredMessage original = messages.get(0);
-                byte[] payload = original.getPayload().toByteArray();
-                String key = original.hasKey() ? original.getKey() : null;
+                    if (raftNode != null && raftNode.isLeader()) {
+                        raftNode.propose(dlqTopic, payload, key, original.getTimestamp());
+                    } else {
+                        messageStore.append(dlqTopic, payload, key, original.getTimestamp());
+                    }
 
-                if (raftNode != null && raftNode.isLeader()) {
-                    raftNode.propose(dlqTopic, payload, key, original.getTimestamp());
+                    logger.warn("Routed poison message to DLQ: offset={} from topic={} -> {}",
+                            badOffset, topic, dlqTopic);
                 } else {
-                    messageStore.append(dlqTopic, payload, key, original.getTimestamp());
+                    logger.error("Failed to fetch poison message for DLQ routing: topic={}, offset={}",
+                            topic, badOffset);
                 }
-
-                logger.warn("Routed poison message to DLQ: offset={} from topic={} -> {}",
-                        badOffset, topic, dlqTopic);
-            } else {
-                logger.error("Failed to fetch poison message for DLQ routing: topic={}, offset={}",
-                        topic, badOffset);
+            } catch (IOException e) {
+                logger.error("Failed to route message to DLQ topic {}: {}", dlqTopic, e.getMessage(), e);
             }
-        } catch (IOException e) {
-            logger.error("Failed to route message to DLQ topic {}: {}", dlqTopic, e.getMessage(), e);
-        }
+        });
 
         // Advance past the bad offset regardless — don't let a DLQ write failure block progress
         long nextOffset = badOffset + 1;
@@ -391,11 +398,7 @@ public class ConsumerGroupCoordinator implements Closeable {
         return dlqTopicPrefix + group + "." + topic;
     }
 
-    /** Parse a "group/topic" key back into its components. */
-    private static String[] parseGroupKey(String key) {
-        int idx = key.indexOf('/');
-        return new String[]{ key.substring(0, idx), key.substring(idx + 1) };
-    }
+
 
     @Override
     public void close() {
@@ -416,6 +419,8 @@ public class ConsumerGroupCoordinator implements Closeable {
      * Per (group, topic) coordination state.
      */
     private static class GroupTopicState {
+        final String group;
+        final String topic;
         final ReentrantLock lock = new ReentrantLock();
 
         long dispatchOffset;
@@ -434,7 +439,9 @@ public class ConsumerGroupCoordinator implements Closeable {
         /** Delivery attempt counts per offset for DLQ tracking. */
         final Map<Long, Integer> deliveryCounts = new HashMap<>();
 
-        GroupTopicState(long startOffset) {
+        GroupTopicState(String group, String topic, long startOffset) {
+            this.group = group;
+            this.topic = topic;
             this.dispatchOffset = startOffset;
             this.committedOffset = startOffset;
         }

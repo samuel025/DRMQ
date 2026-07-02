@@ -171,7 +171,7 @@ try (DRMQConsumer consumer = new DRMQConsumer("localhost:9092", "order-processor
         for (DRMQConsumer.ConsumedMessage msg : messages) {
             try {
                 processOrder(msg); // Your business logic
-                consumer.commit("orders", msg.offset()); 
+                consumer.commit("orders", msg.offset() + 1); 
             } catch (Exception e) {
                 // Explicitly reject the message on failure
                 boolean routedToDlq = consumer.nack("orders", msg.offset());

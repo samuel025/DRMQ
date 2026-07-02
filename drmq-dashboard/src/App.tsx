@@ -42,6 +42,7 @@ function Sidebar({ telemetryState }: { telemetryState: any }) {
           const active = location.pathname === to;
           return (
             <Link key={to} to={to} aria-label={label}
+              aria-current={active ? "page" : undefined}
               className="flex items-center justify-center lg:justify-start gap-3 px-3 py-2.5 rounded-xl text-sm transition-all duration-200 cursor-pointer group"
               style={active ? {
                 background: 'rgba(255,255,255,0.06)',
@@ -98,6 +99,7 @@ export default function App() {
         <main className="flex-1 min-w-0 overflow-y-auto">
           <Routes>
             <Route path="/" element={<Dashboard telemetryState={telemetryState} telemetryError={telemetryError} />} />
+            <Route path="/docs" element={<div className="p-8 text-zinc-400">Documentation is available at <a href="https://drmq.vercel.app" target="_blank" rel="noreferrer" className="text-brand-400 hover:underline">drmq.vercel.app</a></div>} />
           </Routes>
         </main>
       </div>

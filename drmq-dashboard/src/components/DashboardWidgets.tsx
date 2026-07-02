@@ -1,8 +1,17 @@
 import { motion } from 'framer-motion';
 import type { ReactNode } from 'react';
 
+export interface StatCardProps {
+  icon: any;
+  label: string;
+  value: string | number;
+  unit?: string;
+  color?: string;
+  sub?: ReactNode;
+}
+
 /* ── Stat Card ───────────────────────────────────────────────────────── */
-export function StatCard({ icon: Icon, label, value, unit, color = '#06b6d4', sub }: any) {
+export function StatCard({ icon: Icon, label, value, unit, color = '#06b6d4', sub }: StatCardProps) {
   return (
     <div className="stat-card p-4 flex flex-col gap-1.5" style={{ '--accent-color': `${color}40` } as any}>
       <div className="flex items-center justify-between">

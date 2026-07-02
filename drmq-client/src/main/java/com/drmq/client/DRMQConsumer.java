@@ -391,6 +391,9 @@ public class DRMQConsumer implements AutoCloseable {
      * if the maximum delivery attempts threshold has been reached.
      */
     public boolean nack(String topic, long offset) throws IOException {
+        if (!groupMode) {
+            throw new IllegalStateException("NACK is only supported in consumer group mode");
+        }
         ensureConnectedWithRetry();
         boolean routedToDlq = nackOffsetToBrokerWithRetry(topic, offset, MAX_RETRIES);
         if (routedToDlq) {

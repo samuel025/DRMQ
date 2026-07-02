@@ -192,8 +192,7 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
     if (leaderCommit > 0 && nodes.length > 1) {
       const reachableFollowers = nodes.filter(n =>
         n.status !== 'LEADER' &&
-        (n.replicationLag === undefined || n.replicationLag >= 0) &&
-        (n.commitIndex ?? 0) > 0
+        (n.replicationLag === undefined || n.replicationLag >= 0)
       );
       if (reachableFollowers.length > 0) {
         const maxLag = Math.max(...reachableFollowers.map(n => Math.max(0, leaderCommit - (n.commitIndex ?? 0))));

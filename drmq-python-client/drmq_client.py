@@ -33,7 +33,7 @@ class DRMQClient:
         last_exception = None
         total_attempts = self.max_retries * max(1, len(self.bootstrap_servers))
 
-        for attempt in range(total_attempts):
+        for _ in range(total_attempts):
             try:
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.sock.settimeout(5.0)
@@ -136,7 +136,7 @@ class DRMQProducer(DRMQClient):
             req.key = key
         req.timestamp = int(time.time() * 1000)
 
-        for attempt in range(self.max_retries):
+        for _ in range(self.max_retries):
             try:
                 self._ensure_connected()
                 resp_payload = self._send_envelope(pb.MessageType.PRODUCE_REQUEST, req.SerializeToString())
@@ -181,7 +181,7 @@ class DRMQConsumer(DRMQClient):
 
     def poll(self, max_messages: int = 100, timeout_ms: int = 1000) -> List[pb.StoredMessage]:
         """Poll the broker for new messages across all subscribed topics."""
-        for attempt in range(self.max_retries):
+        for _ in range(self.max_retries):
             try:
                 self._ensure_connected()
                 all_messages = []
@@ -220,7 +220,7 @@ class DRMQConsumer(DRMQClient):
         raise DRMQConnectionError(f"Failed to poll messages after {self.max_retries} attempts")
 
     def _fetch_offset(self, topic: str) -> int:
-        for attempt in range(self.max_retries):
+        for _ in range(self.max_retries):
             try:
                 self._ensure_connected()
                 req = pb.FetchOffsetRequest()
@@ -242,7 +242,7 @@ class DRMQConsumer(DRMQClient):
 
     def commit(self, topic: str, offset: int):
         """Commit an offset back to the broker."""
-        for attempt in range(self.max_retries):
+        for _ in range(self.max_retries):
             try:
                 self._ensure_connected()
                 req = pb.CommitOffsetRequest()
@@ -270,7 +270,7 @@ class DRMQConsumer(DRMQClient):
         Explicitly reject (NACK) an offset back to the broker.
         Returns True if the message was routed to the DLQ, False if it was requeued.
         """
-        for attempt in range(self.max_retries):
+        for _ in range(self.max_retries):
             try:
                 self._ensure_connected()
                 req = pb.NackRequest()
@@ -295,7 +295,7 @@ class DRMQConsumer(DRMQClient):
                 if isinstance(e, DRMQConnectionError) and "NACK failed" in str(e):
                     raise
                 self._reconnect()
-        return False
+        raise DRMQConnectionError(f"Failed to nack message after {self.max_retries} attempts")
 
 # ==========================================
 # Example Usage 

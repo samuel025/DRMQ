@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * Multi-threaded Stress Test App
  * Spawns multiple threads within a single JVM to hammer the broker
- * with messages, sharing a single Netty connection pool.
+ * with messages. Each thread creates its own DRMQProducer and connection.
  */
 public class StressTestApp {
     public static void main(String[] args) throws InterruptedException {
@@ -20,9 +20,22 @@ public class StressTestApp {
         System.out.println("╚═══════════════════════════════════════════════════╝\n");
 
         String bootstrapServers = args.length > 0 ? args[0] : "localhost:9092,localhost:9093,localhost:9094";
-        int concurrency = args.length > 1 ? Integer.parseInt(args[1]) : 4;
+        int concurrency;
+        int msgSize;
+        try {
+            concurrency = args.length > 1 ? Integer.parseInt(args[1]) : 4;
+            msgSize = args.length > 3 ? Integer.parseInt(args[3]) : 512;
+            if (concurrency < 1 || msgSize < 1) {
+                throw new NumberFormatException("Concurrency and msgSize must be positive integers");
+            }
+        } catch (NumberFormatException e) {
+            System.err.println("Error: Concurrency and Payload Size must be valid positive integers.");
+            System.err.println("Usage: StressTestApp [bootstrapServers] [concurrency] [topic] [msgSize]");
+            System.exit(1);
+            return;
+        }
+
         String topic = args.length > 2 ? args[2] : "load-test-topic";
-        int msgSize = args.length > 3 ? Integer.parseInt(args[3]) : 512;
 
         System.out.println("Configuration:");
         System.out.println("  Brokers      : " + bootstrapServers);

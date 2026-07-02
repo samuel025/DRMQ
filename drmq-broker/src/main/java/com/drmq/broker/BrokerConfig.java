@@ -137,7 +137,7 @@ public class BrokerConfig {
                 case "--log-retention-ms" -> logRetentionMs = parseLongArg(args, ++i, "--log-retention-ms");
                 case "--raft-compact-threshold" -> raftCompactThreshold = parseLongArg(args, ++i, "--raft-compact-threshold");
                 case "--max-deliveries" -> maxDeliveries = (int) parseLongArg(args, ++i, "--max-deliveries");
-                case "--dlq-topic-prefix" -> dlqTopicPrefix = args[++i];
+                case "--dlq-topic-prefix" -> dlqTopicPrefix = parsePrefixArg(args, ++i, "--dlq-topic-prefix");
                 default -> {
                     if (i == 0) {
                         try {
@@ -208,6 +208,15 @@ public class BrokerConfig {
         }
         if (normalized.length() > 1 && normalized.endsWith("/")) {
             normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        return normalized;
+    }
+
+    private static String parsePrefixArg(String[] args, int index, String flag) {
+        String value = requireValue(args, index, flag);
+        String normalized = value.trim();
+        if (normalized.isBlank()) {
+            throw new IllegalArgumentException(flag + " must not be empty or whitespace");
         }
         return normalized;
     }

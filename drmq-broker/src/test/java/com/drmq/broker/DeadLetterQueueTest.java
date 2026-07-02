@@ -43,9 +43,9 @@ class DeadLetterQueueTest {
         BrokerConfig config = new BrokerConfig(9092, tempDir.toString());
         messageStore = new MessageStore(logManager, config);
         offsetManager = new OffsetManager(tempDir.toString());
-        // Short lease timeout (100ms), maxDeliveries=3, default prefix "dlq."
+        // Short lease timeout (50ms), maxDeliveries=3, default prefix "dlq."
         coordinator = new ConsumerGroupCoordinator(
-                messageStore, offsetManager, null, 100, MAX_DELIVERIES, "dlq.");
+                messageStore, offsetManager, null, 50, MAX_DELIVERIES, "dlq.");
     }
 
     @AfterEach
@@ -67,6 +67,21 @@ class DeadLetterQueueTest {
         }
     }
 
+    private List<StoredMessage> getDlqMessagesWithWait(String dlqTopic, int expectedSize) {
+        for (int i = 0; i < 50; i++) {
+            List<StoredMessage> msgs = messageStore.getMessages(dlqTopic, 0, 10);
+            if (msgs.size() >= expectedSize) {
+                return msgs;
+            }
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        return messageStore.getMessages(dlqTopic, 0, 10);
+    }
+
     // =========================================================================
     // 1. Lease expiry delivery counting — redelivery before threshold
     // =========================================================================
@@ -81,7 +96,7 @@ class DeadLetterQueueTest {
         assertEquals(0, batch1.get(0).getOffset());
 
         // Let lease expire (attempt 1)
-        Thread.sleep(150);
+        Thread.sleep(200);
         coordinator.expireLeases();
 
         // Message should be redelivered (not yet at threshold of 3)
@@ -105,12 +120,12 @@ class DeadLetterQueueTest {
             List<StoredMessage> batch = coordinator.acquireMessages(GROUP, TOPIC, "consumer-A", 1, 0);
             assertEquals(1, batch.size(), "Attempt " + (i + 1) + " should get the message");
 
-            Thread.sleep(150);
+            Thread.sleep(200);
             coordinator.expireLeases();
         }
 
         // The message should now be in the DLQ topic
-        List<StoredMessage> dlqMessages = messageStore.getMessages(dlqTopic, 0, 10);
+        List<StoredMessage> dlqMessages = getDlqMessagesWithWait(dlqTopic, 1);
         assertEquals(1, dlqMessages.size(), "Exactly one message should be in the DLQ");
 
         // Verify the DLQ message payload matches the original
@@ -168,7 +183,7 @@ class DeadLetterQueueTest {
         }
 
         // Verify DLQ topic has the message
-        List<StoredMessage> dlqMessages = messageStore.getMessages(dlqTopic, 0, 10);
+        List<StoredMessage> dlqMessages = getDlqMessagesWithWait(dlqTopic, 1);
         assertEquals(1, dlqMessages.size());
         assertEquals("msg-0", new String(dlqMessages.get(0).getPayload().toByteArray()));
     }
@@ -190,7 +205,7 @@ class DeadLetterQueueTest {
             coordinator.nackOffset(GROUP, TOPIC, "consumer-A", 0);
         }
 
-        List<StoredMessage> dlqMessages = messageStore.getMessages(dlqTopic, 0, 10);
+        List<StoredMessage> dlqMessages = getDlqMessagesWithWait(dlqTopic, 1);
         assertEquals(1, dlqMessages.size());
 
         StoredMessage dlqMsg = dlqMessages.get(0);
@@ -236,7 +251,7 @@ class DeadLetterQueueTest {
 
         // Attempt 2: lease expiry
         coordinator.acquireMessages(GROUP, TOPIC, "consumer-A", 1, 0);
-        Thread.sleep(150);
+        Thread.sleep(200);
         coordinator.expireLeases();
 
         // Attempt 3 (= MAX_DELIVERIES): NACK should trigger DLQ
@@ -245,7 +260,7 @@ class DeadLetterQueueTest {
         assertTrue(r3, "Third attempt should route to DLQ (mixed NACK + expiry)");
 
         // Verify the message landed in the DLQ
-        List<StoredMessage> dlqMessages = messageStore.getMessages(dlqTopic, 0, 10);
+        List<StoredMessage> dlqMessages = getDlqMessagesWithWait(dlqTopic, 1);
         assertEquals(1, dlqMessages.size());
     }
 
@@ -273,7 +288,7 @@ class DeadLetterQueueTest {
     void customDlqTopicPrefix() throws IOException {
         // Create coordinator with custom prefix
         ConsumerGroupCoordinator custom = new ConsumerGroupCoordinator(
-                messageStore, offsetManager, null, 100, 3, "dead.");
+                messageStore, offsetManager, null, 50, 3, "dead.");
 
         assertEquals("dead.my-group.my-topic",
                 custom.getDlqTopicName("my-group", "my-topic"));
@@ -302,7 +317,7 @@ class DeadLetterQueueTest {
         }
 
         // Only offset 1 should be in the DLQ, not offset 0
-        List<StoredMessage> dlqMessages = messageStore.getMessages(dlqTopic, 0, 10);
+        List<StoredMessage> dlqMessages = getDlqMessagesWithWait(dlqTopic, 1);
         assertEquals(1, dlqMessages.size(), "Only the NACKed message should be in DLQ");
         assertEquals("msg-1", new String(dlqMessages.get(0).getPayload().toByteArray()));
     }
@@ -335,7 +350,7 @@ class DeadLetterQueueTest {
         }
 
         // Two messages should be in the DLQ
-        List<StoredMessage> dlqMessages = messageStore.getMessages(dlqTopic, 0, 10);
+        List<StoredMessage> dlqMessages = getDlqMessagesWithWait(dlqTopic, 2);
         assertEquals(2, dlqMessages.size(), "Two poison messages should be in DLQ");
         assertEquals("msg-0", new String(dlqMessages.get(0).getPayload().toByteArray()));
         assertEquals("msg-2", new String(dlqMessages.get(1).getPayload().toByteArray()));
@@ -354,7 +369,7 @@ class DeadLetterQueueTest {
     @Test
     void maxDeliveriesOneRouteImmediately() throws IOException {
         ConsumerGroupCoordinator strict = new ConsumerGroupCoordinator(
-                messageStore, offsetManager, null, 100, 1, "dlq.");
+                messageStore, offsetManager, null, 50, 1, "dlq.");
 
         try {
             produceMessages(1);
@@ -365,7 +380,7 @@ class DeadLetterQueueTest {
             boolean routedToDlq = strict.nackOffset(GROUP, TOPIC, "consumer-A", 0);
             assertTrue(routedToDlq, "With maxDeliveries=1, first NACK should route to DLQ");
 
-            List<StoredMessage> dlqMessages = messageStore.getMessages(dlqTopic, 0, 10);
+            List<StoredMessage> dlqMessages = getDlqMessagesWithWait(dlqTopic, 1);
             assertEquals(1, dlqMessages.size());
         } finally {
             strict.close();
@@ -445,12 +460,12 @@ class DeadLetterQueueTest {
             assertEquals(1, batch.size());
             assertEquals(0, batch.get(0).getOffset());
 
-            Thread.sleep(150);
+            Thread.sleep(200);
             coordinator.expireLeases();
         }
 
         // Only offset 0 (the lease's fromOffset) should be DLQ'd
-        List<StoredMessage> dlqMessages = messageStore.getMessages(dlqTopic, 0, 10);
+        List<StoredMessage> dlqMessages = getDlqMessagesWithWait(dlqTopic, 1);
         assertEquals(1, dlqMessages.size());
         assertEquals("msg-0", new String(dlqMessages.get(0).getPayload().toByteArray()));
 

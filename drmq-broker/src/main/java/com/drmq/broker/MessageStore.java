@@ -491,6 +491,11 @@ public class MessageStore implements Closeable {
                             Long nextBaseOffset = segments.higherKey(baseOffset);
                             long endOffset = (nextBaseOffset != null) ? nextBaseOffset : Long.MAX_VALUE;
                             index.subMap(baseOffset, endOffset).clear();
+                            
+                            BoundedMessageCache cache = messageCache.get(topic);
+                            if (cache != null) {
+                                cache.removeRange(baseOffset, endOffset);
+                            }
                         }
                     } catch (IOException e) {
                         logger.error("Failed to delete old log segment {}", segment.getFilePath(), e);
@@ -534,6 +539,15 @@ public class MessageStore implements Closeable {
                 return cache.get(offset);
             } finally {
                 lock.readLock().unlock();
+            }
+        }
+
+        public void removeRange(long fromOffset, long toOffset) {
+            lock.writeLock().lock();
+            try {
+                cache.keySet().removeIf(k -> k >= fromOffset && k < toOffset);
+            } finally {
+                lock.writeLock().unlock();
             }
         }
 
