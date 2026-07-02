@@ -357,6 +357,10 @@ export class DRMQConsumer extends DRMQClient {
   }
 
   public async nack(topic: string, offset: number): Promise<boolean> {
+    if (!this.groupMode) {
+      throw new Error("NACK is only supported in consumer group mode");
+    }
+
     for (let attempt = 0; attempt < this.maxRetries; attempt++) {
       try {
         await this.ensureConnected();

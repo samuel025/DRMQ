@@ -270,6 +270,9 @@ class DRMQConsumer(DRMQClient):
         Explicitly reject (NACK) an offset back to the broker.
         Returns True if the message was routed to the DLQ, False if it was requeued.
         """
+        if not self.group_mode:
+            raise RuntimeError("NACK is only supported in consumer group mode")
+            
         for _ in range(self.max_retries):
             try:
                 self._ensure_connected()
