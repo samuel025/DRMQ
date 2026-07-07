@@ -24,11 +24,20 @@ public class BrokerConfig {
     private final long raftCompactThreshold;
     private final int maxDeliveries;
     private final String dlqTopicPrefix;
+    private final boolean logSegmentFsync;
 
     public BrokerConfig(String nodeId, int port, String dataDir, List<PeerAddress> peers,
                         boolean metricsEnabled, int metricsPort, String metricsPath,
                         long logSegmentBytes, long logRetentionMs, long raftCompactThreshold,
                         int maxDeliveries, String dlqTopicPrefix) {
+        this(nodeId, port, dataDir, peers, metricsEnabled, metricsPort, metricsPath,
+             logSegmentBytes, logRetentionMs, raftCompactThreshold, maxDeliveries, dlqTopicPrefix, true);
+    }
+
+    public BrokerConfig(String nodeId, int port, String dataDir, List<PeerAddress> peers,
+                        boolean metricsEnabled, int metricsPort, String metricsPath,
+                        long logSegmentBytes, long logRetentionMs, long raftCompactThreshold,
+                        int maxDeliveries, String dlqTopicPrefix, boolean logSegmentFsync) {
         this.nodeId = nodeId;
         this.port = port;
         this.dataDir = dataDir;
@@ -41,17 +50,18 @@ public class BrokerConfig {
         this.raftCompactThreshold = raftCompactThreshold;
         this.maxDeliveries = maxDeliveries > 0 ? maxDeliveries : 5;
         this.dlqTopicPrefix = dlqTopicPrefix != null ? dlqTopicPrefix : "dlq.";
+        this.logSegmentFsync = logSegmentFsync;
     }
 
     public BrokerConfig(String nodeId, int port, String dataDir, List<PeerAddress> peers) {
         this(nodeId, port, dataDir, peers, true, 9096, "/metrics", 
-             100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.");
+             100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.", true);
     }
 
     /** Single-node config (backward compatible) */
     public BrokerConfig(int port, String dataDir) {
         this("standalone", port, dataDir, List.of(), true, 9096, "/metrics",
-             100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.");
+             100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.", true);
     }
 
     public String getNodeId() { return nodeId; }
@@ -66,6 +76,7 @@ public class BrokerConfig {
     public long getRaftCompactThreshold() { return raftCompactThreshold; }
     public int getMaxDeliveries() { return maxDeliveries; }
     public String getDlqTopicPrefix() { return dlqTopicPrefix; }
+    public boolean isLogSegmentFsync() { return logSegmentFsync; }
 
     public void setLogSegmentBytes(long logSegmentBytes) {
         if (logSegmentBytes <= 0) {
@@ -117,6 +128,7 @@ public class BrokerConfig {
         long raftCompactThreshold = 1000L;
         int maxDeliveries = 5;
         String dlqTopicPrefix = "dlq.";
+        boolean logSegmentFsync = true;
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
@@ -138,6 +150,7 @@ public class BrokerConfig {
                 case "--raft-compact-threshold" -> raftCompactThreshold = parseLongArg(args, ++i, "--raft-compact-threshold");
                 case "--max-deliveries" -> maxDeliveries = (int) parseLongArg(args, ++i, "--max-deliveries");
                 case "--dlq-topic-prefix" -> dlqTopicPrefix = parsePrefixArg(args, ++i, "--dlq-topic-prefix");
+                case "--log-segment-fsync" -> logSegmentFsync = parseBooleanArg(args, ++i, "--log-segment-fsync");
                 default -> {
                     if (i == 0) {
                         try {
@@ -154,7 +167,7 @@ public class BrokerConfig {
 
         return new BrokerConfig(nodeId, port, dataDir, peers, metricsEnabled, metricsPort, metricsPath,
                                 logSegmentBytes, logRetentionMs, raftCompactThreshold,
-                                maxDeliveries, dlqTopicPrefix);
+                                maxDeliveries, dlqTopicPrefix, logSegmentFsync);
     }
 
     private static boolean parseBooleanArg(String[] args, int index, String flag) {

@@ -239,9 +239,10 @@ class DRMQProducer(DRMQClient):
                         pm.future.set_result(SendResult(True, base_offset + i))
                     return
                 else:
-                    error_msg = resp.error_message
-                    if error_msg and error_msg.startswith("NOT_LEADER:"):
-                        leader_addr = error_msg[len("NOT_LEADER:"):]
+                    error_code = resp.error_code
+                    if error_code == pb.ErrorCode.NOT_LEADER:
+                        error_msg = resp.error_message
+                        leader_addr = error_msg[len("NOT_LEADER:"):] if error_msg and error_msg.startswith("NOT_LEADER:") else "UNKNOWN"
                         if leader_addr != "UNKNOWN":
                             parts = leader_addr.split(":")
                             if len(parts) == 2:

@@ -87,13 +87,48 @@ public class RaftLog {
     public synchronized void append(RaftEntry entry) throws IOException {
         long entryStart = raf.length();
         raf.seek(entryStart);
-        byte[] data = entry.toByteArray();
-        raf.writeInt(data.length);
-        raf.write(data);
-        raf.getFD().sync(); 
+        try {
+            byte[] data = entry.toByteArray();
+            raf.writeInt(data.length);
+            raf.write(data);
+            raf.getFD().sync(); 
+        } catch (IOException e) {
+            raf.setLength(entryStart);
+            throw e;
+        }
         entries.add(entry);
         filePositions.add(entryStart);
         logger.debug("Appended raft entry: index={}, term={}", entry.getIndex(), entry.getTerm());
+    }
+
+    /**
+     * Append a list of entries to the log. Writes to disk immediately with a single fsync.
+     */
+    public synchronized void append(List<RaftEntry> batch) throws IOException {
+        if (batch.isEmpty()) return;
+        
+        long entryStart = raf.length();
+        raf.seek(entryStart);
+        
+        List<Long> newPositions = new ArrayList<>(batch.size());
+        try {
+            for (RaftEntry entry : batch) {
+                newPositions.add(raf.getFilePointer());
+                byte[] data = entry.toByteArray();
+                raf.writeInt(data.length);
+                raf.write(data);
+            }
+            
+            raf.getFD().sync(); 
+        } catch (IOException e) {
+            raf.setLength(entryStart);
+            throw e;
+        }
+        
+        entries.addAll(batch);
+        filePositions.addAll(newPositions);
+        logger.debug("Appended {} raft entries (indices {} to {})", 
+                batch.size(), batch.get(0).getIndex(), batch.get(batch.size() - 1).getIndex());
     }
 
     /**

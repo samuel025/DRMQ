@@ -19,6 +19,7 @@ message ProduceResponse {
     bool success = 1;
     int64 offset = 2;         // Assigned offset if successful
     string error_message = 3; // Error details if failed
+    ErrorCode error_code = 4;
 }
 
 // Request to produce a batch of messages to a topic
@@ -40,6 +41,7 @@ message ProduceBatchResponse {
     int64 base_offset = 2;    // The offset assigned to the FIRST message in the batch
     int32 count = 3;          // Number of messages successfully written
     string error_message = 4; // Error details if failed
+    ErrorCode error_code = 5;
 }
 
 // Internal message representation stored in  the broker
@@ -222,4 +224,11 @@ enum MessageType {
     NACK_RESPONSE = 19;
     PRODUCE_BATCH_REQUEST = 20;
     PRODUCE_BATCH_RESPONSE = 21;
+}
+
+// --- Standard Error Codes ---
+enum ErrorCode {
+    NONE = 0;
+    NOT_LEADER = 1;
+    UNKNOWN_ERROR = 99;
 }

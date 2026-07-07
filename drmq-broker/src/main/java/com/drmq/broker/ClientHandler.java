@@ -3,6 +3,7 @@ package com.drmq.broker;
 import com.drmq.broker.raft.RaftNode;
 import com.drmq.broker.ClusterEventBuffer;
 import com.drmq.protocol.DRMQProtocol.*;
+import com.drmq.protocol.DRMQProtocol.ErrorCode;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.group.ChannelGroup;
@@ -109,7 +110,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
                 if (!raftNode.isLeader()) {
                     String leaderAddr = raftNode.getLeaderAddress();
                     return createProduceErrorResponse("NOT_LEADER:" +
-                            (leaderAddr != null ? leaderAddr : "UNKNOWN"));
+                            (leaderAddr != null ? leaderAddr : "UNKNOWN"), ErrorCode.NOT_LEADER);
                 }
                 offset = raftNode.propose(topic, payload, key, timestamp);
             } else {
@@ -135,7 +136,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
             logger.error("Error processing produce request", e);
             BrokerMetrics.get().recordRequest("produce", false,
                 System.nanoTime() - startNanos, payloadBytes, 1);
-            return createProduceErrorResponse(e.getMessage());
+            return createProduceErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR);
         }
     }
 
@@ -150,10 +151,10 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
             batchCount = request.getEntriesCount();
 
             if (batchCount == 0) {
-                return createProduceBatchErrorResponse("Batch must contain at least one message");
+                return createProduceBatchErrorResponse("Batch must contain at least one message", ErrorCode.UNKNOWN_ERROR);
             }
             if (batchCount > MAX_BATCH_MESSAGES) {
-                return createProduceBatchErrorResponse("Batch exceeds maximum message count of " + MAX_BATCH_MESSAGES);
+                return createProduceBatchErrorResponse("Batch exceeds maximum message count of " + MAX_BATCH_MESSAGES, ErrorCode.UNKNOWN_ERROR);
             }
 
             for (var entry : request.getEntriesList()) {
@@ -161,7 +162,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
             }
 
             if (totalPayloadBytes > MAX_PAYLOAD_BYTES) {
-                return createProduceBatchErrorResponse("Batch payload exceeds maximum size of " + MAX_PAYLOAD_BYTES + " bytes");
+                return createProduceBatchErrorResponse("Batch payload exceeds maximum size of " + MAX_PAYLOAD_BYTES + " bytes", ErrorCode.UNKNOWN_ERROR);
             }
 
             long baseOffset;
@@ -169,7 +170,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
                 if (!raftNode.isLeader()) {
                     String leaderAddr = raftNode.getLeaderAddress();
                     return createProduceBatchErrorResponse("NOT_LEADER:" +
-                            (leaderAddr != null ? leaderAddr : "UNKNOWN"));
+                            (leaderAddr != null ? leaderAddr : "UNKNOWN"), ErrorCode.NOT_LEADER);
                 }
                 baseOffset = raftNode.proposeBatch(topic, request.getEntriesList());
             } else {
@@ -196,14 +197,15 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
             logger.error("Error processing produce batch request", e);
             BrokerMetrics.get().recordRequest("produce_batch", false,
                 System.nanoTime() - startNanos, totalPayloadBytes, batchCount);
-            return createProduceBatchErrorResponse(e.getMessage());
+            return createProduceBatchErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR);
         }
     }
 
-    private MessageEnvelope createProduceBatchErrorResponse(String errorMessage) {
+    private MessageEnvelope createProduceBatchErrorResponse(String errorMessage, ErrorCode errorCode) {
         ProduceBatchResponse response = ProduceBatchResponse.newBuilder()
                 .setSuccess(false)
                 .setErrorMessage(errorMessage != null ? errorMessage : "Unknown error")
+                .setErrorCode(errorCode)
                 .build();
         return MessageEnvelope.newBuilder()
                 .setType(MessageType.PRODUCE_BATCH_RESPONSE)
@@ -265,10 +267,11 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
         }
     }
 
-    private MessageEnvelope createProduceErrorResponse(String errorMessage) {
+    private MessageEnvelope createProduceErrorResponse(String errorMessage, ErrorCode errorCode) {
         ProduceResponse response = ProduceResponse.newBuilder()
                 .setSuccess(false)
                 .setErrorMessage(errorMessage != null ? errorMessage : "Unknown error")
+                .setErrorCode(errorCode)
                 .build();
 
         return MessageEnvelope.newBuilder()
@@ -488,12 +491,12 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
             case PRE_VOTE_RESPONSE -> createPreVoteErrorResponse();
             case APPEND_ENTRIES_RESPONSE -> createAppendEntriesErrorResponse();
             case INSTALL_SNAPSHOT_RESPONSE -> createInstallSnapshotErrorResponse();
-            case PRODUCE_RESPONSE -> createProduceErrorResponse(errorMessage);
+            case PRODUCE_RESPONSE -> createProduceErrorResponse(errorMessage, ErrorCode.UNKNOWN_ERROR);
             case CONSUME_RESPONSE -> createConsumeErrorResponse(errorMessage);
             case COMMIT_OFFSET_RESPONSE -> createCommitOffsetErrorResponse(errorMessage);
             case FETCH_OFFSET_RESPONSE -> createFetchOffsetErrorResponse(errorMessage);
             case NACK_RESPONSE -> createNackErrorResponse(errorMessage);
-            default -> createProduceErrorResponse(errorMessage);
+            default -> createProduceErrorResponse(errorMessage, ErrorCode.UNKNOWN_ERROR);
         };
     }
 

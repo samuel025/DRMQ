@@ -1274,6 +1274,7 @@ public class RaftNode {
             }
 
             if (!request.getEntriesList().isEmpty()) {
+                List<RaftEntry> newEntries = new ArrayList<>();
                 for (RaftEntry entry : request.getEntriesList()) {
                     long existingTerm = raftLog.getTermAt(entry.getIndex());
                     if (existingTerm != 0 && existingTerm != entry.getTerm()) {
@@ -1289,18 +1290,29 @@ public class RaftNode {
                         }
                     }
 
-                    // Append if new
-                    if (entry.getIndex() > raftLog.getLastIndex()) {
-                        try {
-                            raftLog.append(entry);
-                        } catch (IOException e) {
-                            logger.error("[{}] Failed to append raft entry at index {}", nodeId, entry.getIndex(), e);
-                            return AppendEntriesResponse.newBuilder()
-                                    .setTerm(currentTerm)
-                                    .setSuccess(false)
-                                    .setMatchIndex(raftLog.getLastIndex())
-                                    .build();
-                        }
+                    long expectedIndex = raftLog.getLastIndex() + newEntries.size() + 1;
+                    if (entry.getIndex() == expectedIndex) {
+                        newEntries.add(entry);
+                    } else if (entry.getIndex() > expectedIndex) {
+                        logger.error("[{}] Detected gap in AppendEntries: expected {}, got {}", nodeId, expectedIndex, entry.getIndex());
+                        return AppendEntriesResponse.newBuilder()
+                                .setTerm(currentTerm)
+                                .setSuccess(false)
+                                .setMatchIndex(raftLog.getLastIndex())
+                                .build();
+                    }
+                }
+
+                if (!newEntries.isEmpty()) {
+                    try {
+                        raftLog.append(newEntries);
+                    } catch (IOException e) {
+                        logger.error("[{}] Failed to append batch of {} raft entries", nodeId, newEntries.size(), e);
+                        return AppendEntriesResponse.newBuilder()
+                                .setTerm(currentTerm)
+                                .setSuccess(false)
+                                .setMatchIndex(raftLog.getLastIndex())
+                                .build();
                     }
                 }
             }
