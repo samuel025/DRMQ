@@ -4,7 +4,10 @@ import time
 import random
 import threading
 import concurrent.futures
+import logging
 from typing import List, Optional
+
+logger = logging.getLogger(__name__)
 
 # Import the generated Protobuf classes
 import messages_pb2 as pb
@@ -257,6 +260,7 @@ class DRMQProducer(DRMQClient):
                             pm.future.set_result(SendResult(False, -1, error_msg))
                         return
             except Exception as e:
+                logger.warning("Network error during batch send. Retrying may result in duplicate messages (at-least-once contract): %s", e)
                 super().close()
                 self._rotate_server()
                 
