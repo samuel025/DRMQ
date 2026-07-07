@@ -97,6 +97,31 @@ public class RaftLog {
     }
 
     /**
+     * Append a list of entries to the log. Writes to disk immediately with a single fsync.
+     */
+    public synchronized void append(List<RaftEntry> batch) throws IOException {
+        if (batch.isEmpty()) return;
+        
+        long entryStart = raf.length();
+        raf.seek(entryStart);
+        
+        List<Long> newPositions = new ArrayList<>(batch.size());
+        for (RaftEntry entry : batch) {
+            newPositions.add(raf.getFilePointer());
+            byte[] data = entry.toByteArray();
+            raf.writeInt(data.length);
+            raf.write(data);
+        }
+        
+        raf.getFD().sync(); 
+        
+        entries.addAll(batch);
+        filePositions.addAll(newPositions);
+        logger.debug("Appended {} raft entries (indices {} to {})", 
+                batch.size(), batch.get(0).getIndex(), batch.get(batch.size() - 1).getIndex());
+    }
+
+    /**
      * Get entry at the given Raft index (1-indexed).
      * Returns null if index is out of bounds.
      */

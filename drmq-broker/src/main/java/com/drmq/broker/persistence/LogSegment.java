@@ -25,9 +25,11 @@ public class LogSegment implements AutoCloseable {
     private final FileChannel fileChannel;
     private final long baseOffset;
     private volatile long currentSize; 
+    private final boolean fsyncEnabled;
 
-    public LogSegment(Path filePath) throws IOException {
+    public LogSegment(Path filePath, boolean fsyncEnabled) throws IOException {
         this.filePath = filePath;
+        this.fsyncEnabled = fsyncEnabled;
         String fileName = filePath.getFileName().toString();
         try {
             this.baseOffset = Long.parseLong(fileName.substring(0, fileName.indexOf('.')));
@@ -119,7 +121,9 @@ public class LogSegment implements AutoCloseable {
                 totalBytesWritten += buffer.limit();
             }
 
-            fileChannel.force(true);
+            if (fsyncEnabled) {
+                fileChannel.force(true);
+            }
 
         } catch (IOException e) {
             logger.warn("Batch write failed at position {}. Truncating segment {} back to {}",

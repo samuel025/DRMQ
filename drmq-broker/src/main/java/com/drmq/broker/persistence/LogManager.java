@@ -73,7 +73,7 @@ public class LogManager implements AutoCloseable {
                 Files.createDirectories(topicDir);
             }
             Path logPath = topicDir.resolve(String.format("%020d" + LOG_FILE_SUFFIX, 0L));
-            LogSegment segment = new LogSegment(logPath);
+            LogSegment segment = new LogSegment(logPath, config.isLogSegmentFsync());
             segments.put(0L, segment);
             BrokerMetrics.get().registerLogSegment(topic, segment);
             return segment;
@@ -97,7 +97,7 @@ public class LogManager implements AutoCloseable {
             
             Path topicDir = dataDir.resolve(topic);
             Path logPath = topicDir.resolve(String.format("%020d" + LOG_FILE_SUFFIX, baseOffset));
-            LogSegment segment = new LogSegment(logPath);
+            LogSegment segment = new LogSegment(logPath, config.isLogSegmentFsync());
             segments.put(baseOffset, segment);
             BrokerMetrics.get().registerLogSegment(topic, segment);
             logger.info("Rolled new log segment for topic {}: {}", topic, logPath.getFileName());
@@ -167,7 +167,7 @@ public class LogManager implements AutoCloseable {
                     ConcurrentSkipListMap<Long, LogSegment> segments = topicSegments.computeIfAbsent(topic, k -> new ConcurrentSkipListMap<>());
                     for (Path logPath : segmentPaths) {
                         try {
-                            LogSegment segment = new LogSegment(logPath);
+                            LogSegment segment = new LogSegment(logPath, config.isLogSegmentFsync());
                             segments.put(segment.getBaseOffset(), segment);
                         } catch (IOException e) {
                             logger.error("Failed to load segment: {}", logPath, e);
