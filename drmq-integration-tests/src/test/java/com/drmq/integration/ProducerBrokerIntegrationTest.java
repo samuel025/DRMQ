@@ -41,7 +41,7 @@ class ProducerBrokerIntegrationTest {
         try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
             producer.connect();
 
-            var result = producer.send("test-topic", "Hello, DRMQ!".getBytes());
+            var result = producer.send("test-topic", "Hello, DRMQ!".getBytes()).join();
 
             assertTrue(result.isSuccess());
             assertEquals(0, result.getOffset());
@@ -54,7 +54,7 @@ class ProducerBrokerIntegrationTest {
             producer.connect();
 
             for (int i = 0; i < 100; i++) {
-                var result = producer.send("test-topic", ("Message " + i).getBytes());
+                var result = producer.send("test-topic", ("Message " + i).getBytes()).join();
                 assertTrue(result.isSuccess());
                 assertEquals(i, result.getOffset());
             }
@@ -69,10 +69,10 @@ class ProducerBrokerIntegrationTest {
         try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
             producer.connect();
 
-            producer.send("orders", "order-1".getBytes());
-            producer.send("payments", "payment-1".getBytes());
-            producer.send("orders", "order-2".getBytes());
-            producer.send("notifications", "notif-1".getBytes());
+            producer.send("orders", "order-1".getBytes()).join();
+            producer.send("payments", "payment-1".getBytes()).join();
+            producer.send("orders", "order-2".getBytes()).join();
+            producer.send("notifications", "notif-1".getBytes()).join();
         }
 
         assertEquals(2, broker.getMessageStore().getMessageCount("orders"));
@@ -86,7 +86,7 @@ class ProducerBrokerIntegrationTest {
             // Don't call connect() explicitly
             assertFalse(producer.isConnected());
 
-            var result = producer.send("test-topic", "auto-connect test".getBytes());
+            var result = producer.send("test-topic", "auto-connect test".getBytes()).join();
 
             assertTrue(producer.isConnected());
             assertTrue(result.isSuccess());
@@ -98,7 +98,7 @@ class ProducerBrokerIntegrationTest {
         try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
             producer.connect();
 
-            var result = producer.send("keyed-topic", "payload".getBytes(), "user-123");
+            var result = producer.send("keyed-topic", "payload".getBytes(), "user-123").join();
 
             assertTrue(result.isSuccess());
             
@@ -120,7 +120,7 @@ class ProducerBrokerIntegrationTest {
                     producer.connect();
                     for (int m = 0; m < messagesPerProducer; m++) {
                         producer.send("concurrent-topic", 
-                                ("Producer " + producerId + " - Message " + m).getBytes());
+                                ("Producer " + producerId + " - Message " + m).getBytes()).join();
                     }
                 } catch (Exception e) {
                     fail("Producer " + producerId + " failed: " + e.getMessage());
@@ -143,7 +143,7 @@ class ProducerBrokerIntegrationTest {
     @Test
     void producerStringMessageConvenience() throws Exception {
         try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
-            var result = producer.send("string-topic", "This is a string message");
+            var result = producer.send("string-topic", "This is a string message").join();
 
             assertTrue(result.isSuccess());
             

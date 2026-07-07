@@ -37,7 +37,7 @@ public class RaftNode {
     private static final long HEARTBEAT_INTERVAL_MS = 75;
 
     // Proposal timeout — how long a client blocks waiting for Raft commitment
-    private static final long PROPOSAL_TIMEOUT_SECONDS = 5;
+    private static final long PROPOSAL_TIMEOUT_SECONDS = 60;
     
 
     private static final long STALE_PROPOSAL_THRESHOLD_MS = 30000;  // 30 seconds
@@ -848,6 +848,13 @@ public class RaftNode {
                                     nodeId, entry.getConsumerGroup(), entry.getTopic(), entry.getOffsetValue());
                         }
                     }
+                    case BATCH_MESSAGE -> {
+                        ProduceBatchRequest batchRequest = ProduceBatchRequest.parseFrom(entry.getPayload());
+                        long baseOffset = messageStore.appendBatch(entry.getTopic(), batchRequest.getEntriesList());
+                        completionValue = baseOffset;
+                        logger.debug("[{}] Applied raft batch entry {} to MessageStore (topic={}, count={})",
+                                nodeId, lastApplied, entry.getTopic(), batchRequest.getEntriesCount());
+                    }
                     default -> {
                         // MESSAGE (default): apply to MessageStore
                         long msgOffset = messageStore.append(
@@ -988,6 +995,73 @@ public class RaftNode {
         }
     }
 
+    /**
+     * Propose a batch of messages to be replicated via Raft as a single log entry.
+     * The entire batch is serialized into one RaftEntry, replicated once, and applied atomically.
+     * Blocks until the entry is committed (majority ACK) or times out.
+     *
+     * @param topic   The target topic
+     * @param entries The batch entries from the ProduceBatchRequest
+     * @return The base offset (offset of the first message in the batch)
+     */
+    public long proposeBatch(String topic, List<ProduceBatchRequest.BatchEntry> entries) throws IOException {
+        lock.lock();
+        long index;
+        long proposalTerm;
+        CompletableFuture<Long> future;
+        try {
+            if (state != RaftState.LEADER) {
+                throw new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
+            }
+
+            proposalTerm = currentTerm;
+            index = raftLog.getLastIndex() + 1;
+
+            if (pendingProposals.size() >= MAX_PENDING_PROPOSALS) {
+                throw new IOException("Too many pending proposals (" + pendingProposals.size()
+                        + "/" + MAX_PENDING_PROPOSALS + ")");
+            }
+
+            ProduceBatchRequest batchPayload = ProduceBatchRequest.newBuilder()
+                    .setTopic(topic)
+                    .addAllEntries(entries)
+                    .build();
+
+            RaftEntry entry = RaftEntry.newBuilder()
+                    .setTerm(proposalTerm)
+                    .setIndex(index)
+                    .setTopic(topic)
+                    .setPayload(batchPayload.toByteString())
+                    .setCommandType(RaftCommandType.BATCH_MESSAGE)
+                    .build();
+
+            raftLog.append(entry);
+            future = new CompletableFuture<>();
+            pendingProposals.put(index, new ProposalState(proposalTerm, future));
+
+        } finally {
+            lock.unlock();
+        }
+        sendHeartbeats();
+        try {
+            return future.get(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            ProposalState ps = pendingProposals.get(index);
+            if (ps != null) {
+                ps.timedOut = true;
+                if (pendingProposals.size() > MAX_PENDING_PROPOSALS / 2) {
+                    logger.warn("[{}] High number of pending proposals: {} (threshold: {})",
+                            nodeId, pendingProposals.size(), MAX_PENDING_PROPOSALS);
+                }
+            }
+            throw new IOException("Raft batch proposal timed out (index=" + index + "); entry may still commit");
+        } catch (ExecutionException e) {
+            throw new IOException("Raft batch proposal failed: " + e.getCause().getMessage());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Raft batch proposal interrupted");
+        }
+    }
     /**
      * Propose a consumer offset commit to be replicated via Raft.
      * Ensures offset durability across leader failover.

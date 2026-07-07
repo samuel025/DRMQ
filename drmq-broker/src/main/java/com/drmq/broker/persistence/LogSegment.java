@@ -10,6 +10,8 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * A single log file (WAL segment) for one topic.
@@ -70,6 +72,66 @@ public class LogSegment implements AutoCloseable {
         currentSize += buffer.limit();
         BrokerMetrics.get().recordLogAppend(buffer.limit(), System.nanoTime() - startNanos);
         return position;
+    }
+
+    /**
+     * Append a batch of messages atomically with a single fsync (Group Commit).
+     * All messages are written sequentially, then fileChannel.force(true) is called once.
+     * If a write fails mid-batch, the segment is truncated back to its original size.
+     *
+     * @param messages The list of messages to append.
+     * @return A list of starting byte positions for each message in the batch.
+     * @throws IOException If a write or fsync error occurs.
+     */
+    public synchronized List<Long> appendBatch(List<StoredMessage> messages) throws IOException {
+        long startNanos = System.nanoTime();
+        long originalSize = currentSize;
+        List<Long> positions = new ArrayList<>(messages.size());
+        int totalBytesWritten = 0;
+
+        try {
+            for (StoredMessage message : messages) {
+                byte[] messageBytes = message.toByteArray();
+
+                if (messageBytes.length > MAX_MESSAGE_SIZE) {
+                    throw new IllegalArgumentException(
+                        "Message size " + messageBytes.length + " bytes exceeds maximum allowed size " +
+                        MAX_MESSAGE_SIZE + " bytes. Message cannot be persisted.");
+                }
+
+                ByteBuffer buffer = ByteBuffer.allocate(4 + messageBytes.length);
+                buffer.putInt(messageBytes.length);
+                buffer.put(messageBytes);
+                buffer.flip();
+
+                long position = currentSize;
+                positions.add(position);
+
+                while (buffer.hasRemaining()) {
+                    fileChannel.write(buffer, position + buffer.position());
+                }
+                currentSize += buffer.limit();
+                totalBytesWritten += buffer.limit();
+            }
+
+            // TRUE GROUP COMMIT: single fsync for the entire batch
+            fileChannel.force(true);
+
+        } catch (IOException e) {
+            // Roll back partial writes on failure
+            logger.warn("Batch write failed at position {}. Truncating segment {} back to {}",
+                    currentSize, filePath, originalSize);
+            try {
+                fileChannel.truncate(originalSize);
+                currentSize = originalSize;
+            } catch (IOException truncateEx) {
+                logger.error("Failed to truncate segment {} after batch write failure", filePath, truncateEx);
+            }
+            throw e;
+        }
+
+        BrokerMetrics.get().recordLogAppend(totalBytesWritten, System.nanoTime() - startNanos);
+        return positions;
     }
 
     /**

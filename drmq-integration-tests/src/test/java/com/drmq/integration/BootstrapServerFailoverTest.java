@@ -123,7 +123,7 @@ class BootstrapServerFailoverTest {
         String bootstrapServers = "localhost:" + PORT_1 + ",localhost:" + PORT_2 + ",localhost:" + PORT_3;
         try (DRMQProducer producer = new DRMQProducer(bootstrapServers)) {
             // Send a message — should connect to one of the brokers and eventually reach leader
-            var result = producer.send("bootstrap-test", "Message 1");
+            var result = producer.send("bootstrap-test", "Message 1").join();
             assertTrue(result.isSuccess(), "Producer should connect to one of the bootstrap servers");
         }
 
@@ -162,7 +162,7 @@ class BootstrapServerFailoverTest {
         String bootstrapServers = "localhost:" + PORT_1 + ",localhost:" + PORT_2 + ",localhost:" + PORT_3;
         try (DRMQProducer producer = new DRMQProducer(bootstrapServers)) {
             // This should retry and connect to PORT_2 or PORT_3
-            var result = producer.send("failover-test", "Should work despite first server down");
+            var result = producer.send("failover-test", "Should work despite first server down").join();
             assertTrue(result.isSuccess(), "Producer should failover to next bootstrap server");
         }
 
@@ -188,7 +188,7 @@ class BootstrapServerFailoverTest {
 
         // Send a message successfully to establish baseline
         try (DRMQProducer producer = new DRMQProducer(bootstrapServers)) {
-            var result = producer.send("baseline", "Baseline message");
+            var result = producer.send("baseline", "Baseline message").join();
             assertTrue(result.isSuccess());
         }
 
@@ -206,7 +206,7 @@ class BootstrapServerFailoverTest {
         // Now try to send with the same producer bootstrap servers
         // The producer should retry and eventually connect to the new leader
         try (DRMQProducer producer = new DRMQProducer(bootstrapServers)) {
-            var result = producer.send("after-failover", "Message after leader dies");
+            var result = producer.send("after-failover", "Message after leader dies").join();
             assertTrue(result.isSuccess(), "Producer should handle leader failover and retry");
         }
 
@@ -231,9 +231,9 @@ class BootstrapServerFailoverTest {
         // Produce some messages
         try (DRMQProducer producer = new DRMQProducer("localhost", leader.getPort())) {
             producer.connect();
-            producer.send("consumer-bootstrap", "Message 1");
-            producer.send("consumer-bootstrap", "Message 2");
-            producer.send("consumer-bootstrap", "Message 3");
+            producer.send("consumer-bootstrap", "Message 1").join();
+            producer.send("consumer-bootstrap", "Message 2").join();
+            producer.send("consumer-bootstrap", "Message 3").join();
         }
 
         Thread.sleep(300);
@@ -257,8 +257,8 @@ class BootstrapServerFailoverTest {
         // Produce some messages
         try (DRMQProducer producer = new DRMQProducer("localhost", leader.getPort())) {
             producer.connect();
-            producer.send("consumer-failover", "Message 1");
-            producer.send("consumer-failover", "Message 2");
+            producer.send("consumer-failover", "Message 1").join();
+            producer.send("consumer-failover", "Message 2").join();
         }
 
         Thread.sleep(300);
@@ -296,8 +296,8 @@ class BootstrapServerFailoverTest {
         // Produce initial messages
         try (DRMQProducer producer = new DRMQProducer("localhost", leader.getPort())) {
             producer.connect();
-            producer.send("consumer-continuous", "Message 1");
-            producer.send("consumer-continuous", "Message 2");
+            producer.send("consumer-continuous", "Message 1").join();
+            producer.send("consumer-continuous", "Message 2").join();
         }
 
         Thread.sleep(300);
@@ -323,8 +323,8 @@ class BootstrapServerFailoverTest {
             assertNotNull(newLeader);
             try (DRMQProducer producer2 = new DRMQProducer("localhost", newLeader.getPort())) {
                 producer2.connect();
-                producer2.send("consumer-continuous", "Message 3");
-                producer2.send("consumer-continuous", "Message 4");
+                producer2.send("consumer-continuous", "Message 3").join();
+                producer2.send("consumer-continuous", "Message 4").join();
             }
 
             Thread.sleep(300);

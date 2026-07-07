@@ -2,6 +2,7 @@ package com.drmq.broker;
 
 import com.drmq.broker.persistence.LogManager;
 import com.drmq.broker.persistence.LogSegment;
+import com.drmq.protocol.DRMQProtocol.ProduceBatchRequest;
 import com.drmq.protocol.DRMQProtocol.StoredMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -217,6 +218,80 @@ public class MessageStore implements Closeable {
         }
 
         return offset;
+    }
+
+    /**
+     * Append a batch of messages to the specified topic with True Group Commit.
+     * Reserves a contiguous block of offsets atomically, writes all messages in one
+     * disk operation with a single fsync, then updates RAM indexes and caches.
+     *
+     * @param topic     The target topic
+     * @param entries   The batch entries (payload, key, timestamp)
+     * @return The base offset (offset of the first message in the batch)
+     */
+    public long appendBatch(String topic, List<ProduceBatchRequest.BatchEntry> entries) {
+        int batchSize = entries.size();
+        if (batchSize == 0) {
+            throw new IllegalArgumentException("Batch must contain at least one message");
+        }
+
+        long baseOffset = globalOffset.getAndAdd(batchSize);
+        long storedAt = System.currentTimeMillis();
+
+        List<StoredMessage> messages = new ArrayList<>(batchSize);
+        long currentOffset = baseOffset;
+        for (var entry : entries) {
+            StoredMessage.Builder builder = StoredMessage.newBuilder()
+                    .setOffset(currentOffset++)
+                    .setTopic(topic)
+                    .setPayload(entry.getPayload())
+                    .setTimestamp(entry.getClientTimestamp())
+                    .setStoredAt(storedAt);
+
+            if (entry.hasKey()) {
+                builder.setKey(entry.getKey());
+            }
+
+            messages.add(builder.build());
+        }
+
+        globalLock.readLock().lock();
+        try {
+            Object topicLock = topicWriteLocks.computeIfAbsent(topic, k -> new Object());
+            List<Long> positions;
+            synchronized (topicLock) {
+                LogSegment segment = logManager.getOrCreateActiveSegment(topic);
+
+                if (segment.getSize() >= config.getLogSegmentBytes()) {
+                    segment = logManager.rollNewSegment(topic, baseOffset);
+                }
+
+                positions = segment.appendBatch(messages);
+            }
+
+            AtomicLong counter = topicMessageCounts.computeIfAbsent(topic, k -> new AtomicLong());
+            for (int i = 0; i < messages.size(); i++) {
+                StoredMessage msg = messages.get(i);
+                indexMessage(topic, msg.getOffset(), positions.get(i));
+                addToCache(topic, msg);
+                counter.incrementAndGet();
+            }
+
+            logger.debug("Batch persisted: topic={}, baseOffset={}, count={}", topic, baseOffset, batchSize);
+
+        } catch (IOException e) {
+            logger.error("Failed to persist batch for topic {}", topic, e);
+            throw new RuntimeException("Failed to persist batch", e);
+        } finally {
+            globalLock.readLock().unlock();
+        }
+
+        synchronized (messageMonitor) {
+            messageSignal.incrementAndGet();
+            messageMonitor.notifyAll();
+        }
+
+        return baseOffset;
     }
 
     /**
