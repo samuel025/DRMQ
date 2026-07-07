@@ -17,6 +17,9 @@ import java.util.concurrent.*;
 public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
     private static final Logger logger = LoggerFactory.getLogger(ClientHandler.class);
 
+    private static final int MAX_BATCH_MESSAGES = 10000;
+    private static final int MAX_PAYLOAD_BYTES = 10 * 1024 * 1024; // 10MB
+
     private final MessageStore messageStore;
     private final OffsetManager offsetManager;
     private final RaftNode raftNode;  
@@ -149,9 +152,16 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
             if (batchCount == 0) {
                 return createProduceBatchErrorResponse("Batch must contain at least one message");
             }
+            if (batchCount > MAX_BATCH_MESSAGES) {
+                return createProduceBatchErrorResponse("Batch exceeds maximum message count of " + MAX_BATCH_MESSAGES);
+            }
 
             for (var entry : request.getEntriesList()) {
                 totalPayloadBytes += entry.getPayload().size();
+            }
+
+            if (totalPayloadBytes > MAX_PAYLOAD_BYTES) {
+                return createProduceBatchErrorResponse("Batch payload exceeds maximum size of " + MAX_PAYLOAD_BYTES + " bytes");
             }
 
             long baseOffset;

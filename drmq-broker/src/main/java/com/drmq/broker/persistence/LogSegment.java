@@ -90,15 +90,20 @@ public class LogSegment implements AutoCloseable {
         int totalBytesWritten = 0;
 
         try {
+            // Pre-validate and serialize all messages before any writes
+            List<byte[]> serializedMessages = new ArrayList<>(messages.size());
             for (StoredMessage message : messages) {
                 byte[] messageBytes = message.toByteArray();
-
                 if (messageBytes.length > MAX_MESSAGE_SIZE) {
                     throw new IllegalArgumentException(
                         "Message size " + messageBytes.length + " bytes exceeds maximum allowed size " +
                         MAX_MESSAGE_SIZE + " bytes. Message cannot be persisted.");
                 }
+                serializedMessages.add(messageBytes);
+            }
 
+            // Write all validated messages
+            for (byte[] messageBytes : serializedMessages) {
                 ByteBuffer buffer = ByteBuffer.allocate(4 + messageBytes.length);
                 buffer.putInt(messageBytes.length);
                 buffer.put(messageBytes);
@@ -114,11 +119,9 @@ public class LogSegment implements AutoCloseable {
                 totalBytesWritten += buffer.limit();
             }
 
-            // TRUE GROUP COMMIT: single fsync for the entire batch
             fileChannel.force(true);
 
         } catch (IOException e) {
-            // Roll back partial writes on failure
             logger.warn("Batch write failed at position {}. Truncating segment {} back to {}",
                     currentSize, filePath, originalSize);
             try {

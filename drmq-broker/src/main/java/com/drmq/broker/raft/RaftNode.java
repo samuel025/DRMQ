@@ -40,7 +40,7 @@ public class RaftNode {
     private static final long PROPOSAL_TIMEOUT_SECONDS = 60;
     
 
-    private static final long STALE_PROPOSAL_THRESHOLD_MS = 30000;  // 30 seconds
+    private static final long STALE_PROPOSAL_THRESHOLD_MS = 65000;  // 65 seconds (must exceed PROPOSAL_TIMEOUT_SECONDS)
     private static final long PROPOSAL_CLEANUP_INTERVAL_MS = 5000;  // Check every 5 seconds
     private static final int MAX_PENDING_PROPOSALS = 10000;  // Safety limit
 
@@ -974,6 +974,15 @@ public class RaftNode {
         } finally {
             lock.unlock();
         }
+        
+        if (peers.isEmpty()) {
+            lock.lock();
+            try {
+                advanceCommitIndex();
+            } finally {
+                lock.unlock();
+            }
+        }
         sendHeartbeats();
         try {
             return future.get(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -1042,6 +1051,15 @@ public class RaftNode {
         } finally {
             lock.unlock();
         }
+        
+        if (peers.isEmpty()) {
+            lock.lock();
+            try {
+                advanceCommitIndex();
+            } finally {
+                lock.unlock();
+            }
+        }
         sendHeartbeats();
         try {
             return future.get(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -1108,6 +1126,14 @@ public class RaftNode {
             lock.unlock();
         }
 
+        if (peers.isEmpty()) {
+            lock.lock();
+            try {
+                advanceCommitIndex();
+            } finally {
+                lock.unlock();
+            }
+        }
         sendHeartbeats();
 
         try {

@@ -10,7 +10,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
@@ -36,7 +36,8 @@ public class DRMQProducer implements AutoCloseable {
     private volatile boolean connected = false;
     private volatile boolean running = true;
 
-    private final ConcurrentLinkedQueue<PendingMessage> accumulator = new ConcurrentLinkedQueue<>();
+    private static final int MAX_ACCUMULATOR_MESSAGES = 100000;
+    private final LinkedBlockingQueue<PendingMessage> accumulator = new LinkedBlockingQueue<>(MAX_ACCUMULATOR_MESSAGES);
     private final Thread senderThread;
 
     public DRMQProducer(String host, int port) {
@@ -153,7 +154,9 @@ public class DRMQProducer implements AutoCloseable {
             future.completeExceptionally(new IllegalArgumentException("Payload too large"));
             return future;
         }
-        accumulator.add(new PendingMessage(topic, payload, key, future));
+        if (!accumulator.offer(new PendingMessage(topic, payload, key, future))) {
+            future.completeExceptionally(new IllegalStateException("Producer accumulator is full (capacity: " + MAX_ACCUMULATOR_MESSAGES + "). Apply backpressure."));
+        }
         return future;
     }
 
@@ -165,7 +168,7 @@ public class DRMQProducer implements AutoCloseable {
                     continue;
                 }
 
-                // Group messages by topic
+   
                 List<PendingMessage> currentBatch = new ArrayList<>();
                 int currentBytes = 0;
                 long firstMsgTime = System.currentTimeMillis();
@@ -176,7 +179,7 @@ public class DRMQProducer implements AutoCloseable {
                     if (currentTopic == null) {
                         currentTopic = peeked.topic;
                     } else if (!currentTopic.equals(peeked.topic)) {
-                        break; // Batches are per-topic
+                        break; 
                     }
 
                     PendingMessage msg = accumulator.poll();
@@ -221,13 +224,17 @@ public class DRMQProducer implements AutoCloseable {
                 .build();
 
         IOException lastException = null;
-        long deliveryTimeoutMs = 120_000; // 2 minutes max wait time for cluster healing
+        long deliveryTimeoutMs = 120_000; 
         long startMs = System.currentTimeMillis();
         long currentBackoffMs = 100;
 
         while (true) {
+            if (!running || Thread.currentThread().isInterrupted()) {
+                lastException = new IOException("Producer closed or interrupted during retry");
+                break;
+            }
             if (System.currentTimeMillis() - startMs > deliveryTimeoutMs) {
-                break; // Give up after 2 minutes
+                break; 
             }
 
             try {
@@ -279,7 +286,6 @@ public class DRMQProducer implements AutoCloseable {
                             closeConnection();
                             rotateToNextServer();
                         } else {
-                            // Fatal error from broker (e.g., bad payload), do not retry
                             for (PendingMessage pm : batch) {
                                 pm.future.complete(SendResult.failure(errorMsg));
                             }
@@ -364,8 +370,13 @@ public class DRMQProducer implements AutoCloseable {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+            if (senderThread.isAlive()) {
+                senderThread.interrupt();
+            }
         }
-        closeConnection();
+        synchronized (sendLock) {
+            closeConnection();
+        }
         logger.info("Disconnected from broker");
     }
 

@@ -82,7 +82,7 @@ export class DRMQClient {
         return; // Connected successfully
       } catch (err) {
         lastError = err as Error;
-        this.close();
+        this.closeConnection();
         this.rotateServer();
         await new Promise(res => setTimeout(res, 500)); // sleep
       }
@@ -98,7 +98,7 @@ export class DRMQClient {
   }
 
   protected async reconnect(): Promise<void> {
-    this.close();
+    this.closeConnection();
     this.rotateServer();
     await this.ensureConnected();
   }
@@ -114,7 +114,7 @@ export class DRMQClient {
       if (parts.length === 2) {
         this.host = parts[0];
         this.port = parseInt(parts[1], 10);
-        this.close();
+        this.closeConnection();
         await this.ensureConnected();
         return true;
       }
@@ -124,7 +124,7 @@ export class DRMQClient {
     return true;
   }
 
-  public close(): void {
+  protected closeConnection(): void {
     if (this.socket) {
       this.socket.destroy();
       this.socket = null;
@@ -132,6 +132,10 @@ export class DRMQClient {
     this.responseQueue.forEach(resolve => resolve(Buffer.alloc(0)));
     this.responseQueue = [];
     this.receiveBuffer = Buffer.alloc(0);
+  }
+
+  public close(): void {
+    this.closeConnection();
   }
 
   private handleData(data: Buffer): void {
@@ -214,7 +218,7 @@ export class DRMQProducer extends DRMQClient {
         this.accumulator.set(topic, []);
       }
       this.accumulator.get(topic)!.push({
-        payload,
+        payload: new Uint8Array(payload),
         key,
         timestamp: Date.now(),
         resolve,
@@ -277,15 +281,15 @@ export class DRMQProducer extends DRMQClient {
               if (parts.length === 2) {
                 this.host = parts[0];
                 this.port = parseInt(parts[1], 10);
-                super.close();
+                super.closeConnection();
                 await this.ensureConnected();
                 continue;
               }
             }
-            super.close();
+            super.closeConnection();
             this.rotateServer();
           } else if (errorMsg && (errorMsg.includes("timed out") || errorMsg.includes("Lost leadership") || errorMsg.includes("Raft batch proposal"))) {
-            super.close();
+            super.closeConnection();
             this.rotateServer();
           } else {
             batch.forEach(pm => pm.resolve({ success: false, offset: -1, errorMessage: errorMsg }));
@@ -293,7 +297,7 @@ export class DRMQProducer extends DRMQClient {
           }
         }
       } catch (e) {
-        super.close();
+        super.closeConnection();
         this.rotateServer();
       }
 
