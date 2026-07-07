@@ -12,7 +12,9 @@ import {
   FetchOffsetRequest,
   FetchOffsetResponse,
   NackRequest,
-  NackResponse
+  NackResponse,
+  ProduceBatchRequest,
+  ProduceBatchResponse
 } from './messages';
 
 export class DRMQConnectionError extends Error {
@@ -80,7 +82,7 @@ export class DRMQClient {
         return; // Connected successfully
       } catch (err) {
         lastError = err as Error;
-        this.close();
+        this.closeConnection();
         this.rotateServer();
         await new Promise(res => setTimeout(res, 500)); // sleep
       }
@@ -96,7 +98,7 @@ export class DRMQClient {
   }
 
   protected async reconnect(): Promise<void> {
-    this.close();
+    this.closeConnection();
     this.rotateServer();
     await this.ensureConnected();
   }
@@ -112,7 +114,7 @@ export class DRMQClient {
       if (parts.length === 2) {
         this.host = parts[0];
         this.port = parseInt(parts[1], 10);
-        this.close();
+        this.closeConnection();
         await this.ensureConnected();
         return true;
       }
@@ -122,7 +124,7 @@ export class DRMQClient {
     return true;
   }
 
-  public close(): void {
+  protected closeConnection(): void {
     if (this.socket) {
       this.socket.destroy();
       this.socket = null;
@@ -130,6 +132,10 @@ export class DRMQClient {
     this.responseQueue.forEach(resolve => resolve(Buffer.alloc(0)));
     this.responseQueue = [];
     this.receiveBuffer = Buffer.alloc(0);
+  }
+
+  public close(): void {
+    this.closeConnection();
   }
 
   private handleData(data: Buffer): void {
@@ -155,7 +161,7 @@ export class DRMQClient {
 
     const envelope = MessageEnvelope.create({
       type: msgType,
-      payload: payload
+      payload: Buffer.from(payload)
     });
     const envelopeBytes = MessageEnvelope.encode(envelope).finish();
 
@@ -185,35 +191,127 @@ export class DRMQClient {
   }
 }
 
+export interface SendResult {
+  success: boolean;
+  offset: number;
+  errorMessage?: string;
+}
+
+interface PendingMessage {
+  payload: Uint8Array;
+  key?: string;
+  timestamp: number;
+  resolve: (res: SendResult) => void;
+  reject: (err: Error) => void;
+}
+
 export class DRMQProducer extends DRMQClient {
-  public async send(topic: string, payload: Uint8Array, key?: string): Promise<ProduceResponse> {
-    const req = ProduceRequest.create({
+  private accumulator: Map<string, PendingMessage[]> = new Map();
+  private sendTimer: NodeJS.Timeout | null = null;
+  private isClosed = false;
+
+  public async send(topic: string, payload: Uint8Array, key?: string): Promise<SendResult> {
+    if (this.isClosed) throw new Error("Producer is closed");
+    
+    return new Promise((resolve, reject) => {
+      if (!this.accumulator.has(topic)) {
+        this.accumulator.set(topic, []);
+      }
+      this.accumulator.get(topic)!.push({
+        payload: new Uint8Array(payload),
+        key,
+        timestamp: Date.now(),
+        resolve,
+        reject
+      });
+
+      if (!this.sendTimer) {
+        this.sendTimer = setTimeout(() => this.flush(), 5);
+      }
+    });
+  }
+
+  private async flush() {
+    this.sendTimer = null;
+    const batches = this.accumulator;
+    this.accumulator = new Map();
+
+    for (const [topic, batch] of batches.entries()) {
+      this.sendBatchWithRetry(topic, batch).catch(e => {
+        batch.forEach(pm => pm.reject(e));
+      });
+    }
+  }
+
+  private async sendBatchWithRetry(topic: string, batch: PendingMessage[]) {
+    const req = ProduceBatchRequest.create({
       topic,
-      payload,
-      key,
-      timestamp: Date.now()
+      entries: batch.map(pm => ({
+        payload: Buffer.from(pm.payload),
+        key: pm.key,
+        clientTimestamp: pm.timestamp
+      }))
     });
 
-    for (let attempt = 0; attempt < this.maxRetries; attempt++) {
+    const envelopeBytes = ProduceBatchRequest.encode(req).finish();
+    const deliveryTimeoutMs = 120000;
+    const startMs = Date.now();
+    let currentBackoffMs = 100;
+
+    while (true) {
+      if (Date.now() - startMs > deliveryTimeoutMs) {
+        break;
+      }
+
       try {
         await this.ensureConnected();
-        const respBytes = await this.sendEnvelope(
-          MessageType.PRODUCE_REQUEST,
-          ProduceRequest.encode(req).finish()
-        );
+        const respBytes = await this.sendEnvelope(MessageType.PRODUCE_BATCH_REQUEST, envelopeBytes);
+        const resp = ProduceBatchResponse.decode(respBytes);
 
-        const resp = ProduceResponse.decode(respBytes);
-
-        if (!resp.success && await this.tryRedirectToLeader(resp.errorMessage)) {
-          continue; // Retry on new leader
+        if (resp.success) {
+          let baseOffset = Number(resp.baseOffset);
+          batch.forEach((pm, i) => pm.resolve({ success: true, offset: baseOffset + i }));
+          return;
+        } else {
+          const errorMsg = resp.errorMessage;
+          if (errorMsg && errorMsg.startsWith("NOT_LEADER:")) {
+            const leaderAddr = errorMsg.substring("NOT_LEADER:".length);
+            if (leaderAddr !== "UNKNOWN") {
+              const parts = leaderAddr.split(":");
+              if (parts.length === 2) {
+                this.host = parts[0];
+                this.port = parseInt(parts[1], 10);
+                super.closeConnection();
+                await this.ensureConnected();
+                continue;
+              }
+            }
+            super.closeConnection();
+            this.rotateServer();
+          } else if (errorMsg && (errorMsg.includes("timed out") || errorMsg.includes("Lost leadership") || errorMsg.includes("Raft batch proposal"))) {
+            super.closeConnection();
+            this.rotateServer();
+          } else {
+            batch.forEach(pm => pm.resolve({ success: false, offset: -1, errorMessage: errorMsg }));
+            return;
+          }
         }
-
-        return resp;
-      } catch (err) {
-        await this.reconnect();
+      } catch (e) {
+        super.closeConnection();
+        this.rotateServer();
       }
+
+      await new Promise(res => setTimeout(res, currentBackoffMs));
+      currentBackoffMs = Math.min(2000, currentBackoffMs * 2);
     }
-    throw new DRMQConnectionError(`Failed to send message after ${this.maxRetries} attempts`);
+
+    throw new Error("Failed to send batch: timeout exhausted");
+  }
+
+  public close() {
+    this.isClosed = true;
+    if (this.sendTimer) clearTimeout(this.sendTimer);
+    super.close();
   }
 }
 

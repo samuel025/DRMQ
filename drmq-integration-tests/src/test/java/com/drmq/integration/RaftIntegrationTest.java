@@ -154,7 +154,7 @@ class RaftIntegrationTest {
         // Produce via the leader
         try (DRMQProducer producer = new DRMQProducer("localhost", leader.getPort())) {
             producer.connect();
-            var result = producer.send("raft-topic", "Replicated Message");
+            var result = producer.send("raft-topic", "Replicated Message").join();
             assertTrue(result.isSuccess(), "Produce via leader should succeed");
         }
 
@@ -186,7 +186,7 @@ class RaftIntegrationTest {
         try (DRMQProducer producer = new DRMQProducer("localhost", follower.getPort())) {
             producer.connect();
             // The producer auto-redirects to leader, so the send should succeed
-            var result = producer.send("redirect-topic", "Redirected Message");
+            var result = producer.send("redirect-topic", "Redirected Message").join();
             assertTrue(result.isSuccess(), "Producer should auto-redirect to leader and succeed");
         }
 
@@ -240,7 +240,7 @@ class RaftIntegrationTest {
         assertNotNull(leader);
         try (DRMQProducer producer = new DRMQProducer("localhost", leader.getPort())) {
             producer.connect();
-            producer.send("failover-topic", "Before failover");
+            producer.send("failover-topic", "Before failover").join();
         }
         Thread.sleep(300);
 
@@ -258,7 +258,7 @@ class RaftIntegrationTest {
         // Produce via the new leader
         try (DRMQProducer producer = new DRMQProducer("localhost", newLeader.getPort())) {
             producer.connect();
-            var result = producer.send("failover-topic", "After failover");
+            var result = producer.send("failover-topic", "After failover").join();
             assertTrue(result.isSuccess(), "New leader should accept writes after failover");
         }
     }
@@ -280,7 +280,7 @@ class RaftIntegrationTest {
 
             try (DRMQProducer producer = new DRMQProducer("localhost", 19110)) {
                 producer.connect();
-                var result = producer.send("standalone-topic", "Hello standalone");
+                var result = producer.send("standalone-topic", "Hello standalone").join();
                 assertTrue(result.isSuccess());
                 assertEquals(0, result.getOffset());
             }
@@ -312,8 +312,8 @@ class RaftIntegrationTest {
         // Produce via leader
         try (DRMQProducer producer = new DRMQProducer("localhost", leader.getPort())) {
             producer.connect();
-            producer.send("consumer-raft", "Message 1");
-            producer.send("consumer-raft", "Message 2");
+            producer.send("consumer-raft", "Message 1").join();
+            producer.send("consumer-raft", "Message 2").join();
         }
 
         // Wait for replication

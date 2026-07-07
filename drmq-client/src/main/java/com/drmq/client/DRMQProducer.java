@@ -9,23 +9,24 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * DRMQ Producer client for sending messages to the broker.
- * Supports bootstrap servers: provide multiple broker addresses so the producer
- * can automatically failover to another broker if the current one dies.
- * Thread-safe: can be used by multiple threads to send messages concurrently.
- * Uses synchronous send with response waiting.
+ * Supports asynchronous client-side batching for high throughput.
  */
 public class DRMQProducer implements AutoCloseable {
     private static final Logger logger = LoggerFactory.getLogger(DRMQProducer.class);
     private static final int MAX_RETRIES = 5;
-    private static final long RECONNECT_DELAY_MS = 500;  // Brief pause between retries to allow leader election
+    private static final long RECONNECT_DELAY_MS = 500;
+    private static final int BATCH_SIZE_BYTES = 16384; // 16KB
+    private static final long LINGER_MS = 5;
 
     private String host;
     private int port;
-    private final List<String[]> bootstrapServers;  // List of [host, port] pairs
+    private final List<String[]> bootstrapServers;
     private int currentServerIndex = 0;
     private final Object sendLock = new Object();
 
@@ -33,10 +34,12 @@ public class DRMQProducer implements AutoCloseable {
     private DataInputStream in;
     private DataOutputStream out;
     private volatile boolean connected = false;
+    private volatile boolean running = true;
 
-    /**
-     * Create a producer targeting a single broker.
-     */
+    private static final int MAX_ACCUMULATOR_MESSAGES = 100000;
+    private final LinkedBlockingQueue<PendingMessage> accumulator = new LinkedBlockingQueue<>(MAX_ACCUMULATOR_MESSAGES);
+    private final Thread senderThread;
+
     public DRMQProducer(String host, int port) {
         List<String[]> parsed = host != null && host.contains(",") ? parseBootstrapServers(host) : List.of();
         if (!parsed.isEmpty()) {
@@ -44,22 +47,16 @@ public class DRMQProducer implements AutoCloseable {
             this.currentServerIndex = ThreadLocalRandom.current().nextInt(bootstrapServers.size());
             this.host = bootstrapServers.get(currentServerIndex)[0];
             this.port = Integer.parseInt(bootstrapServers.get(currentServerIndex)[1]);
-            logger.warn("Comma-separated bootstrap list passed as host; using parsed servers and ignoring port {}", port);
         } else {
             this.host = host;
             this.port = port;
             this.bootstrapServers = new ArrayList<>();
             this.bootstrapServers.add(new String[]{host, String.valueOf(port)});
         }
+        senderThread = new Thread(this::senderLoop, "drmq-producer-sender");
+        senderThread.start();
     }
 
-    /**
-     * Create a producer with multiple bootstrap servers for failover.
-     * Format: "host1:port1,host2:port2,host3:port3"
-     *
-     * The producer will try each server in order when the current one fails.
-     * If it connects to a follower, it will auto-redirect to the leader.
-     */
     public DRMQProducer(String bootstrapServersStr) {
         this.bootstrapServers = new ArrayList<>(parseBootstrapServers(bootstrapServersStr));
         if (bootstrapServers.isEmpty()) {
@@ -68,6 +65,8 @@ public class DRMQProducer implements AutoCloseable {
         this.currentServerIndex = ThreadLocalRandom.current().nextInt(bootstrapServers.size());
         this.host = bootstrapServers.get(currentServerIndex)[0];
         this.port = Integer.parseInt(bootstrapServers.get(currentServerIndex)[1]);
+        senderThread = new Thread(this::senderLoop, "drmq-producer-sender");
+        senderThread.start();
     }
 
     private static List<String[]> parseBootstrapServers(String bootstrapServersStr) {
@@ -84,16 +83,10 @@ public class DRMQProducer implements AutoCloseable {
         return parsed;
     }
 
-    /**
-     * Create a producer targeting localhost with default port.
-     */
     public DRMQProducer() {
         this("localhost", 9092);
     }
 
-    /**
-     * Connect to the broker.
-     */
     public void connect() throws IOException {
         ensureConnectedWithRetry();
     }
@@ -115,11 +108,6 @@ public class DRMQProducer implements AutoCloseable {
         logger.info("Connected to broker at {}:{}", host, port);
     }
 
-    /**
-     * Ensures connected state with automatic retries across all bootstrap servers.
-     * Tries to connect to the current broker, and if that fails, cycles through
-     * all bootstrap servers before giving up.
-     */
     private void ensureConnectedWithRetry() throws IOException {
         if (connected && socket != null && !socket.isClosed()) {
             return;
@@ -129,12 +117,12 @@ public class DRMQProducer implements AutoCloseable {
         }
 
         IOException lastException = null;
-        int totalAttempts = MAX_RETRIES * bootstrapServers.size();
+        int totalAttempts = MAX_RETRIES * Math.max(1, bootstrapServers.size());
 
         for (int attempt = 0; attempt < totalAttempts; attempt++) {
             try {
                 connectInternal();
-                return;  // Success
+                return;
             } catch (IOException e) {
                 logger.debug("Connection to {}:{} failed (attempt {}/{}): {}",
                         host, port, attempt + 1, totalAttempts, e.getMessage());
@@ -152,137 +140,177 @@ public class DRMQProducer implements AutoCloseable {
                 (lastException != null ? lastException.getMessage() : "unknown error"));
     }
 
-
-    /**
-     * Send a message to the specified topic.
-     *
-     * @param topic   The topic name
-     * @param payload The message payload
-     * @return The result containing the assigned offset or error
-     */
-    public SendResult send(String topic, byte[] payload) throws IOException {
+    public CompletableFuture<SendResult> send(String topic, byte[] payload) {
         return send(topic, payload, null);
     }
 
-    /**
-     * Send a string message to the specified topic.
-     */
-    public SendResult send(String topic, String message) throws IOException {
+    public CompletableFuture<SendResult> send(String topic, String message) {
         return send(topic, message.getBytes(StandardCharsets.UTF_8), null);
     }
 
-    /**
-     * Send a message with an optional key to the specified topic.
-     *
-     * @param topic   The topic name
-     * @param payload The message payload
-     * @param key     Optional message key (can be null)
-     * @return The result containing the assigned offset or error
-     */
-    public SendResult send(String topic, byte[] payload, String key) throws IOException {
-        return sendWithRetry(topic, payload, key, MAX_RETRIES);
+    public CompletableFuture<SendResult> send(String topic, byte[] payload, String key) {
+        CompletableFuture<SendResult> future = new CompletableFuture<>();
+        if (payload.length > 10 * 1024 * 1024) { // 10MB sanity check
+            future.completeExceptionally(new IllegalArgumentException("Payload too large"));
+            return future;
+        }
+        if (!accumulator.offer(new PendingMessage(topic, payload, key, future))) {
+            future.completeExceptionally(new IllegalStateException("Producer accumulator is full (capacity: " + MAX_ACCUMULATOR_MESSAGES + "). Apply backpressure."));
+        }
+        return future;
     }
 
-    private SendResult sendWithRetry(String topic, byte[] payload, String key, int retriesLeft) throws IOException {
-        // Build the produce request
-        ProduceRequest.Builder requestBuilder = ProduceRequest.newBuilder()
-                .setTopic(topic)
-                .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
-                .setTimestamp(System.currentTimeMillis());
+    private void senderLoop() {
+        while (running || !accumulator.isEmpty()) {
+            try {
+                if (accumulator.isEmpty()) {
+                    Thread.sleep(1);
+                    continue;
+                }
 
-        if (key != null && !key.isEmpty()) {
-            requestBuilder.setKey(key);
+   
+                List<PendingMessage> currentBatch = new ArrayList<>();
+                int currentBytes = 0;
+                long firstMsgTime = System.currentTimeMillis();
+                String currentTopic = null;
+
+                while (!accumulator.isEmpty() && currentBytes < BATCH_SIZE_BYTES) {
+                    PendingMessage peeked = accumulator.peek();
+                    if (currentTopic == null) {
+                        currentTopic = peeked.topic;
+                    } else if (!currentTopic.equals(peeked.topic)) {
+                        break; 
+                    }
+
+                    PendingMessage msg = accumulator.poll();
+                    currentBatch.add(msg);
+                    currentBytes += msg.payload.length;
+                    
+                    if (System.currentTimeMillis() - firstMsgTime >= LINGER_MS) {
+                        break;
+                    }
+                }
+
+                if (!currentBatch.isEmpty()) {
+                    sendBatchWithRetry(currentTopic, currentBatch, MAX_RETRIES);
+                }
+
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception e) {
+                logger.error("Error in sender loop", e);
+            }
+        }
+    }
+
+    private void sendBatchWithRetry(String topic, List<PendingMessage> batch, int retriesLeft) {
+        ProduceBatchRequest.Builder requestBuilder = ProduceBatchRequest.newBuilder()
+                .setTopic(topic);
+
+        for (PendingMessage pm : batch) {
+            ProduceBatchRequest.BatchEntry.Builder entryBuilder = ProduceBatchRequest.BatchEntry.newBuilder()
+                    .setPayload(com.google.protobuf.ByteString.copyFrom(pm.payload))
+                    .setClientTimestamp(pm.timestamp);
+            if (pm.key != null) {
+                entryBuilder.setKey(pm.key);
+            }
+            requestBuilder.addEntries(entryBuilder.build());
         }
 
-        ProduceRequest request = requestBuilder.build();
-
-        // Wrap in envelope
         MessageEnvelope envelope = MessageEnvelope.newBuilder()
-                .setType(MessageType.PRODUCE_REQUEST)
-                .setPayload(request.toByteString())
+                .setType(MessageType.PRODUCE_BATCH_REQUEST)
+                .setPayload(requestBuilder.build().toByteString())
                 .build();
 
         IOException lastException = null;
-        int totalAttempts = MAX_RETRIES * bootstrapServers.size();
+        long deliveryTimeoutMs = 120_000; 
+        long startMs = System.currentTimeMillis();
+        long currentBackoffMs = 100;
 
-        for (int attempt = 0; attempt < totalAttempts; attempt++) {
+        while (true) {
+            if (!running || Thread.currentThread().isInterrupted()) {
+                lastException = new IOException("Producer closed or interrupted during retry");
+                break;
+            }
+            if (System.currentTimeMillis() - startMs > deliveryTimeoutMs) {
+                break; 
+            }
+
             try {
                 ensureConnectedWithRetry();
-
-                // Send and receive (synchronized for thread safety)
+                
                 synchronized (sendLock) {
                     byte[] envelopeBytes = envelope.toByteArray();
                     out.writeInt(envelopeBytes.length);
                     out.write(envelopeBytes);
                     out.flush();
 
-                    // Read response
                     int responseLength = in.readInt();
                     byte[] responseBytes = new byte[responseLength];
                     in.readFully(responseBytes);
 
                     MessageEnvelope responseEnvelope = MessageEnvelope.parseFrom(responseBytes);
-                    ProduceResponse response = ProduceResponse.parseFrom(responseEnvelope.getPayload());
+                    ProduceBatchResponse response = ProduceBatchResponse.parseFrom(responseEnvelope.getPayload());
 
                     if (response.getSuccess()) {
-                        logger.debug("Message sent: topic={}, offset={}", topic, response.getOffset());
-                        return SendResult.success(response.getOffset());
+                        long baseOffset = response.getBaseOffset();
+                        for (int i = 0; i < batch.size(); i++) {
+                            batch.get(i).future.complete(SendResult.success(baseOffset + i));
+                        }
+                        return; // Success
                     } else {
                         String errorMsg = response.getErrorMessage();
-                        // Check for leader redirection (Raft cluster mode)
                         if (errorMsg != null && errorMsg.startsWith("NOT_LEADER:")) {
                             String leaderAddr = errorMsg.substring("NOT_LEADER:".length());
                             if (!leaderAddr.equals("UNKNOWN")) {
-                                logger.info("Redirected to leader: {}", leaderAddr);
                                 try {
                                     redirectToLeader(leaderAddr);
-                                    // Retry the send to the leader
-                                    continue;
+                                    continue; // Try again immediately on new leader
                                 } catch (IOException e) {
-                                    logger.warn("Failed to redirect to leader {}: {}", leaderAddr, e.getMessage());
                                     lastException = e;
                                     closeConnection();
                                     rotateToNextServer();
                                 }
                             } else {
-                                logger.info("Leader unknown, rotating to next bootstrap server");
                                 lastException = new IOException("Leader unknown");
                                 closeConnection();
                                 rotateToNextServer();
-                                try { Thread.sleep(RECONNECT_DELAY_MS); } catch (InterruptedException ie) {
-                                    Thread.currentThread().interrupt();
-                                    throw new IOException("Interrupted during leader-unknown retry", ie);
-                                }
-                                continue;
                             }
+                        } else if (errorMsg != null && (
+                                errorMsg.contains("timed out") || 
+                                errorMsg.contains("Lost leadership") ||
+                                errorMsg.contains("Raft batch proposal")
+                        )) {
+                            lastException = new IOException("Broker cluster error: " + errorMsg);
+                            closeConnection();
+                            rotateToNextServer();
+                        } else {
+                            for (PendingMessage pm : batch) {
+                                pm.future.complete(SendResult.failure(errorMsg));
+                            }
+                            return;
                         }
-                        logger.warn("Message send failed: {}", errorMsg);
-                        return SendResult.failure(errorMsg);
                     }
                 }
             } catch (IOException e) {
-                // Connection is broken (leader crashed, network issue, etc.)
-                logger.warn("Connection lost to {}:{} (attempt {}/{}): {}",
-                        host, port, attempt + 1, totalAttempts, e.getMessage());
                 lastException = e;
                 closeConnection();
-                // Try the next bootstrap server
                 rotateToNextServer();
-                // Brief pause to allow new leader election
-                try { Thread.sleep(RECONNECT_DELAY_MS); } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Interrupted during send retry", ie);
-                }
             }
+
+            // Exponential backoff before retrying
+            try { Thread.sleep(currentBackoffMs); } catch (InterruptedException ignored) {}
+            currentBackoffMs = Math.min(2000, currentBackoffMs * 2);
         }
 
-        throw new IOException("Failed to send after " + totalAttempts + " attempts: " +
-                (lastException != null ? lastException.getMessage() : "unknown error"));
+        // Complete exceptionally if we exhausted retries
+        for (PendingMessage pm : batch) {
+            pm.future.completeExceptionally(new IOException("Failed to send batch: " + 
+                (lastException != null ? lastException.getMessage() : "unknown error")));
+        }
     }
 
-    /**
-     * Rotate to the next bootstrap server in the list.
-     */
     private void rotateToNextServer() {
         if (bootstrapServers.size() <= 1) return;
         currentServerIndex = (currentServerIndex + 1) % bootstrapServers.size();
@@ -295,45 +323,33 @@ public class DRMQProducer implements AutoCloseable {
     private void syncServerIndexToCurrent() {
         for (int i = 0; i < bootstrapServers.size(); i++) {
             String[] server = bootstrapServers.get(i);
-            if (server.length != 2) {
-                continue;
-            }
+            if (server.length != 2) continue;
             try {
                 int serverPort = Integer.parseInt(server[1]);
                 if (server[0].equals(host) && serverPort == port) {
                     currentServerIndex = i;
                     return;
                 }
-            } catch (NumberFormatException ignored) {
-            }
+            } catch (NumberFormatException ignored) {}
         }
     }
 
-    /**
-     * Reconnect to the leader broker.
-     */
     private void redirectToLeader(String leaderAddr) throws IOException {
         String[] parts = leaderAddr.split(":");
         if (parts.length != 2) {
             throw new IOException("Invalid leader address: " + leaderAddr);
         }
-
         try {
-            int leaderPort = Integer.parseInt(parts[1]);
+            this.port = Integer.parseInt(parts[1]);
             this.host = parts[0];
-            this.port = leaderPort;
             syncServerIndexToCurrent();
         } catch (NumberFormatException e) {
             throw new IOException("Invalid port in leader address: " + leaderAddr, e);
         }
-
         closeConnection();
         logger.info("Redirected to leader at {}:{}", host, port);
     }
 
-    /**
-     * Close the current connection without closing the producer.
-     */
     private void closeConnection() {
         connected = false;
         try { if (in != null) in.close(); } catch (IOException ignored) {}
@@ -341,46 +357,45 @@ public class DRMQProducer implements AutoCloseable {
         try { if (socket != null && !socket.isClosed()) socket.close(); } catch (IOException ignored) {}
     }
 
-    /**
-     * Check if connected to the broker.
-     */
     public boolean isConnected() {
         return connected && socket != null && !socket.isClosed();
     }
 
-    /**
-     * Close the connection to the broker.
-     */
     @Override
     public void close() {
-        connected = false;
-
-        try {
-            if (in != null) in.close();
-        } catch (IOException e) {
-            logger.debug("Error closing input stream", e);
-        }
-
-        try {
-            if (out != null) out.close();
-        } catch (IOException e) {
-            logger.debug("Error closing output stream", e);
-        }
-
-        try {
-            if (socket != null && !socket.isClosed()) {
-                socket.close();
+        running = false;
+        if (senderThread != null && senderThread.isAlive()) {
+            try {
+                senderThread.join(5000); // Wait up to 5 seconds to flush accumulator
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             }
-        } catch (IOException e) {
-            logger.debug("Error closing socket", e);
+            if (senderThread.isAlive()) {
+                senderThread.interrupt();
+            }
         }
-
+        synchronized (sendLock) {
+            closeConnection();
+        }
         logger.info("Disconnected from broker");
     }
 
-    /**
-     * Result of a send operation.
-     */
+    private static class PendingMessage {
+        final String topic;
+        final byte[] payload;
+        final String key;
+        final long timestamp;
+        final CompletableFuture<SendResult> future;
+
+        PendingMessage(String topic, byte[] payload, String key, CompletableFuture<SendResult> future) {
+            this.topic = topic;
+            this.payload = payload;
+            this.key = key;
+            this.timestamp = System.currentTimeMillis();
+            this.future = future;
+        }
+    }
+
     public static class SendResult {
         private final boolean success;
         private final long offset;

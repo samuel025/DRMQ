@@ -21,6 +21,27 @@ message ProduceResponse {
     string error_message = 3; // Error details if failed
 }
 
+// Request to produce a batch of messages to a topic
+message ProduceBatchRequest {
+    string topic = 1;
+
+    message BatchEntry {
+        bytes payload = 1;
+        optional string key = 2;
+        int64 client_timestamp = 3;
+    }
+
+    repeated BatchEntry entries = 2;
+}
+
+// Response after producing a batch of messages
+message ProduceBatchResponse {
+    bool success = 1;
+    int64 base_offset = 2;    // The offset assigned to the FIRST message in the batch
+    int32 count = 3;          // Number of messages successfully written
+    string error_message = 4; // Error details if failed
+}
+
 // Internal message representation stored in  the broker
 message StoredMessage {
     int64 offset = 1;
@@ -102,6 +123,7 @@ message MessageEnvelope {
 enum RaftCommandType {
     MESSAGE = 0;        // Normal message append (default)
     OFFSET_COMMIT = 1;  // Consumer offset commit (replicated for durability)
+    BATCH_MESSAGE = 2;  // Batch message append (multiple messages in a single Raft entry)
 }
 
 // --- Raft log entry (wraps a user message for Raft replication) ---
@@ -198,4 +220,6 @@ enum MessageType {
     INSTALL_SNAPSHOT_RESPONSE = 17;
     NACK_REQUEST = 18;
     NACK_RESPONSE = 19;
+    PRODUCE_BATCH_REQUEST = 20;
+    PRODUCE_BATCH_RESPONSE = 21;
 }

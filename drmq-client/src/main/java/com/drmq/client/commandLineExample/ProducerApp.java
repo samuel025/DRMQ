@@ -73,14 +73,14 @@ public class ProducerApp {
                         String message = parts[2];
                         
                         try {
-                            DRMQProducer.SendResult result = producer.send(topic, message);
+                            DRMQProducer.SendResult result = producer.send(topic, message).join();
                             
                             if (result.isSuccess()) {
                                 System.out.printf("✓ Sent to [%s] at offset %d\n\n", topic, result.getOffset());
                             } else {
                                 System.out.printf("❌ Failed: %s\n\n", result.getErrorMessage());
                             }
-                        } catch (IOException e) {
+                        } catch (Exception e) {
                             System.out.printf("❌ Error: %s\n\n", e.getMessage());
                         }
                     }

@@ -17,6 +17,9 @@ import java.util.concurrent.*;
 public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
     private static final Logger logger = LoggerFactory.getLogger(ClientHandler.class);
 
+    private static final int MAX_BATCH_MESSAGES = 10000;
+    private static final int MAX_PAYLOAD_BYTES = 10 * 1024 * 1024; // 10MB
+
     private final MessageStore messageStore;
     private final OffsetManager offsetManager;
     private final RaftNode raftNode;  
@@ -76,6 +79,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
     private MessageEnvelope handleMessage(MessageEnvelope envelope) throws IOException {
         return switch (envelope.getType()) {
             case PRODUCE_REQUEST -> handleProduceRequest(envelope);
+            case PRODUCE_BATCH_REQUEST -> handleProduceBatchRequest(envelope);
             case CONSUME_REQUEST -> handleConsumeRequest(envelope);
             case COMMIT_OFFSET_REQUEST -> handleCommitOffsetRequest(envelope);
             case FETCH_OFFSET_REQUEST -> handleFetchOffsetRequest(envelope);
@@ -133,6 +137,78 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
                 System.nanoTime() - startNanos, payloadBytes, 1);
             return createProduceErrorResponse(e.getMessage());
         }
+    }
+
+    private MessageEnvelope handleProduceBatchRequest(MessageEnvelope envelope) throws IOException {
+        long startNanos = System.nanoTime();
+        long totalPayloadBytes = 0;
+        int batchCount = 0;
+        try {
+            ProduceBatchRequest request = ProduceBatchRequest.parseFrom(envelope.getPayload());
+
+            String topic = request.getTopic();
+            batchCount = request.getEntriesCount();
+
+            if (batchCount == 0) {
+                return createProduceBatchErrorResponse("Batch must contain at least one message");
+            }
+            if (batchCount > MAX_BATCH_MESSAGES) {
+                return createProduceBatchErrorResponse("Batch exceeds maximum message count of " + MAX_BATCH_MESSAGES);
+            }
+
+            for (var entry : request.getEntriesList()) {
+                totalPayloadBytes += entry.getPayload().size();
+            }
+
+            if (totalPayloadBytes > MAX_PAYLOAD_BYTES) {
+                return createProduceBatchErrorResponse("Batch payload exceeds maximum size of " + MAX_PAYLOAD_BYTES + " bytes");
+            }
+
+            long baseOffset;
+            if (raftNode != null) {
+                if (!raftNode.isLeader()) {
+                    String leaderAddr = raftNode.getLeaderAddress();
+                    return createProduceBatchErrorResponse("NOT_LEADER:" +
+                            (leaderAddr != null ? leaderAddr : "UNKNOWN"));
+                }
+                baseOffset = raftNode.proposeBatch(topic, request.getEntriesList());
+            } else {
+                baseOffset = messageStore.appendBatch(topic, request.getEntriesList());
+            }
+
+            logger.debug("Produced batch: topic={}, baseOffset={}, count={}", topic, baseOffset, batchCount);
+
+            ProduceBatchResponse response = ProduceBatchResponse.newBuilder()
+                    .setSuccess(true)
+                    .setBaseOffset(baseOffset)
+                    .setCount(batchCount)
+                    .build();
+
+            BrokerMetrics.get().recordRequest("produce_batch", true,
+                System.nanoTime() - startNanos, totalPayloadBytes, batchCount);
+
+            return MessageEnvelope.newBuilder()
+                    .setType(MessageType.PRODUCE_BATCH_RESPONSE)
+                    .setPayload(response.toByteString())
+                    .build();
+
+        } catch (Exception e) {
+            logger.error("Error processing produce batch request", e);
+            BrokerMetrics.get().recordRequest("produce_batch", false,
+                System.nanoTime() - startNanos, totalPayloadBytes, batchCount);
+            return createProduceBatchErrorResponse(e.getMessage());
+        }
+    }
+
+    private MessageEnvelope createProduceBatchErrorResponse(String errorMessage) {
+        ProduceBatchResponse response = ProduceBatchResponse.newBuilder()
+                .setSuccess(false)
+                .setErrorMessage(errorMessage != null ? errorMessage : "Unknown error")
+                .build();
+        return MessageEnvelope.newBuilder()
+                .setType(MessageType.PRODUCE_BATCH_RESPONSE)
+                .setPayload(response.toByteString())
+                .build();
     }
 
     private MessageEnvelope handleConsumeRequest(MessageEnvelope envelope) throws IOException {

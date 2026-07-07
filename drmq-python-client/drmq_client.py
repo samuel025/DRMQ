@@ -2,7 +2,12 @@ import socket
 import struct
 import time
 import random
+import threading
+import concurrent.futures
+import logging
 from typing import List, Optional
+
+logger = logging.getLogger(__name__)
 
 # Import the generated Protobuf classes
 import messages_pb2 as pb
@@ -124,34 +129,158 @@ class DRMQClient:
         return bytes(data)
 
 
-class DRMQProducer(DRMQClient):
-    """Client for producing messages to the DRMQ cluster."""
-    
-    def send(self, topic: str, payload: bytes, key: Optional[str] = None) -> pb.ProduceResponse:
-        """Sends a message to a topic with automatic retries and leader redirect handling."""
-        req = pb.ProduceRequest()
-        req.topic = topic
-        req.payload = payload
-        if key:
-            req.key = key
-        req.timestamp = int(time.time() * 1000)
+class SendResult:
+    def __init__(self, success: bool, offset: int = -1, error_message: str = ""):
+        self.success = success
+        self.offset = offset
+        self.error_message = error_message
 
-        for _ in range(self.max_retries):
+class PendingMessage:
+    def __init__(self, payload: bytes, key: Optional[str], timestamp: int):
+        self.payload = payload
+        self.key = key
+        self.timestamp = timestamp
+        self.future = concurrent.futures.Future()
+
+class DRMQProducer(DRMQClient):
+    """Client for producing messages to the DRMQ cluster with asynchronous batching."""
+    
+    MAX_ACCUMULATOR_MESSAGES = 100000
+    MAX_BATCH_MESSAGES = 10000
+    MAX_PAYLOAD_BYTES = 10 * 1024 * 1024
+
+    def __init__(self, bootstrap_servers: str):
+        super().__init__(bootstrap_servers)
+        self.accumulator = []
+        self.accum_lock = threading.Lock()
+        self.running = True
+        self.send_thread = threading.Thread(target=self._sender_loop, daemon=True, name="drmq-producer-sender")
+        self.send_thread.start()
+
+    def send(self, topic: str, payload: bytes, key: Optional[str] = None) -> concurrent.futures.Future:
+        """Enqueues a message for batching and returns a Future."""
+        pm = PendingMessage(payload, key, int(time.time() * 1000))
+        if not self.running:
+            pm.future.set_exception(Exception("Producer is closed"))
+            return pm.future
+
+        with self.accum_lock:
+            if len(self.accumulator) >= self.MAX_ACCUMULATOR_MESSAGES:
+                pm.future.set_exception(Exception("Producer accumulator is full"))
+                return pm.future
+            self.accumulator.append((topic, pm))
+        return pm.future
+        
+    def _sender_loop(self):
+        while self.running:
+            batches = {}
+            with self.accum_lock:
+                new_acc = []
+                for topic, pm in self.accumulator:
+                    if topic not in batches:
+                        batches[topic] = {"msgs": [], "bytes": 0}
+                    b = batches[topic]
+                    if len(b["msgs"]) < self.MAX_BATCH_MESSAGES and b["bytes"] + len(pm.payload) <= self.MAX_PAYLOAD_BYTES:
+                        b["msgs"].append(pm)
+                        b["bytes"] += len(pm.payload)
+                    else:
+                        new_acc.append((topic, pm))
+                self.accumulator = new_acc
+            
+            if not batches:
+                time.sleep(0.005) # 5ms linger
+                continue
+                
+            for topic, batch_data in batches.items():
+                self._send_batch_with_retry(topic, batch_data["msgs"])
+
+    def _send_batch_with_retry(self, topic: str, batch: List[PendingMessage]):
+        try:
+            req = pb.ProduceBatchRequest()
+            req.topic = topic
+            for pm in batch:
+                entry = req.entries.add()
+                entry.payload = pm.payload
+                entry.client_timestamp = pm.timestamp
+                if pm.key is not None:
+                    entry.key = pm.key
+                    
+            envelope_bytes = req.SerializeToString()
+        except Exception as e:
+            for pm in batch:
+                pm.future.set_exception(e)
+            return
+
+        delivery_timeout_ms = 120000
+        start_ms = int(time.time() * 1000)
+        current_backoff_ms = 100
+        
+        while True:
+            if not self.running:
+                for pm in batch:
+                    pm.future.set_exception(Exception("Producer closed during retry"))
+                return
+                
+            if int(time.time() * 1000) - start_ms > delivery_timeout_ms:
+                break
+                
             try:
                 self._ensure_connected()
-                resp_payload = self._send_envelope(pb.MessageType.PRODUCE_REQUEST, req.SerializeToString())
+                # At-least-once semantics: If the network drops after the server processes the batch,
+                # this retry may result in duplicate messages being appended.
+                resp_payload = self._send_envelope(pb.MessageType.PRODUCE_BATCH_REQUEST, envelope_bytes)
                 
-                resp = pb.ProduceResponse()
+                resp = pb.ProduceBatchResponse()
                 resp.ParseFromString(resp_payload)
-
-                if not resp.success and self._try_redirect_to_leader(resp.error_message):
-                    continue # Retry on new leader
-
-                return resp
+                
+                if resp.success:
+                    base_offset = resp.base_offset
+                    for i, pm in enumerate(batch):
+                        pm.future.set_result(SendResult(True, base_offset + i))
+                    return
+                else:
+                    error_msg = resp.error_message
+                    if error_msg and error_msg.startswith("NOT_LEADER:"):
+                        leader_addr = error_msg[len("NOT_LEADER:"):]
+                        if leader_addr != "UNKNOWN":
+                            parts = leader_addr.split(":")
+                            if len(parts) == 2:
+                                self.host = parts[0]
+                                self.port = int(parts[1])
+                                super().close()
+                                self._ensure_connected()
+                                continue
+                        super().close()
+                        self._rotate_server()
+                    elif error_msg and ("timed out" in error_msg or "Lost leadership" in error_msg or "Raft batch proposal" in error_msg):
+                        super().close()
+                        self._rotate_server()
+                    else:
+                        for pm in batch:
+                            pm.future.set_result(SendResult(False, -1, error_msg))
+                        return
             except Exception as e:
-                self._reconnect()
+                logger.warning("Network error during batch send. Retrying may result in duplicate messages (at-least-once contract): %s", e)
+                super().close()
+                self._rotate_server()
+                
+            time.sleep(current_backoff_ms / 1000.0)
+            current_backoff_ms = min(2000, current_backoff_ms * 2)
+            
+        for pm in batch:
+            pm.future.set_exception(Exception("Failed to send batch: timeout exhausted"))
 
-        raise DRMQConnectionError(f"Failed to send message after {self.max_retries} attempts")
+    def close(self):
+        self.running = False
+        if self.send_thread and self.send_thread.is_alive():
+            self.send_thread.join(timeout=5.0)
+            
+        with self.accum_lock:
+            for topic, pm in self.accumulator:
+                pm.future.set_exception(Exception("Producer closed before send"))
+            self.accumulator.clear()
+            
+        super().close()
 
 
 class DRMQConsumer(DRMQClient):

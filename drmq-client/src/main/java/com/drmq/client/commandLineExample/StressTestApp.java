@@ -84,14 +84,25 @@ public class StressTestApp {
                     producer.connect();
                     long count = 0;
                     while (!Thread.currentThread().isInterrupted()) {
-                        String payload = "T" + threadId + "_" + count + "_" + basePayload;
-                        DRMQProducer.SendResult result = producer.send(topic, payload);
-                        if (result.isSuccess()) {
-                            messagesSent.incrementAndGet();
-                        } else {
-                            errors.incrementAndGet();
+                        java.util.List<java.util.concurrent.CompletableFuture<DRMQProducer.SendResult>> futures = new java.util.ArrayList<>(1000);
+                        for (int k = 0; k < 1000; k++) {
+                            String payload = "T" + threadId + "_" + count + "_" + basePayload;
+                            futures.add(producer.send(topic, payload));
+                            count++;
                         }
-                        count++;
+
+                        for (var f : futures) {
+                            try {
+                                DRMQProducer.SendResult result = f.join();
+                                if (result.isSuccess()) {
+                                    messagesSent.incrementAndGet();
+                                } else {
+                                    errors.incrementAndGet();
+                                }
+                            } catch (Exception e) {
+                                errors.incrementAndGet();
+                            }
+                        }
                     }
                 } catch (Exception e) {
                      errors.incrementAndGet();
