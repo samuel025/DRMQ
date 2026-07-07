@@ -29,6 +29,14 @@ public class BrokerConfig {
     public BrokerConfig(String nodeId, int port, String dataDir, List<PeerAddress> peers,
                         boolean metricsEnabled, int metricsPort, String metricsPath,
                         long logSegmentBytes, long logRetentionMs, long raftCompactThreshold,
+                        int maxDeliveries, String dlqTopicPrefix) {
+        this(nodeId, port, dataDir, peers, metricsEnabled, metricsPort, metricsPath,
+             logSegmentBytes, logRetentionMs, raftCompactThreshold, maxDeliveries, dlqTopicPrefix, true);
+    }
+
+    public BrokerConfig(String nodeId, int port, String dataDir, List<PeerAddress> peers,
+                        boolean metricsEnabled, int metricsPort, String metricsPath,
+                        long logSegmentBytes, long logRetentionMs, long raftCompactThreshold,
                         int maxDeliveries, String dlqTopicPrefix, boolean logSegmentFsync) {
         this.nodeId = nodeId;
         this.port = port;
@@ -47,13 +55,13 @@ public class BrokerConfig {
 
     public BrokerConfig(String nodeId, int port, String dataDir, List<PeerAddress> peers) {
         this(nodeId, port, dataDir, peers, true, 9096, "/metrics", 
-             100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.", false);
+             100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.", true);
     }
 
     /** Single-node config (backward compatible) */
     public BrokerConfig(int port, String dataDir) {
         this("standalone", port, dataDir, List.of(), true, 9096, "/metrics",
-             100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.", false);
+             100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.", true);
     }
 
     public String getNodeId() { return nodeId; }
@@ -120,7 +128,7 @@ public class BrokerConfig {
         long raftCompactThreshold = 1000L;
         int maxDeliveries = 5;
         String dlqTopicPrefix = "dlq.";
-        boolean logSegmentFsync = false;
+        boolean logSegmentFsync = true;
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {

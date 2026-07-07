@@ -87,10 +87,15 @@ public class RaftLog {
     public synchronized void append(RaftEntry entry) throws IOException {
         long entryStart = raf.length();
         raf.seek(entryStart);
-        byte[] data = entry.toByteArray();
-        raf.writeInt(data.length);
-        raf.write(data);
-        raf.getFD().sync(); 
+        try {
+            byte[] data = entry.toByteArray();
+            raf.writeInt(data.length);
+            raf.write(data);
+            raf.getFD().sync(); 
+        } catch (IOException e) {
+            raf.setLength(entryStart);
+            throw e;
+        }
         entries.add(entry);
         filePositions.add(entryStart);
         logger.debug("Appended raft entry: index={}, term={}", entry.getIndex(), entry.getTerm());
@@ -106,14 +111,19 @@ public class RaftLog {
         raf.seek(entryStart);
         
         List<Long> newPositions = new ArrayList<>(batch.size());
-        for (RaftEntry entry : batch) {
-            newPositions.add(raf.getFilePointer());
-            byte[] data = entry.toByteArray();
-            raf.writeInt(data.length);
-            raf.write(data);
+        try {
+            for (RaftEntry entry : batch) {
+                newPositions.add(raf.getFilePointer());
+                byte[] data = entry.toByteArray();
+                raf.writeInt(data.length);
+                raf.write(data);
+            }
+            
+            raf.getFD().sync(); 
+        } catch (IOException e) {
+            raf.setLength(entryStart);
+            throw e;
         }
-        
-        raf.getFD().sync(); 
         
         entries.addAll(batch);
         filePositions.addAll(newPositions);

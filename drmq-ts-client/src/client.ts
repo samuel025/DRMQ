@@ -14,7 +14,8 @@ import {
   NackRequest,
   NackResponse,
   ProduceBatchRequest,
-  ProduceBatchResponse
+  ProduceBatchResponse,
+  ErrorCode
 } from './messages';
 
 export class DRMQConnectionError extends Error {
@@ -273,9 +274,11 @@ export class DRMQProducer extends DRMQClient {
           batch.forEach((pm, i) => pm.resolve({ success: true, offset: baseOffset + i }));
           return;
         } else {
-          const errorMsg = resp.errorMessage;
-          if (errorMsg && errorMsg.startsWith("NOT_LEADER:")) {
-            const leaderAddr = errorMsg.substring("NOT_LEADER:".length);
+          if (resp.errorCode === ErrorCode.NOT_LEADER) {
+            const errorMsg = resp.errorMessage;
+            const leaderAddr = errorMsg && errorMsg.startsWith("NOT_LEADER:") 
+                ? errorMsg.substring("NOT_LEADER:".length) 
+                : "UNKNOWN";
             if (leaderAddr !== "UNKNOWN") {
               const parts = leaderAddr.split(":");
               if (parts.length === 2) {

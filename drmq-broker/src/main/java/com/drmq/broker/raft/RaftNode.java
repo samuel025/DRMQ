@@ -1290,9 +1290,16 @@ public class RaftNode {
                         }
                     }
 
-                    // Collect if new
-                    if (entry.getIndex() > raftLog.getLastIndex() + newEntries.size()) {
+                    long expectedIndex = raftLog.getLastIndex() + newEntries.size() + 1;
+                    if (entry.getIndex() == expectedIndex) {
                         newEntries.add(entry);
+                    } else if (entry.getIndex() > expectedIndex) {
+                        logger.error("[{}] Detected gap in AppendEntries: expected {}, got {}", nodeId, expectedIndex, entry.getIndex());
+                        return AppendEntriesResponse.newBuilder()
+                                .setTerm(currentTerm)
+                                .setSuccess(false)
+                                .setMatchIndex(raftLog.getLastIndex())
+                                .build();
                     }
                 }
 

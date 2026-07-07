@@ -163,31 +163,32 @@ public class DRMQProducer implements AutoCloseable {
     private void senderLoop() {
         while (running || !accumulator.isEmpty()) {
             try {
-                if (accumulator.isEmpty()) {
-                    Thread.sleep(1);
+                PendingMessage firstMsg = accumulator.poll(500, java.util.concurrent.TimeUnit.MILLISECONDS);
+                if (firstMsg == null) {
                     continue;
                 }
 
-   
                 List<PendingMessage> currentBatch = new ArrayList<>();
-                int currentBytes = 0;
+                currentBatch.add(firstMsg);
+                int currentBytes = firstMsg.payload.length;
                 long firstMsgTime = System.currentTimeMillis();
-                String currentTopic = null;
+                String currentTopic = firstMsg.topic;
 
-                while (!accumulator.isEmpty() && currentBytes < BATCH_SIZE_BYTES) {
+                while (currentBytes < BATCH_SIZE_BYTES) {
                     PendingMessage peeked = accumulator.peek();
-                    if (currentTopic == null) {
-                        currentTopic = peeked.topic;
-                    } else if (!currentTopic.equals(peeked.topic)) {
-                        break; 
-                    }
+                    if (peeked != null) {
+                        if (!currentTopic.equals(peeked.topic)) {
+                            break; 
+                        }
 
                     PendingMessage msg = accumulator.poll();
                     currentBatch.add(msg);
                     currentBytes += msg.payload.length;
-                    
-                    if (System.currentTimeMillis() - firstMsgTime >= LINGER_MS) {
-                        break;
+                    } else {
+                        if (System.currentTimeMillis() - firstMsgTime >= LINGER_MS) {
+                            break;
+                        }
+                        Thread.sleep(1); // Brief yield during linger window
                     }
                 }
 
@@ -260,9 +261,12 @@ public class DRMQProducer implements AutoCloseable {
                         }
                         return; // Success
                     } else {
+                        com.drmq.protocol.DRMQProtocol.ErrorCode errorCode = response.getErrorCode();
                         String errorMsg = response.getErrorMessage();
-                        if (errorMsg != null && errorMsg.startsWith("NOT_LEADER:")) {
-                            String leaderAddr = errorMsg.substring("NOT_LEADER:".length());
+                        if (errorCode == com.drmq.protocol.DRMQProtocol.ErrorCode.NOT_LEADER) {
+                            String leaderAddr = errorMsg != null && errorMsg.startsWith("NOT_LEADER:") 
+                                                ? errorMsg.substring("NOT_LEADER:".length()) 
+                                                : "UNKNOWN";
                             if (!leaderAddr.equals("UNKNOWN")) {
                                 try {
                                     redirectToLeader(leaderAddr);
