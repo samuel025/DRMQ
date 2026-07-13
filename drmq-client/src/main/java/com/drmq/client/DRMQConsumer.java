@@ -315,6 +315,66 @@ public class DRMQConsumer implements AutoCloseable {
         logger.info("Subscribed to topic '{}' from explicit offset {} (group='{}')", topic, fromOffset, consumerGroup);
     }
 
+    /**
+     * Subscribe to a topic, starting from the first message at or after the given timestamp.
+     * Overrides the current offset for the topic.
+     */
+    public void seekByTime(String topic, long timestamp) throws IOException {
+        long offset = doSearchOffsetByTime(topic, timestamp);
+        if (offset >= 0) {
+            topicOffsets.put(topic, offset);
+            if (groupMode) {
+                commit(topic, offset);
+            }
+            logger.info("Subscribed to topic '{}' from time-based offset {} (timestamp={})", topic, offset, timestamp);
+        } else {
+            logger.warn("Could not find any offset for topic '{}' at or after timestamp {}", topic, timestamp);
+        }
+    }
+
+    private long doSearchOffsetByTime(String topic, long timestamp) throws IOException {
+        int attempts = 0;
+        while (attempts < MAX_RETRIES) {
+            try {
+                ensureConnectedWithRetry();
+                SearchOffsetByTimeRequest request = SearchOffsetByTimeRequest.newBuilder()
+                        .setTopic(topic)
+                        .setTimestamp(timestamp)
+                        .build();
+
+                sendEnvelope(MessageEnvelope.newBuilder()
+                        .setType(MessageType.SEARCH_OFFSET_BY_TIME_REQUEST)
+                        .setPayload(request.toByteString())
+                        .build());
+                MessageEnvelope responseEnvelope = receiveEnvelope();
+
+                if (responseEnvelope.getType() == MessageType.SEARCH_OFFSET_BY_TIME_RESPONSE) {
+                    SearchOffsetByTimeResponse resp = SearchOffsetByTimeResponse.parseFrom(responseEnvelope.getPayload());
+                    return resp.getOffset();
+                } else if (responseEnvelope.getType() == MessageType.PRODUCE_RESPONSE) {
+                    ProduceResponse errorResp = ProduceResponse.parseFrom(responseEnvelope.getPayload());
+                    if (tryRedirectToLeader(errorResp.getErrorMessage())) {
+                        attempts++;
+                        continue;
+                    }
+                    throw new IOException("Error searching offset by time: " + errorResp.getErrorMessage());
+                } else {
+                    throw new IOException("Unexpected response type: " + responseEnvelope.getType());
+                }
+            } catch (IOException e) {
+                if (e.getMessage() != null && e.getMessage().contains("Error searching offset")) {
+                    throw e;
+                }
+                attempts++;
+                if (attempts >= MAX_RETRIES) {
+                    throw new IOException("Failed to search offset by time after retries", e);
+                }
+                reconnect();
+            }
+        }
+        return -1;
+    }
+
     public List<ConsumedMessage> poll() throws IOException {
         return poll(DEFAULT_MAX_MESSAGES, DEFAULT_POLL_TIMEOUT_MS);
     }

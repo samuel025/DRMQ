@@ -98,6 +98,19 @@ message FetchOffsetResponse {
     string error_message = 3;
 }
 
+// Request to find an offset by a given timestamp
+message SearchOffsetByTimeRequest {
+    string topic = 1;
+    int64 timestamp = 2;      // The target timestamp
+}
+
+// Response with the found offset
+message SearchOffsetByTimeResponse {
+    bool success = 1;
+    int64 offset = 2;         // The found offset, or -1 if none
+    string error_message = 3;
+}
+
 // --- Dead-Letter Queue (DLQ) support ---
 
 // Request to negatively acknowledge (NACK) a message, triggering redelivery or DLQ routing
@@ -224,6 +237,8 @@ enum MessageType {
     NACK_RESPONSE = 19;
     PRODUCE_BATCH_REQUEST = 20;
     PRODUCE_BATCH_RESPONSE = 21;
+    SEARCH_OFFSET_BY_TIME_REQUEST = 22;
+    SEARCH_OFFSET_BY_TIME_RESPONSE = 23;
 }
 
 // --- Standard Error Codes ---

@@ -332,4 +332,43 @@ class RaftIntegrationTest {
             assertEquals("Message 2", messages.get(1).payloadAsString());
         }
     }
+
+    @Test
+    @DisplayName("Seek by time correctly replays from specific timestamp")
+    void consumerSeekByTimeTest() throws Exception {
+        startCluster();
+
+        BrokerServer leader = findLeader();
+        assertNotNull(leader);
+
+        String topic = "time-seek-test";
+
+        long targetTime = 0;
+        try (DRMQProducer producer = new DRMQProducer("localhost", leader.getPort())) {
+            producer.connect();
+            producer.send(topic, "Message 1 - Early").join();
+            
+            Thread.sleep(100);
+            targetTime = System.currentTimeMillis();
+            Thread.sleep(100);
+            
+            producer.send(topic, "Message 2 - Target").join();
+            producer.send(topic, "Message 3 - Late").join();
+        }
+
+        // Wait for replication
+        Thread.sleep(500);
+
+        // Single-mode consumer connecting to any node
+        BrokerServer follower = findFollower();
+        try (DRMQConsumer consumer = new DRMQConsumer("localhost", follower.getPort())) {
+            consumer.connect();
+            consumer.seekByTime(topic, targetTime);
+            
+            var messages = consumer.poll(10, 2000);
+            assertEquals(2, messages.size(), "Should receive exactly messages 2 and 3");
+            assertEquals("Message 2 - Target", messages.get(0).payloadAsString());
+            assertEquals("Message 3 - Late", messages.get(1).payloadAsString());
+        }
+    }
 }
