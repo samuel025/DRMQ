@@ -205,10 +205,50 @@ export function messageTypeToJSON(object: MessageType): string {
   }
 }
 
+/** --- Standard Error Codes --- */
+export enum ErrorCode {
+  NONE = 0,
+  NOT_LEADER = 1,
+  UNKNOWN_ERROR = 99,
+  UNRECOGNIZED = -1,
+}
+
+export function errorCodeFromJSON(object: any): ErrorCode {
+  switch (object) {
+    case 0:
+    case "NONE":
+      return ErrorCode.NONE;
+    case 1:
+    case "NOT_LEADER":
+      return ErrorCode.NOT_LEADER;
+    case 99:
+    case "UNKNOWN_ERROR":
+      return ErrorCode.UNKNOWN_ERROR;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return ErrorCode.UNRECOGNIZED;
+  }
+}
+
+export function errorCodeToJSON(object: ErrorCode): string {
+  switch (object) {
+    case ErrorCode.NONE:
+      return "NONE";
+    case ErrorCode.NOT_LEADER:
+      return "NOT_LEADER";
+    case ErrorCode.UNKNOWN_ERROR:
+      return "UNKNOWN_ERROR";
+    case ErrorCode.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
 /** Request to produce a message to a topic */
 export interface ProduceRequest {
   topic: string;
-  payload: Buffer;
+  payload: Uint8Array;
   /** Optional message key for partitioning (future use) */
   key?:
     | string
@@ -224,6 +264,7 @@ export interface ProduceResponse {
   offset: number;
   /** Error details if failed */
   errorMessage: string;
+  errorCode: ErrorCode;
 }
 
 /** Request to produce a batch of messages to a topic */
@@ -233,7 +274,7 @@ export interface ProduceBatchRequest {
 }
 
 export interface ProduceBatchRequest_BatchEntry {
-  payload: Buffer;
+  payload: Uint8Array;
   key?: string | undefined;
   clientTimestamp: number;
 }
@@ -247,13 +288,14 @@ export interface ProduceBatchResponse {
   count: number;
   /** Error details if failed */
   errorMessage: string;
+  errorCode: ErrorCode;
 }
 
 /** Internal message representation stored in  the broker */
 export interface StoredMessage {
   offset: number;
   topic: string;
-  payload: Buffer;
+  payload: Uint8Array;
   key?:
     | string
     | undefined;
@@ -341,7 +383,7 @@ export interface NackResponse {
 export interface MessageEnvelope {
   type: MessageType;
   /** Serialized inner message */
-  payload: Buffer;
+  payload: Uint8Array;
 }
 
 /** --- Raft log entry (wraps a user message for Raft replication) --- */
@@ -353,7 +395,7 @@ export interface RaftEntry {
   /** Target topic for the message */
   topic: string;
   /** Message payload */
-  payload: Buffer;
+  payload: Uint8Array;
   /** Optional message key */
   key?:
     | string
@@ -447,7 +489,7 @@ export interface InstallSnapshotRequest {
   /** Byte offset of this chunk in the file */
   offset: number;
   /** Raw zip chunk payload */
-  data: Buffer;
+  data: Uint8Array;
   /** True if this is the final chunk */
   done: boolean;
 }
@@ -457,7 +499,7 @@ export interface InstallSnapshotResponse {
 }
 
 function createBaseProduceRequest(): ProduceRequest {
-  return { topic: "", payload: Buffer.alloc(0), key: undefined, timestamp: 0 };
+  return { topic: "", payload: new Uint8Array(0), key: undefined, timestamp: 0 };
 }
 
 export const ProduceRequest: MessageFns<ProduceRequest> = {
@@ -497,7 +539,7 @@ export const ProduceRequest: MessageFns<ProduceRequest> = {
             break;
           }
 
-          message.payload = Buffer.from(reader.bytes());
+          message.payload = reader.bytes();
           continue;
         }
         case 3: {
@@ -528,7 +570,7 @@ export const ProduceRequest: MessageFns<ProduceRequest> = {
   fromJSON(object: any): ProduceRequest {
     return {
       topic: isSet(object.topic) ? globalThis.String(object.topic) : "",
-      payload: isSet(object.payload) ? Buffer.from(bytesFromBase64(object.payload)) : Buffer.alloc(0),
+      payload: isSet(object.payload) ? bytesFromBase64(object.payload) : new Uint8Array(0),
       key: isSet(object.key) ? globalThis.String(object.key) : undefined,
       timestamp: isSet(object.timestamp) ? globalThis.Number(object.timestamp) : 0,
     };
@@ -557,7 +599,7 @@ export const ProduceRequest: MessageFns<ProduceRequest> = {
   fromPartial<I extends Exact<DeepPartial<ProduceRequest>, I>>(object: I): ProduceRequest {
     const message = createBaseProduceRequest();
     message.topic = object.topic ?? "";
-    message.payload = object.payload ?? Buffer.alloc(0);
+    message.payload = object.payload ?? new Uint8Array(0);
     message.key = object.key ?? undefined;
     message.timestamp = object.timestamp ?? 0;
     return message;
@@ -565,7 +607,7 @@ export const ProduceRequest: MessageFns<ProduceRequest> = {
 };
 
 function createBaseProduceResponse(): ProduceResponse {
-  return { success: false, offset: 0, errorMessage: "" };
+  return { success: false, offset: 0, errorMessage: "", errorCode: 0 };
 }
 
 export const ProduceResponse: MessageFns<ProduceResponse> = {
@@ -578,6 +620,9 @@ export const ProduceResponse: MessageFns<ProduceResponse> = {
     }
     if (message.errorMessage !== "") {
       writer.uint32(26).string(message.errorMessage);
+    }
+    if (message.errorCode !== 0) {
+      writer.uint32(32).int32(message.errorCode);
     }
     return writer;
   },
@@ -613,6 +658,14 @@ export const ProduceResponse: MessageFns<ProduceResponse> = {
           message.errorMessage = reader.string();
           continue;
         }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.errorCode = reader.int32() as any;
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -631,6 +684,11 @@ export const ProduceResponse: MessageFns<ProduceResponse> = {
         : isSet(object.error_message)
         ? globalThis.String(object.error_message)
         : "",
+      errorCode: isSet(object.errorCode)
+        ? errorCodeFromJSON(object.errorCode)
+        : isSet(object.error_code)
+        ? errorCodeFromJSON(object.error_code)
+        : 0,
     };
   },
 
@@ -645,6 +703,9 @@ export const ProduceResponse: MessageFns<ProduceResponse> = {
     if (message.errorMessage !== "") {
       obj.errorMessage = message.errorMessage;
     }
+    if (message.errorCode !== 0) {
+      obj.errorCode = errorCodeToJSON(message.errorCode);
+    }
     return obj;
   },
 
@@ -656,6 +717,7 @@ export const ProduceResponse: MessageFns<ProduceResponse> = {
     message.success = object.success ?? false;
     message.offset = object.offset ?? 0;
     message.errorMessage = object.errorMessage ?? "";
+    message.errorCode = object.errorCode ?? 0;
     return message;
   },
 };
@@ -739,7 +801,7 @@ export const ProduceBatchRequest: MessageFns<ProduceBatchRequest> = {
 };
 
 function createBaseProduceBatchRequest_BatchEntry(): ProduceBatchRequest_BatchEntry {
-  return { payload: Buffer.alloc(0), key: undefined, clientTimestamp: 0 };
+  return { payload: new Uint8Array(0), key: undefined, clientTimestamp: 0 };
 }
 
 export const ProduceBatchRequest_BatchEntry: MessageFns<ProduceBatchRequest_BatchEntry> = {
@@ -768,7 +830,7 @@ export const ProduceBatchRequest_BatchEntry: MessageFns<ProduceBatchRequest_Batc
             break;
           }
 
-          message.payload = Buffer.from(reader.bytes());
+          message.payload = reader.bytes();
           continue;
         }
         case 2: {
@@ -798,7 +860,7 @@ export const ProduceBatchRequest_BatchEntry: MessageFns<ProduceBatchRequest_Batc
 
   fromJSON(object: any): ProduceBatchRequest_BatchEntry {
     return {
-      payload: isSet(object.payload) ? Buffer.from(bytesFromBase64(object.payload)) : Buffer.alloc(0),
+      payload: isSet(object.payload) ? bytesFromBase64(object.payload) : new Uint8Array(0),
       key: isSet(object.key) ? globalThis.String(object.key) : undefined,
       clientTimestamp: isSet(object.clientTimestamp)
         ? globalThis.Number(object.clientTimestamp)
@@ -829,7 +891,7 @@ export const ProduceBatchRequest_BatchEntry: MessageFns<ProduceBatchRequest_Batc
     object: I,
   ): ProduceBatchRequest_BatchEntry {
     const message = createBaseProduceBatchRequest_BatchEntry();
-    message.payload = object.payload ?? Buffer.alloc(0);
+    message.payload = object.payload ?? new Uint8Array(0);
     message.key = object.key ?? undefined;
     message.clientTimestamp = object.clientTimestamp ?? 0;
     return message;
@@ -837,7 +899,7 @@ export const ProduceBatchRequest_BatchEntry: MessageFns<ProduceBatchRequest_Batc
 };
 
 function createBaseProduceBatchResponse(): ProduceBatchResponse {
-  return { success: false, baseOffset: 0, count: 0, errorMessage: "" };
+  return { success: false, baseOffset: 0, count: 0, errorMessage: "", errorCode: 0 };
 }
 
 export const ProduceBatchResponse: MessageFns<ProduceBatchResponse> = {
@@ -853,6 +915,9 @@ export const ProduceBatchResponse: MessageFns<ProduceBatchResponse> = {
     }
     if (message.errorMessage !== "") {
       writer.uint32(34).string(message.errorMessage);
+    }
+    if (message.errorCode !== 0) {
+      writer.uint32(40).int32(message.errorCode);
     }
     return writer;
   },
@@ -896,6 +961,14 @@ export const ProduceBatchResponse: MessageFns<ProduceBatchResponse> = {
           message.errorMessage = reader.string();
           continue;
         }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.errorCode = reader.int32() as any;
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -919,6 +992,11 @@ export const ProduceBatchResponse: MessageFns<ProduceBatchResponse> = {
         : isSet(object.error_message)
         ? globalThis.String(object.error_message)
         : "",
+      errorCode: isSet(object.errorCode)
+        ? errorCodeFromJSON(object.errorCode)
+        : isSet(object.error_code)
+        ? errorCodeFromJSON(object.error_code)
+        : 0,
     };
   },
 
@@ -936,6 +1014,9 @@ export const ProduceBatchResponse: MessageFns<ProduceBatchResponse> = {
     if (message.errorMessage !== "") {
       obj.errorMessage = message.errorMessage;
     }
+    if (message.errorCode !== 0) {
+      obj.errorCode = errorCodeToJSON(message.errorCode);
+    }
     return obj;
   },
 
@@ -948,12 +1029,13 @@ export const ProduceBatchResponse: MessageFns<ProduceBatchResponse> = {
     message.baseOffset = object.baseOffset ?? 0;
     message.count = object.count ?? 0;
     message.errorMessage = object.errorMessage ?? "";
+    message.errorCode = object.errorCode ?? 0;
     return message;
   },
 };
 
 function createBaseStoredMessage(): StoredMessage {
-  return { offset: 0, topic: "", payload: Buffer.alloc(0), key: undefined, timestamp: 0, storedAt: 0 };
+  return { offset: 0, topic: "", payload: new Uint8Array(0), key: undefined, timestamp: 0, storedAt: 0 };
 }
 
 export const StoredMessage: MessageFns<StoredMessage> = {
@@ -1007,7 +1089,7 @@ export const StoredMessage: MessageFns<StoredMessage> = {
             break;
           }
 
-          message.payload = Buffer.from(reader.bytes());
+          message.payload = reader.bytes();
           continue;
         }
         case 4: {
@@ -1047,7 +1129,7 @@ export const StoredMessage: MessageFns<StoredMessage> = {
     return {
       offset: isSet(object.offset) ? globalThis.Number(object.offset) : 0,
       topic: isSet(object.topic) ? globalThis.String(object.topic) : "",
-      payload: isSet(object.payload) ? Buffer.from(bytesFromBase64(object.payload)) : Buffer.alloc(0),
+      payload: isSet(object.payload) ? bytesFromBase64(object.payload) : new Uint8Array(0),
       key: isSet(object.key) ? globalThis.String(object.key) : undefined,
       timestamp: isSet(object.timestamp) ? globalThis.Number(object.timestamp) : 0,
       storedAt: isSet(object.storedAt)
@@ -1088,7 +1170,7 @@ export const StoredMessage: MessageFns<StoredMessage> = {
     const message = createBaseStoredMessage();
     message.offset = object.offset ?? 0;
     message.topic = object.topic ?? "";
-    message.payload = object.payload ?? Buffer.alloc(0);
+    message.payload = object.payload ?? new Uint8Array(0);
     message.key = object.key ?? undefined;
     message.timestamp = object.timestamp ?? 0;
     message.storedAt = object.storedAt ?? 0;
@@ -1943,7 +2025,7 @@ export const NackResponse: MessageFns<NackResponse> = {
 };
 
 function createBaseMessageEnvelope(): MessageEnvelope {
-  return { type: 0, payload: Buffer.alloc(0) };
+  return { type: 0, payload: new Uint8Array(0) };
 }
 
 export const MessageEnvelope: MessageFns<MessageEnvelope> = {
@@ -1977,7 +2059,7 @@ export const MessageEnvelope: MessageFns<MessageEnvelope> = {
             break;
           }
 
-          message.payload = Buffer.from(reader.bytes());
+          message.payload = reader.bytes();
           continue;
         }
       }
@@ -1992,7 +2074,7 @@ export const MessageEnvelope: MessageFns<MessageEnvelope> = {
   fromJSON(object: any): MessageEnvelope {
     return {
       type: isSet(object.type) ? messageTypeFromJSON(object.type) : 0,
-      payload: isSet(object.payload) ? Buffer.from(bytesFromBase64(object.payload)) : Buffer.alloc(0),
+      payload: isSet(object.payload) ? bytesFromBase64(object.payload) : new Uint8Array(0),
     };
   },
 
@@ -2013,7 +2095,7 @@ export const MessageEnvelope: MessageFns<MessageEnvelope> = {
   fromPartial<I extends Exact<DeepPartial<MessageEnvelope>, I>>(object: I): MessageEnvelope {
     const message = createBaseMessageEnvelope();
     message.type = object.type ?? 0;
-    message.payload = object.payload ?? Buffer.alloc(0);
+    message.payload = object.payload ?? new Uint8Array(0);
     return message;
   },
 };
@@ -2023,7 +2105,7 @@ function createBaseRaftEntry(): RaftEntry {
     term: 0,
     index: 0,
     topic: "",
-    payload: Buffer.alloc(0),
+    payload: new Uint8Array(0),
     key: undefined,
     timestamp: 0,
     commandType: 0,
@@ -2100,7 +2182,7 @@ export const RaftEntry: MessageFns<RaftEntry> = {
             break;
           }
 
-          message.payload = Buffer.from(reader.bytes());
+          message.payload = reader.bytes();
           continue;
         }
         case 5: {
@@ -2157,7 +2239,7 @@ export const RaftEntry: MessageFns<RaftEntry> = {
       term: isSet(object.term) ? globalThis.Number(object.term) : 0,
       index: isSet(object.index) ? globalThis.Number(object.index) : 0,
       topic: isSet(object.topic) ? globalThis.String(object.topic) : "",
-      payload: isSet(object.payload) ? Buffer.from(bytesFromBase64(object.payload)) : Buffer.alloc(0),
+      payload: isSet(object.payload) ? bytesFromBase64(object.payload) : new Uint8Array(0),
       key: isSet(object.key) ? globalThis.String(object.key) : undefined,
       timestamp: isSet(object.timestamp) ? globalThis.Number(object.timestamp) : 0,
       commandType: isSet(object.commandType)
@@ -2218,7 +2300,7 @@ export const RaftEntry: MessageFns<RaftEntry> = {
     message.term = object.term ?? 0;
     message.index = object.index ?? 0;
     message.topic = object.topic ?? "";
-    message.payload = object.payload ?? Buffer.alloc(0);
+    message.payload = object.payload ?? new Uint8Array(0);
     message.key = object.key ?? undefined;
     message.timestamp = object.timestamp ?? 0;
     message.commandType = object.commandType ?? 0;
@@ -2889,7 +2971,7 @@ function createBaseInstallSnapshotRequest(): InstallSnapshotRequest {
     lastIncludedIndex: 0,
     lastIncludedTerm: 0,
     offset: 0,
-    data: Buffer.alloc(0),
+    data: new Uint8Array(0),
     done: false,
   };
 }
@@ -2972,7 +3054,7 @@ export const InstallSnapshotRequest: MessageFns<InstallSnapshotRequest> = {
             break;
           }
 
-          message.data = Buffer.from(reader.bytes());
+          message.data = reader.bytes();
           continue;
         }
         case 7: {
@@ -3011,7 +3093,7 @@ export const InstallSnapshotRequest: MessageFns<InstallSnapshotRequest> = {
         ? globalThis.Number(object.last_included_term)
         : 0,
       offset: isSet(object.offset) ? globalThis.Number(object.offset) : 0,
-      data: isSet(object.data) ? Buffer.from(bytesFromBase64(object.data)) : Buffer.alloc(0),
+      data: isSet(object.data) ? bytesFromBase64(object.data) : new Uint8Array(0),
       done: isSet(object.done) ? globalThis.Boolean(object.done) : false,
     };
   },
@@ -3052,7 +3134,7 @@ export const InstallSnapshotRequest: MessageFns<InstallSnapshotRequest> = {
     message.lastIncludedIndex = object.lastIncludedIndex ?? 0;
     message.lastIncludedTerm = object.lastIncludedTerm ?? 0;
     message.offset = object.offset ?? 0;
-    message.data = object.data ?? Buffer.alloc(0);
+    message.data = object.data ?? new Uint8Array(0);
     message.done = object.done ?? false;
     return message;
   },
@@ -3117,11 +3199,28 @@ export const InstallSnapshotResponse: MessageFns<InstallSnapshotResponse> = {
 };
 
 function bytesFromBase64(b64: string): Uint8Array {
-  return Uint8Array.from(globalThis.Buffer.from(b64, "base64"));
+  if ((globalThis as any).Buffer) {
+    return Uint8Array.from((globalThis as any).Buffer.from(b64, "base64"));
+  } else {
+    const bin = globalThis.atob(b64);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; ++i) {
+      arr[i] = bin.charCodeAt(i);
+    }
+    return arr;
+  }
 }
 
 function base64FromBytes(arr: Uint8Array): string {
-  return globalThis.Buffer.from(arr).toString("base64");
+  if ((globalThis as any).Buffer) {
+    return (globalThis as any).Buffer.from(arr).toString("base64");
+  } else {
+    const bin: string[] = [];
+    arr.forEach((byte) => {
+      bin.push(globalThis.String.fromCharCode(byte));
+    });
+    return globalThis.btoa(bin.join(""));
+  }
 }
 
 type Builtin = Date | Function | Uint8Array | string | number | boolean | undefined;

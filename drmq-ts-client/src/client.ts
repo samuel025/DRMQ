@@ -274,8 +274,8 @@ export class DRMQProducer extends DRMQClient {
           batch.forEach((pm, i) => pm.resolve({ success: true, offset: baseOffset + i }));
           return;
         } else {
+          const errorMsg = resp.errorMessage;
           if (resp.errorCode === ErrorCode.NOT_LEADER) {
-            const errorMsg = resp.errorMessage;
             const leaderAddr = errorMsg && errorMsg.startsWith("NOT_LEADER:") 
                 ? errorMsg.substring("NOT_LEADER:".length) 
                 : "UNKNOWN";
