@@ -125,7 +125,7 @@ public class BrokerConfig {
         String metricsPath = "/metrics";
         long logSegmentBytes = 100 * 1024 * 1024L; // 100MB
         long logRetentionMs = 7L * 24 * 60 * 60 * 1000; // 7 days
-        long raftCompactThreshold = 1000L;
+        long raftCompactThreshold = 50000L; // Keep 50,000 entries to buffer followers during short outages
         int maxDeliveries = 5;
         String dlqTopicPrefix = "dlq.";
         boolean logSegmentFsync = true;

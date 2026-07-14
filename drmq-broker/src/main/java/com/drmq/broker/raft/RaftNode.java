@@ -79,9 +79,6 @@ public class RaftNode {
     private final Map<String, Function<InstallSnapshotRequest, InstallSnapshotResponse>> installSnapshotRpcHandlers = new ConcurrentHashMap<>();
 
     private final ReentrantLock lock = new ReentrantLock();
-    // Using a cached thread pool or larger scheduled pool size
-    // We have 5 timed tasks (election, heartbeat, quorum check, proposal cleanup, state save).
-    // Given they are short-lived, 4 threads minimizes scheduling collision while preserving efficiency.
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
     private final ExecutorService raftExecutor;
     private ScheduledFuture<?> electionTimer;
@@ -112,7 +109,6 @@ public class RaftNode {
     private final Map<String, Long> lastContactTime = new ConcurrentHashMap<>();
     private static final long LOG_RATE_LIMIT_MS = 1000;  
 
-    // Snapshot receive state
     private long snapshotReceiveOffset = 0;
     private java.io.OutputStream snapshotReceiveStream = null;
     private Path snapshotTempFile = null;
@@ -152,9 +148,6 @@ public class RaftNode {
         loadPersistentState();
     }
 
-    /**
-     * Backward-compatible constructor using default compaction threshold (1000).
-     */
     public RaftNode(String nodeId, int port, List<PeerAddress> peers,
                     MessageStore messageStore, OffsetManager offsetManager, Path dataDir) throws IOException {
         this(nodeId, port, peers, messageStore, offsetManager, dataDir, 1000L);
@@ -254,6 +247,11 @@ public class RaftNode {
         logger.info("[{}] Raft node stopped", nodeId);
     }
 
+    public RaftLog getRaftLog() {
+        return raftLog;
+    }
+
+
 
     //  Peer RPC Registration
 
@@ -346,13 +344,6 @@ public class RaftNode {
         AtomicLong votesReceived = new AtomicLong(1); // self-vote
         AtomicBoolean electionStarted = new AtomicBoolean(false);
 
-        // Single-node cluster: self-vote alone satisfies quorum, start election immediately
-        if (votesReceived.get() >= votesNeeded) {
-            if (electionStarted.compareAndSet(false, true)) {
-                logger.info("[{}] Pre-vote succeeded (single-node quorum), starting real election", nodeId);
-                startElection(proposedTerm);
-            }
-        }
 
         for (PeerAddress peer : peers) {
             CompletableFuture.supplyAsync(() -> {
@@ -389,7 +380,6 @@ public class RaftNode {
                 } finally {
                     lock.unlock();
                 }
-                // Release lock before startElection() to avoid holding it during disk I/O
                 if (shouldStartElection) {
                     startElection(proposedTerm);
                 }
@@ -399,10 +389,7 @@ public class RaftNode {
         resetElectionTimer();
     }
 
-    /**
-     * Start a real election: transition to CANDIDATE, increment term, vote for self,
-     * request votes from peers. Only called after a successful pre-vote.
-     */
+
     private void startElection(long proposedTerm) {
         if (!running) return;
 
@@ -447,19 +434,6 @@ public class RaftNode {
         AtomicLong votesReceived = new AtomicLong(1);   // self-vote
         AtomicBoolean electionWon = new AtomicBoolean(false);
 
-        // Single-node cluster: self-vote alone satisfies quorum, become leader immediately
-        if (votesReceived.get() >= votesNeeded) {
-            if (electionWon.compareAndSet(false, true)) {
-                lock.lock();
-                try {
-                    if (currentTerm == myTerm && state == RaftState.CANDIDATE) {
-                        becomeLeader();
-                    }
-                } finally {
-                    lock.unlock();
-                }
-            }
-        }
 
         for (PeerAddress peer : peers) {
             CompletableFuture.supplyAsync(() -> {
@@ -647,7 +621,7 @@ public class RaftNode {
                 sendInstallSnapshotToPeer(peer);
             }
         }
-        if (needsSnapshot) return;
+
 
         long prevLogTerm = raftLog.getTermAt(prevLogIndex);
         List<RaftEntry> entries = raftLog.getEntriesFrom(peerNextIndex);
@@ -856,7 +830,6 @@ public class RaftNode {
                                 nodeId, lastApplied, entry.getTopic(), batchRequest.getEntriesCount());
                     }
                     default -> {
-                        // MESSAGE (default): apply to MessageStore
                         long msgOffset = messageStore.append(
                                 entry.getTopic(),
                                 entry.getPayload().toByteArray(),
@@ -896,11 +869,10 @@ public class RaftNode {
 
         if (applied) {
             stateSaveNeeded = true;
-            
-            // Keep at least 100x the compact threshold as a retention buffer
+
             long retentionLimit = lastApplied - (raftCompactThreshold * 100);
             long safeCompactIndex;
-            
+
             if (isLeader()) {
                 long minMatchIndex = lastApplied;
                 for (long idx : matchIndex.values()) {
@@ -910,15 +882,20 @@ public class RaftNode {
             } else {
                 safeCompactIndex = retentionLimit;
             }
-            
-            // Always keep at least raftCompactThreshold entries after lastApplied
+
             long finalCompactIndex = Math.min(safeCompactIndex, lastApplied - raftCompactThreshold);
-            
-            if (finalCompactIndex > 0) {
+  
+            long currentLogStart = raftLog.getStartIndex();
+            boolean compactionDue = finalCompactIndex > 0
+                    && (finalCompactIndex - currentLogStart) >= raftCompactThreshold;
+
+            if (compactionDue) {
                 if (isCompacting.compareAndSet(false, true)) {
                     raftExecutor.execute(() -> {
                         try {
                             raftLog.compact(finalCompactIndex);
+                            logger.debug("[{}] Chunked compaction complete: log now starts at {}",
+                                    nodeId, finalCompactIndex + 1);
                         } catch (IOException e) {
                             logger.error("Failed to compact Raft log", e);
                         } finally {

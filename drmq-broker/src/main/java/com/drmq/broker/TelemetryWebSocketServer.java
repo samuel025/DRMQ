@@ -296,7 +296,6 @@ public class TelemetryWebSocketServer extends WebSocketServer {
         localNode.addProperty("y", 200);
         nodes.add(localNode);
 
-        // Peer nodes — real Raft state, honest about what we don't know
         if (raftNode != null) {
             int[] positions = { 0, 1 };
             int i = 0;
@@ -306,15 +305,37 @@ public class TelemetryWebSocketServer extends WebSocketServer {
                 Long matchIdx = raftNode.getMatchIndexMap().get(peerId);
                 long peerApplied = matchIdx != null ? matchIdx : 0;
 
-                // Replication lag for this peer.
-                // If matchIndex is unconfirmed (null/0) and commitIndex is large,
-                // the new leader simply hasn't heard from this peer since election.
-                // Report -1 to signal "unreachable" rather than a fictitious huge lag.
-                long replicationLag;
+                long replicationLag = 0;
                 if ((matchIdx == null || matchIdx == 0) && commitIndex > 100) {
                     replicationLag = -1; // unreachable / unknown
                 } else {
-                    replicationLag = Math.max(0, commitIndex - peerApplied);
+                    long lagEntries = Math.max(0, commitIndex - peerApplied);
+                    if (lagEntries == 0) {
+                        replicationLag = 0;
+                    } else if (raftNode.getRaftLog() != null && lagEntries <= 2000) {
+                        // Calculate exact message lag by inspecting uncommitted Raft entries
+                        long msgLag = 0;
+                        for (long idx = peerApplied + 1; idx <= commitIndex; idx++) {
+                            com.drmq.protocol.DRMQProtocol.RaftEntry entry = raftNode.getRaftLog().getEntry(idx);
+                            if (entry != null && entry.getCommandType() == com.drmq.protocol.DRMQProtocol.RaftCommandType.BATCH_MESSAGE) {
+                                try {
+                                    com.drmq.protocol.DRMQProtocol.ProduceBatchRequest batch = 
+                                        com.drmq.protocol.DRMQProtocol.ProduceBatchRequest.parseFrom(entry.getPayload());
+                                    msgLag += batch.getEntriesCount();
+                                } catch (Exception e) {
+                                    msgLag += 1; // Fallback
+                                }
+                            } else if (entry != null && entry.getCommandType() == com.drmq.protocol.DRMQProtocol.RaftCommandType.MESSAGE) {
+                                msgLag += 1;
+                            }
+                        }
+                        replicationLag = msgLag;
+                    } else if (lagEntries > 2000) {
+                        // Fallback estimate if lag is extremely large to avoid blocking telemetry thread
+                        double avgBatchSize = currentProduceRecordRate > 0 ? 
+                            Math.max(1.0, currentProduceRecordRate / 10.0) : 50.0; 
+                        replicationLag = (long) (lagEntries * avgBatchSize);
+                    }
                 }
 
                 peerNode.addProperty("id",              peerId);

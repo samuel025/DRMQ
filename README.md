@@ -18,9 +18,11 @@ The project is structured as a multi-module Maven build, separating the core bro
 - **Persistent Storage:** Custom Write-Ahead Log (WAL) and segment-based message storage ensure messages are durably persisted to disk. Features thread-safe, atomic consumer offset management with bounds locking designed to minimize data loss during concurrent background writes and handle shutdowns gracefully.
 - **Graceful Teardown Coordination:** Orchestrated, safe termination of Netty EventLoops, RPC executors, and disk storage guaranteeing state integrity without resource leaks during node shutdowns.
 - **High Performance:**
+  - **Client-Side Batching:** Producers feature high-throughput, latency-optimized message batching via a configurable `linger.ms` window. This groups thousands of messages into a single network round-trip and Raft log flush, massively increasing throughput.
+  - **Configurable Disk Durability:** By default, DRMQ guarantees strict flush-before-ack durability (`fsync`). However, administrators can explicitly disable this (`--log-segment-fsync false`) for extreme throughput scenarios where hardware page-cache flushing is acceptable.
   - **Follower-based Reads:** Scalable read operations allowing consumers to fetch messages from follower nodes, distributing the load across the cluster.
   - **Dedicated Thread Pools:** Separated executor services for Raft tasks and client handling prevent thread starvation and ensure consistent performance. Independent scheduler threads prevent I/O blocking from stunting cluster heartbeats.
-- **Robust Client Ecosystem:** Includes a producer and consumer client with automatic reconnects and randomized bootstrap load balancing for seamless failover operations.
+- **Robust Client Ecosystem:** Includes Java, Python, and TypeScript SDKs featuring automatic reconnects, randomized bootstrap load balancing, typed Error Code handling, and seamless leader failovers.
 - **Metrics & Observability:** Integrated with Micrometer and Prometheus to provide deep visibility into broker health, log replication lag, and throughput metrics.
 
 ## Architecture & Modules

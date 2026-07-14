@@ -35,7 +35,7 @@ public class DRMQConsumer implements AutoCloseable {
     private static final int DEFAULT_MAX_MESSAGES = 100;
     private static final long DEFAULT_POLL_TIMEOUT_MS = 1000;
     private static final int MAX_RETRIES = 5;
-    private static final long RECONNECT_DELAY_MS = 500;  // Brief pause between retries to allow leader election
+    private static final long RECONNECT_DELAY_MS = 500; 
 
     private String host;
     private int port;
