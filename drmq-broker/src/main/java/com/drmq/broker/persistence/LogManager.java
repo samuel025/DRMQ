@@ -119,6 +119,26 @@ public class LogManager implements AutoCloseable {
         return null;
     }
 
+    /**
+     * Finds the first offset across all segments for a topic with timestamp >= targetTimestamp.
+     */
+    public long findOffsetByTimestamp(String topic, long targetTimestamp) throws IOException {
+        ConcurrentSkipListMap<Long, LogSegment> segments = topicSegments.get(topic);
+        if (segments == null || segments.isEmpty()) {
+            return -1;
+        }
+
+        // Iterate through segments to find the first one that has the timestamp.
+        for (LogSegment segment : segments.values()) {
+            long offset = segment.findOffsetByTimestamp(targetTimestamp);
+            if (offset != -1) {
+                return offset; // Found it in this segment!
+            }
+        }
+        
+        return -1;
+    }
+
     public Map<String, ConcurrentSkipListMap<Long, LogSegment>> getAllSegments() {
         return topicSegments;
     }

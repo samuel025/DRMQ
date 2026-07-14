@@ -225,6 +225,30 @@ public class LogSegment implements AutoCloseable {
         }
     }
 
+    /**
+     * Linearly scans the segment to find the first offset with timestamp >= targetTimestamp.
+     * @param targetTimestamp the timestamp to search for.
+     * @return the offset, or -1 if no message in this segment matches.
+     */
+    public synchronized long findOffsetByTimestamp(long targetTimestamp) throws IOException {
+        long position = 0;
+        long foundOffset = -1;
+        while (position < currentSize) {
+            try {
+                StoredMessage msg = read(position);
+                if (msg.getTimestamp() >= targetTimestamp) {
+                    foundOffset = msg.getOffset();
+                    break;
+                }
+                position += 4 + msg.getSerializedSize();
+            } catch (CorruptRecordException e) {
+                logger.warn("Corrupt record found while searching segment {} at pos {}", filePath, position);
+                break;
+            }
+        }
+        return foundOffset;
+    }
+
     @Override
     public void close() throws IOException {
         if (fileChannel.isOpen()) {

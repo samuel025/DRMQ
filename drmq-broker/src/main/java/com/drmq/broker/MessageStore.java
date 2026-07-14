@@ -307,6 +307,18 @@ public class MessageStore implements Closeable {
     }
 
     /**
+     * Get the first offset for a topic whose timestamp is >= targetTimestamp.
+     */
+    public long findOffsetByTimestamp(String topic, long targetTimestamp) {
+        try {
+            return logManager.findOffsetByTimestamp(topic, targetTimestamp);
+        } catch (IOException e) {
+            logger.error("Error searching for timestamp {} in topic {}", targetTimestamp, topic, e);
+            return -1;
+        }
+    }
+
+    /**
      * Get a message by topic and offset.
      */
     public StoredMessage getMessage(String topic, long offset) {

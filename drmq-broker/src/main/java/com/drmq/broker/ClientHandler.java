@@ -89,6 +89,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
             case PRE_VOTE_REQUEST -> handlePreVoteRequest(envelope);
             case APPEND_ENTRIES_REQUEST -> handleAppendEntriesRequest(envelope);
             case INSTALL_SNAPSHOT_REQUEST -> handleInstallSnapshotRequest(envelope);
+            case SEARCH_OFFSET_BY_TIME_REQUEST -> handleSearchOffsetByTimeRequest(envelope);
             default -> createErrorResponse("Unknown message type: " + envelope.getType());
         };
     }
@@ -478,6 +479,21 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
                     .setPayload(response.toByteString())
                     .build();
         }
+    }
+
+    private MessageEnvelope handleSearchOffsetByTimeRequest(MessageEnvelope envelope) throws IOException {
+        SearchOffsetByTimeRequest request = SearchOffsetByTimeRequest.parseFrom(envelope.getPayload());
+        
+        long offset = messageStore.findOffsetByTimestamp(request.getTopic(), request.getTimestamp());
+        
+        SearchOffsetByTimeResponse.Builder response = SearchOffsetByTimeResponse.newBuilder()
+                .setSuccess(true)
+                .setOffset(offset);
+                
+        return MessageEnvelope.newBuilder()
+                .setType(MessageType.SEARCH_OFFSET_BY_TIME_RESPONSE)
+                .setPayload(response.build().toByteString())
+                .build();
     }
 
     @Deprecated

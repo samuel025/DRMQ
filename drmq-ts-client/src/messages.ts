@@ -75,6 +75,8 @@ export enum MessageType {
   NACK_RESPONSE = 19,
   PRODUCE_BATCH_REQUEST = 20,
   PRODUCE_BATCH_RESPONSE = 21,
+  SEARCH_OFFSET_BY_TIME_REQUEST = 22,
+  SEARCH_OFFSET_BY_TIME_RESPONSE = 23,
   UNRECOGNIZED = -1,
 }
 
@@ -146,6 +148,12 @@ export function messageTypeFromJSON(object: any): MessageType {
     case 21:
     case "PRODUCE_BATCH_RESPONSE":
       return MessageType.PRODUCE_BATCH_RESPONSE;
+    case 22:
+    case "SEARCH_OFFSET_BY_TIME_REQUEST":
+      return MessageType.SEARCH_OFFSET_BY_TIME_REQUEST;
+    case 23:
+    case "SEARCH_OFFSET_BY_TIME_RESPONSE":
+      return MessageType.SEARCH_OFFSET_BY_TIME_RESPONSE;
     case -1:
     case "UNRECOGNIZED":
     default:
@@ -199,6 +207,10 @@ export function messageTypeToJSON(object: MessageType): string {
       return "PRODUCE_BATCH_REQUEST";
     case MessageType.PRODUCE_BATCH_RESPONSE:
       return "PRODUCE_BATCH_RESPONSE";
+    case MessageType.SEARCH_OFFSET_BY_TIME_REQUEST:
+      return "SEARCH_OFFSET_BY_TIME_REQUEST";
+    case MessageType.SEARCH_OFFSET_BY_TIME_RESPONSE:
+      return "SEARCH_OFFSET_BY_TIME_RESPONSE";
     case MessageType.UNRECOGNIZED:
     default:
       return "UNRECOGNIZED";
@@ -357,6 +369,21 @@ export interface FetchOffsetRequest {
 export interface FetchOffsetResponse {
   success: boolean;
   /** The committed offset, or -1 if none exists */
+  offset: number;
+  errorMessage: string;
+}
+
+/** Request to find an offset by a given timestamp */
+export interface SearchOffsetByTimeRequest {
+  topic: string;
+  /** The target timestamp */
+  timestamp: number;
+}
+
+/** Response with the found offset */
+export interface SearchOffsetByTimeResponse {
+  success: boolean;
+  /** The found offset, or -1 if none */
   offset: number;
   errorMessage: string;
 }
@@ -1801,6 +1828,178 @@ export const FetchOffsetResponse: MessageFns<FetchOffsetResponse> = {
   },
   fromPartial<I extends Exact<DeepPartial<FetchOffsetResponse>, I>>(object: I): FetchOffsetResponse {
     const message = createBaseFetchOffsetResponse();
+    message.success = object.success ?? false;
+    message.offset = object.offset ?? 0;
+    message.errorMessage = object.errorMessage ?? "";
+    return message;
+  },
+};
+
+function createBaseSearchOffsetByTimeRequest(): SearchOffsetByTimeRequest {
+  return { topic: "", timestamp: 0 };
+}
+
+export const SearchOffsetByTimeRequest: MessageFns<SearchOffsetByTimeRequest> = {
+  encode(message: SearchOffsetByTimeRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.topic !== "") {
+      writer.uint32(10).string(message.topic);
+    }
+    if (message.timestamp !== 0) {
+      writer.uint32(16).int64(message.timestamp);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SearchOffsetByTimeRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSearchOffsetByTimeRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.topic = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.timestamp = longToNumber(reader.int64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SearchOffsetByTimeRequest {
+    return {
+      topic: isSet(object.topic) ? globalThis.String(object.topic) : "",
+      timestamp: isSet(object.timestamp) ? globalThis.Number(object.timestamp) : 0,
+    };
+  },
+
+  toJSON(message: SearchOffsetByTimeRequest): unknown {
+    const obj: any = {};
+    if (message.topic !== "") {
+      obj.topic = message.topic;
+    }
+    if (message.timestamp !== 0) {
+      obj.timestamp = Math.round(message.timestamp);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SearchOffsetByTimeRequest>, I>>(base?: I): SearchOffsetByTimeRequest {
+    return SearchOffsetByTimeRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SearchOffsetByTimeRequest>, I>>(object: I): SearchOffsetByTimeRequest {
+    const message = createBaseSearchOffsetByTimeRequest();
+    message.topic = object.topic ?? "";
+    message.timestamp = object.timestamp ?? 0;
+    return message;
+  },
+};
+
+function createBaseSearchOffsetByTimeResponse(): SearchOffsetByTimeResponse {
+  return { success: false, offset: 0, errorMessage: "" };
+}
+
+export const SearchOffsetByTimeResponse: MessageFns<SearchOffsetByTimeResponse> = {
+  encode(message: SearchOffsetByTimeResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.success !== false) {
+      writer.uint32(8).bool(message.success);
+    }
+    if (message.offset !== 0) {
+      writer.uint32(16).int64(message.offset);
+    }
+    if (message.errorMessage !== "") {
+      writer.uint32(26).string(message.errorMessage);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SearchOffsetByTimeResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSearchOffsetByTimeResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.success = reader.bool();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.offset = longToNumber(reader.int64());
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.errorMessage = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SearchOffsetByTimeResponse {
+    return {
+      success: isSet(object.success) ? globalThis.Boolean(object.success) : false,
+      offset: isSet(object.offset) ? globalThis.Number(object.offset) : 0,
+      errorMessage: isSet(object.errorMessage)
+        ? globalThis.String(object.errorMessage)
+        : isSet(object.error_message)
+        ? globalThis.String(object.error_message)
+        : "",
+    };
+  },
+
+  toJSON(message: SearchOffsetByTimeResponse): unknown {
+    const obj: any = {};
+    if (message.success !== false) {
+      obj.success = message.success;
+    }
+    if (message.offset !== 0) {
+      obj.offset = Math.round(message.offset);
+    }
+    if (message.errorMessage !== "") {
+      obj.errorMessage = message.errorMessage;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SearchOffsetByTimeResponse>, I>>(base?: I): SearchOffsetByTimeResponse {
+    return SearchOffsetByTimeResponse.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SearchOffsetByTimeResponse>, I>>(object: I): SearchOffsetByTimeResponse {
+    const message = createBaseSearchOffsetByTimeResponse();
     message.success = object.success ?? false;
     message.offset = object.offset ?? 0;
     message.errorMessage = object.errorMessage ?? "";

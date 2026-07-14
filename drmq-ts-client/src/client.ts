@@ -15,6 +15,8 @@ import {
   NackResponse,
   ProduceBatchRequest,
   ProduceBatchResponse,
+  SearchOffsetByTimeRequest,
+  SearchOffsetByTimeResponse,
   ErrorCode
 } from './messages';
 
@@ -347,6 +349,50 @@ export class DRMQConsumer extends DRMQClient {
         this.localOffsets[topic] = await this.fetchOffset(topic);
       }
     }
+  }
+
+  public async seekByTime(topic: string, timestamp: number): Promise<void> {
+    if (!this.subscriptions.includes(topic)) {
+      this.subscriptions.push(topic);
+    }
+    
+    for (let attempt = 0; attempt < this.maxRetries; attempt++) {
+      try {
+        await this.ensureConnected();
+        
+        const req = SearchOffsetByTimeRequest.create({
+          topic,
+          timestamp
+        });
+
+        const respBytes = await this.sendEnvelope(
+          MessageType.SEARCH_OFFSET_BY_TIME_REQUEST,
+          SearchOffsetByTimeRequest.encode(req).finish()
+        );
+
+        const resp = SearchOffsetByTimeResponse.decode(respBytes);
+        
+        if (resp.success) {
+          if (resp.offset >= 0) {
+            this.localOffsets[topic] = resp.offset;
+            if (this.groupMode) {
+              await this.commit(topic, resp.offset);
+            }
+          }
+          return;
+        } else if (await this.tryRedirectToLeader(resp.errorMessage)) {
+          continue;
+        } else {
+          throw new DRMQConnectionError(`Seek by time failed: ${resp.errorMessage}`);
+        }
+      } catch (err) {
+        if (err instanceof DRMQConnectionError && err.message.includes("Seek by time failed")) {
+          throw err;
+        }
+        await this.reconnect();
+      }
+    }
+    throw new DRMQConnectionError(`Failed to seek offset by time after ${this.maxRetries} attempts`);
   }
 
   public async poll(maxMessages: number = 100, timeoutMs: number = 1000): Promise<StoredMessage[]> {

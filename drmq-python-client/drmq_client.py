@@ -309,6 +309,45 @@ class DRMQConsumer(DRMQClient):
             else:
                 self.local_offsets[topic] = self._fetch_offset(topic)
 
+    def seek_by_time(self, topic: str, timestamp: int):
+        """
+        Subscribe to a topic, starting from the first message at or after the given timestamp.
+        Overrides the current offset for the topic.
+        """
+        if topic not in self.subscriptions:
+            self.subscriptions.append(topic)
+            
+        for _ in range(self.max_retries):
+            try:
+                self._ensure_connected()
+                req = pb.SearchOffsetByTimeRequest()
+                req.topic = topic
+                req.timestamp = timestamp
+                
+                resp_payload = self._send_envelope(pb.MessageType.SEARCH_OFFSET_BY_TIME_REQUEST, req.SerializeToString())
+                resp = pb.SearchOffsetByTimeResponse()
+                resp.ParseFromString(resp_payload)
+                
+                if resp.success:
+                    if resp.offset >= 0:
+                        self.local_offsets[topic] = resp.offset
+                        if self.group_mode:
+                            self.commit(topic, resp.offset)
+                        logger.info(f"Subscribed to topic '{topic}' from time-based offset {resp.offset}")
+                    else:
+                        logger.warning(f"Could not find any offset for topic '{topic}' at or after timestamp {timestamp}")
+                    return
+                elif self._try_redirect_to_leader(resp.error_message):
+                    continue
+                else:
+                    raise DRMQConnectionError(f"Seek by time failed: {resp.error_message}")
+            except Exception as e:
+                if isinstance(e, DRMQConnectionError) and "Seek by time failed" in str(e):
+                    raise
+                self._reconnect()
+                
+        raise DRMQConnectionError(f"Failed to seek offset by time after {self.max_retries} attempts")
+
     def poll(self, max_messages: int = 100, timeout_ms: int = 1000) -> List[pb.StoredMessage]:
         """Poll the broker for new messages across all subscribed topics."""
         for _ in range(self.max_retries):
@@ -342,6 +381,9 @@ class DRMQConsumer(DRMQClient):
                     elif self._try_redirect_to_leader(resp.error_message):
                         # Break and retry the entire poll loop on the new leader
                         raise ConnectionError("Redirected to leader")
+                    else:
+                        print(f"POLL ERROR from broker: {resp.error_message}")
+                        raise DRMQConnectionError(f"Poll failed: {resp.error_message}")
 
                 return all_messages
             except Exception:

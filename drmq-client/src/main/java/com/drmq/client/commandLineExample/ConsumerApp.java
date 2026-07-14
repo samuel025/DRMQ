@@ -93,6 +93,36 @@ public class ConsumerApp {
                         }
                     }
 
+                    case "seektime" -> {
+                        if (parts.length < 3) {
+                            System.out.println("❌ Usage: seektime <topic> <timestamp_or_iso_8601>");
+                            System.out.println("   Example: seektime orders 1783968079251");
+                            System.out.println("   Example: seektime payments 2026-07-13T10:30:00Z\n");
+                            continue;
+                        }
+
+                        String topic = parts[1];
+                        long targetTime;
+                        try {
+                            targetTime = Long.parseLong(parts[2]);
+                        } catch (NumberFormatException e) {
+                            try {
+                                targetTime = java.time.Instant.parse(parts[2]).toEpochMilli();
+                            } catch (Exception ex) {
+                                System.out.println("❌ Invalid timestamp format: " + parts[2]);
+                                System.out.println("   Please provide Unix milliseconds or an ISO-8601 UTC string (e.g., 2026-07-13T10:30:00Z)\n");
+                                continue;
+                            }
+                        }
+
+                        try {
+                            consumer.seekByTime(topic, targetTime);
+                            System.out.printf("✓ Seeked [%s] to messages on or after timestamp %d\n\n", topic, targetTime);
+                        } catch (IOException e) {
+                            System.out.printf("❌ Seek failed: %s\n\n", e.getMessage());
+                        }
+                    }
+
                     case "poll" -> {
                         int maxMessages = 100;
                         long timeoutMs = 1000; // default: 1s long-poll
@@ -273,6 +303,7 @@ public class ConsumerApp {
         System.out.println("\nCommands:");
         System.out.println("  subscribe <topic>                    - Resume from broker-committed offset");
         System.out.println("  subscribe <topic> <offset>           - Override to a specific offset");
+        System.out.println("  seektime <topic> <timestamp>         - Seek to offset by Unix ms or ISO-8601 string");
         System.out.println("  poll [max] [timeout_ms]              - One-shot fetch (long-poll if timeout_ms>0)");
         System.out.println("    timeout_ms=0 → short poll (return immediately if empty)");
         System.out.println("    timeout_ms>0 → long poll (broker waits up to N ms for messages)");
@@ -287,6 +318,7 @@ public class ConsumerApp {
         System.out.println("\nExamples:");
         System.out.println("  subscribe orders       (resume from last offset)");
         System.out.println("  subscribe payments 5   (seek to offset 5)");
+        System.out.println("  seektime orders 1783968079251 (seek by time)");
         System.out.println("  poll                   (long-poll, 1s timeout)");
         System.out.println("  poll 50 2000           (up to 50 msgs, wait 2s)");
         System.out.println("  poll 100 0             (short poll)");
