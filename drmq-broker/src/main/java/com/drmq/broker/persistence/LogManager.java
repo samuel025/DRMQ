@@ -128,11 +128,26 @@ public class LogManager implements AutoCloseable {
             return -1;
         }
 
-        // Iterate through segments to find the first one that has the timestamp.
+        LogSegment targetSegment = null;
         for (LogSegment segment : segments.values()) {
-            long offset = segment.findOffsetByTimestamp(targetTimestamp);
+            try {
+                com.drmq.protocol.DRMQProtocol.StoredMessage firstMsg = segment.read(0);
+                if (firstMsg != null) {
+                    if (firstMsg.getTimestamp() > targetTimestamp) {
+                        if (targetSegment == null) {
+                            targetSegment = segment;
+                        }
+                        break;
+                    }
+                }
+            } catch (CorruptRecordException ignored) {}
+            targetSegment = segment;
+        }
+
+        if (targetSegment != null) {
+            long offset = targetSegment.findOffsetByTimestamp(targetTimestamp);
             if (offset != -1) {
-                return offset; // Found it in this segment!
+                return offset;
             }
         }
         

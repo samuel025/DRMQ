@@ -230,10 +230,11 @@ public class LogSegment implements AutoCloseable {
      * @param targetTimestamp the timestamp to search for.
      * @return the offset, or -1 if no message in this segment matches.
      */
-    public synchronized long findOffsetByTimestamp(long targetTimestamp) throws IOException {
+    public long findOffsetByTimestamp(long targetTimestamp) throws IOException {
         long position = 0;
         long foundOffset = -1;
-        while (position < currentSize) {
+        long snapshotSize = currentSize;
+        while (position < snapshotSize) {
             try {
                 StoredMessage msg = read(position);
                 if (msg.getTimestamp() >= targetTimestamp) {

@@ -482,18 +482,38 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
     }
 
     private MessageEnvelope handleSearchOffsetByTimeRequest(MessageEnvelope envelope) throws IOException {
-        SearchOffsetByTimeRequest request = SearchOffsetByTimeRequest.parseFrom(envelope.getPayload());
-        
-        long offset = messageStore.findOffsetByTimestamp(request.getTopic(), request.getTimestamp());
-        
-        SearchOffsetByTimeResponse.Builder response = SearchOffsetByTimeResponse.newBuilder()
-                .setSuccess(true)
-                .setOffset(offset);
-                
-        return MessageEnvelope.newBuilder()
-                .setType(MessageType.SEARCH_OFFSET_BY_TIME_RESPONSE)
-                .setPayload(response.build().toByteString())
-                .build();
+        long startNanos = System.nanoTime();
+        try {
+            SearchOffsetByTimeRequest request = SearchOffsetByTimeRequest.parseFrom(envelope.getPayload());
+            long offset = messageStore.findOffsetByTimestamp(request.getTopic(), request.getTimestamp());
+            
+            SearchOffsetByTimeResponse response = SearchOffsetByTimeResponse.newBuilder()
+                    .setSuccess(true)
+                    .setOffset(offset)
+                    .build();
+                    
+            BrokerMetrics.get().recordRequest("search_offset_by_time", true,
+                System.nanoTime() - startNanos, envelope.getSerializedSize(), response.getSerializedSize());
+                    
+            return MessageEnvelope.newBuilder()
+                    .setType(MessageType.SEARCH_OFFSET_BY_TIME_RESPONSE)
+                    .setPayload(response.toByteString())
+                    .build();
+        } catch (Exception e) {
+            logger.error("Error handling SEARCH_OFFSET_BY_TIME request", e);
+            BrokerMetrics.get().recordRequest("search_offset_by_time", false,
+                System.nanoTime() - startNanos, envelope.getSerializedSize(), 0);
+            
+            SearchOffsetByTimeResponse response = SearchOffsetByTimeResponse.newBuilder()
+                    .setSuccess(false)
+                    .setOffset(-1)
+                    .setErrorMessage(e.getMessage() != null ? e.getMessage() : "Unknown error")
+                    .build();
+            return MessageEnvelope.newBuilder()
+                    .setType(MessageType.SEARCH_OFFSET_BY_TIME_RESPONSE)
+                    .setPayload(response.toByteString())
+                    .build();
+        }
     }
 
     @Deprecated

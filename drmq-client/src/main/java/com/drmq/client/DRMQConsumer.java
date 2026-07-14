@@ -329,6 +329,7 @@ public class DRMQConsumer implements AutoCloseable {
             logger.info("Subscribed to topic '{}' from time-based offset {} (timestamp={})", topic, offset, timestamp);
         } else {
             logger.warn("Could not find any offset for topic '{}' at or after timestamp {}", topic, timestamp);
+            topicOffsets.putIfAbsent(topic, 0L);
         }
     }
 

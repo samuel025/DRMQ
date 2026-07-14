@@ -230,8 +230,8 @@ public class DRMQProducer implements AutoCloseable {
         long currentBackoffMs = 100;
 
         while (true) {
-            if (!running || Thread.currentThread().isInterrupted()) {
-                lastException = new IOException("Producer closed or interrupted during retry");
+            if (Thread.currentThread().isInterrupted()) {
+                lastException = new IOException("Producer interrupted during retry");
                 break;
             }
             if (System.currentTimeMillis() - startMs > deliveryTimeoutMs) {
