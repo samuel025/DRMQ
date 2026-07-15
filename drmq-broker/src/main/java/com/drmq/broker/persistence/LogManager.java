@@ -128,12 +128,34 @@ public class LogManager implements AutoCloseable {
             return -1;
         }
 
-        // Iterate through segments to find the first one that has the timestamp.
+        LogSegment prevSegment = null;
         for (LogSegment segment : segments.values()) {
-            long offset = segment.findOffsetByTimestamp(targetTimestamp);
-            if (offset != -1) {
-                return offset; // Found it in this segment!
+            try {
+                com.drmq.protocol.DRMQProtocol.StoredMessage firstMsg = segment.read(0);
+                if (firstMsg != null) {
+                    if (firstMsg.getTimestamp() >= targetTimestamp) {
+                        // The current segment starts at or after the target timestamp.
+                        // The very first message >= targetTimestamp might be at the tail of the previous segment.
+                        if (prevSegment != null) {
+                            long offset = prevSegment.findOffsetByTimestamp(targetTimestamp);
+                            if (offset != -1) {
+                                return offset;
+                            }
+                        }
+                        // If not found in the previous segment (or no previous segment exists), it must be here.
+                        return segment.findOffsetByTimestamp(targetTimestamp);
+                    }
+                }
+            } catch (CorruptRecordException e) {
+                logger.warn("Skipping corrupt segment in timestamp search: {}", segment.getFilePath());
+                continue;
             }
+            prevSegment = segment;
+        }
+
+        // If all segments start strictly before the targetTimestamp, check the final segment.
+        if (prevSegment != null) {
+            return prevSegment.findOffsetByTimestamp(targetTimestamp);
         }
         
         return -1;

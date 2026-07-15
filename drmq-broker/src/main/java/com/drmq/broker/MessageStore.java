@@ -21,8 +21,14 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.net.URI;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import com.drmq.broker.persistence.CorruptRecordException;
+import com.drmq.broker.persistence.InfinityLogResolver;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.S3ClientBuilder;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.regions.Region;
 
 /**
  * Message storage for the broker.
@@ -34,6 +40,8 @@ public class MessageStore implements Closeable {
     private final LogManager logManager;
     private final BrokerConfig config;
     private final ScheduledExecutorService cleanerScheduler = Executors.newSingleThreadScheduledExecutor();
+    private S3Client s3Client;
+    private InfinityLogResolver infinityLogResolver;
 
     // Topic -> Offset -> Byte Position in log file (Sparse Index)
     private final ConcurrentHashMap<String, ConcurrentSkipListMap<Long, Long>> topicIndex = new ConcurrentHashMap<>();
@@ -61,9 +69,23 @@ public class MessageStore implements Closeable {
         this.logManager = logManager;
         this.config = config;
         
+        if (config.getS3ArchiveBucket() != null && !config.getS3ArchiveBucket().isEmpty()) {
+            S3ClientBuilder builder = S3Client.builder()
+                .region(Region.of(config.getS3ArchiveRegion()));
+            if (config.getS3ArchiveEndpoint() != null && !config.getS3ArchiveEndpoint().isEmpty()) {
+                builder.endpointOverride(URI.create(config.getS3ArchiveEndpoint()))
+                       .forcePathStyle(true);
+            }
+            this.s3Client = builder.build();
+            this.infinityLogResolver = new InfinityLogResolver(this.s3Client, config, logManager);
+            logger.info("S3 Archiving enabled for bucket: {} (Endpoint: {})", 
+                config.getS3ArchiveBucket(), 
+                config.getS3ArchiveEndpoint() != null ? config.getS3ArchiveEndpoint() : "default");
+        }
+
         long retentionMs = config.getLogRetentionMs();
         if (retentionMs > 0) {
-            cleanerScheduler.scheduleWithFixedDelay(this::cleanupOldSegments, 1, 1, TimeUnit.MINUTES);
+            cleanerScheduler.scheduleWithFixedDelay(this::cleanupOldSegments, 5, 10, TimeUnit.SECONDS);
         }
     }
 
@@ -383,21 +405,37 @@ public class MessageStore implements Closeable {
         
         List<StoredMessage> result = new ArrayList<>();
         long currentOffset = fromOffset;
+        LogSegment lastSegment = null;
         
         while (result.size() < maxCount) {
             LogSegment segment = logManager.getSegmentForOffset(topic, currentOffset);
+            
+            if (segment != null && segment == lastSegment) {
+                // The local segment floorEntry returned is the same one we just exhausted.
+                // This means the segment containing currentOffset is missing locally (archived).
+                segment = null;
+            }
+            
             if (segment == null) {
-                ConcurrentSkipListMap<Long, LogSegment> allTopicSegments = logManager.getAllSegments().get(topic);
-                if (allTopicSegments != null) {
-                    Map.Entry<Long, LogSegment> higherEntry = allTopicSegments.higherEntry(currentOffset);
-                    if (higherEntry != null) {
-                        segment = higherEntry.getValue();
-                        currentOffset = segment.getBaseOffset();
+                // Not found locally? Ask the InfinityLog!
+                if (infinityLogResolver != null) {
+                    segment = infinityLogResolver.resolveMissingSegment(topic, currentOffset);
+                }
+                
+                // If still null (not in S3 or no S3), try to jump to the next available local segment
+                if (segment == null) {
+                    ConcurrentSkipListMap<Long, LogSegment> allTopicSegments = logManager.getAllSegments().get(topic);
+                    if (allTopicSegments != null) {
+                        java.util.Map.Entry<Long, LogSegment> higherEntry = allTopicSegments.higherEntry(currentOffset);
+                        if (higherEntry != null) {
+                            segment = higherEntry.getValue();
+                            currentOffset = segment.getBaseOffset();
+                        } else {
+                            break; // No more segments anywhere
+                        }
                     } else {
-                        break; // No more segments
+                        break;
                     }
-                } else {
-                    break;
                 }
             }
             
@@ -422,20 +460,7 @@ public class MessageStore implements Closeable {
                     position += 4 + message.getSerializedSize();
                 }
                 
-                if (position >= segmentSize) {
-                    // Reached end of segment, will loop and fetch next segment
-                    ConcurrentSkipListMap<Long, LogSegment> allTopicSegments = logManager.getAllSegments().get(topic);
-                    if (allTopicSegments != null) {
-                        java.util.Map.Entry<Long, LogSegment> higherEntry = allTopicSegments.higherEntry(segment.getBaseOffset());
-                        if (higherEntry != null) {
-                            currentOffset = higherEntry.getKey();
-                        } else {
-                            break; // No more segments
-                        }
-                    } else {
-                        break;
-                    }
-                }
+                lastSegment = segment;
             } catch (IOException e) {
                 logger.warn("Error reading messages from disk for topic {} segment {}: {}", topic, segment.getFilePath(), e.getMessage());
                 break;
@@ -535,6 +560,9 @@ public class MessageStore implements Closeable {
                 Thread.currentThread().interrupt();
             }
         }
+        if (s3Client != null) {
+            s3Client.close();
+        }
     }
 
     void cleanupOldSegments() {
@@ -572,6 +600,19 @@ public class MessageStore implements Closeable {
                 LogSegment segment = segments.remove(baseOffset);
                 if (segment != null) {
                     try {
+                        if (s3Client != null) {
+                            String key = "archive/" + config.getNodeId() + "/" + topic + "/" + segment.getFilePath().getFileName().toString();
+                            logger.info("Uploading segment {} to S3 bucket {}", segment.getFilePath(), config.getS3ArchiveBucket());
+                            s3Client.putObject(
+                                PutObjectRequest.builder()
+                                    .bucket(config.getS3ArchiveBucket())
+                                    .key(key)
+                                    .build(),
+                                segment.getFilePath()
+                            );
+                            logger.info("Successfully uploaded segment to S3: {}", key);
+                        }
+                        
                         segment.delete();
                         ConcurrentSkipListMap<Long, Long> index = topicIndex.get(topic);
                         if (index != null) {
