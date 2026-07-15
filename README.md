@@ -16,6 +16,8 @@ The project is structured as a multi-module Maven build, separating the core bro
 - **Dead-Letter Queues (DLQ):** Gracefully handle poison pill messages. Consumers can explicitly `nack()` unprocessable messages. After a configurable threshold of delivery failures, the broker automatically routes the message to an isolated DLQ topic and advances the consumer group, preventing blockages.
 - **Raft Consensus Integration:** Full implementation of the Raft protocol for distributed state replication, leader election, and high availability. Features **Quorum-Loss Stepdown** to detect network partitions and demote isolated leaders, preventing split-brain/ghost leadership data loss.
 - **Persistent Storage:** Custom Write-Ahead Log (WAL) and segment-based message storage ensure messages are durably persisted to disk. Features thread-safe, atomic consumer offset management with bounds locking designed to minimize data loss during concurrent background writes and handle shutdowns gracefully.
+- **Tiered Storage (S3 Archiving):** Seamlessly archive old log segments to Amazon S3 (or MinIO) to decouple storage costs from compute. Consumers requesting historical offsets transparently trigger the broker to download and resolve missing segments from the cloud, with built-in pagination and atomic concurrent recovery.
+- **Time-based Message Lookup:** Clients can precisely rewind consumers to the earliest message at or after a specific UNIX timestamp (`seekByTime`), enabling accurate historical replay without knowing exact offsets.
 - **Graceful Teardown Coordination:** Orchestrated, safe termination of Netty EventLoops, RPC executors, and disk storage guaranteeing state integrity without resource leaks during node shutdowns.
 - **High Performance:**
   - **Client-Side Batching:** Producers feature high-throughput, latency-optimized message batching via a configurable `linger.ms` window. This groups thousands of messages into a single network round-trip and Raft log flush, massively increasing throughput.
@@ -77,6 +79,33 @@ To run a fault-tolerant cluster, you must start multiple broker instances and pr
 
 ```bash
 ./mvnw -pl drmq-broker exec:java -Dexec.args="--node-id 3 --port 9094 --data-dir ./data-3 --peers 1:localhost:9092,2:localhost:9093"
+```
+
+### Configuration File
+
+Instead of passing dozens of command-line arguments, DRMQ supports loading properties from a `.properties` file using the `--config` flag. This is highly recommended for production, especially when configuring Tiered Storage.
+
+Create a `server.properties` file:
+```properties
+node.id=1
+port=9092
+data.dir=./data
+peers=2:localhost:9093,3:localhost:9094
+
+# S3 Tiered Storage Configuration
+s3.archive.bucket=drmq-archive
+s3.archive.region=us-east-1
+#s3.archive.endpoint=http://localhost:9000 # Uncomment for MinIO
+
+# Advanced Tuning
+log.segment.bytes=10485760
+log.retention.ms=86400000
+log.segment.fsync=true
+```
+
+Then run the broker:
+```bash
+./mvnw -pl drmq-broker exec:java -Dexec.args="--config server.properties"
 ```
 
 ## Usage Example
@@ -141,6 +170,9 @@ try (DRMQConsumer consumer = new DRMQConsumer("localhost:9092", "my-group")) {
     
     // Subscribe and explicitly tell the broker to start from offset 0 (replay from the start)
     consumer.subscribe("my-topic", 0);
+
+    // Alternatively, seek by time (timestamp in milliseconds)
+    // consumer.seekByTime("my-topic", System.currentTimeMillis() - 3600000); // Replay last hour
 
     while (true) {
         List<DRMQConsumer.ConsumedMessage> messages = consumer.poll(100, 1000);
@@ -270,7 +302,7 @@ mvn exec:java -Dexec.mainClass="com.drmq.client.commandLineExample.ConsumerApp" 
 
 Run multiple instances with the same group name in separate terminals to see messages load-balanced across consumers.
 
-_Commands:_ `subscribe <topic>`, `poll`, `stream`, `commit`, `mode group|single`, `status`
+_Commands:_ `subscribe <topic> [offset]`, `seek <topic> <timestamp>`, `poll`, `stream`, `commit`, `mode group|single`, `status`
 
 ## Monitoring
 
