@@ -16,7 +16,7 @@ The project is structured as a multi-module Maven build, separating the core bro
 - **Dead-Letter Queues (DLQ):** Gracefully handle poison pill messages. Consumers can explicitly `nack()` unprocessable messages. After a configurable threshold of delivery failures, the broker automatically routes the message to an isolated DLQ topic and advances the consumer group, preventing blockages.
 - **Raft Consensus Integration:** Full implementation of the Raft protocol for distributed state replication, leader election, and high availability. Features **Quorum-Loss Stepdown** to detect network partitions and demote isolated leaders, preventing split-brain/ghost leadership data loss.
 - **Persistent Storage:** Custom Write-Ahead Log (WAL) and segment-based message storage ensure messages are durably persisted to disk. Features thread-safe, atomic consumer offset management with bounds locking designed to minimize data loss during concurrent background writes and handle shutdowns gracefully.
-- **Tiered Storage (S3 Archiving):** Seamlessly archive old log segments to Amazon S3 (or MinIO) to decouple storage costs from compute. Consumers requesting historical offsets transparently trigger the broker to download and resolve missing segments from the cloud, with built-in pagination and atomic concurrent recovery.
+- **InfinityLog (Tiered Storage):** Seamlessly archive old log segments to Amazon S3 (or MinIO) to decouple storage costs from compute. Consumers requesting historical offsets transparently trigger the broker to download and resolve missing segments from the cloud, with built-in pagination and atomic concurrent recovery.
 - **Time-based Message Lookup:** Clients can precisely rewind consumers to the earliest message at or after a specific UNIX timestamp (`seekByTime`), enabling accurate historical replay without knowing exact offsets.
 - **Graceful Teardown Coordination:** Orchestrated, safe termination of Netty EventLoops, RPC executors, and disk storage guaranteeing state integrity without resource leaks during node shutdowns.
 - **High Performance:**
@@ -92,7 +92,7 @@ port=9092
 data.dir=./data
 peers=2:localhost:9093,3:localhost:9094
 
-# S3 Tiered Storage Configuration
+# InfinityLog (Tiered Storage) Configuration
 s3.archive.bucket=drmq-archive
 s3.archive.region=us-east-1
 #s3.archive.endpoint=http://localhost:9000 # Uncomment for MinIO
