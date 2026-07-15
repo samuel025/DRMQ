@@ -73,7 +73,8 @@ public class MessageStore implements Closeable {
             S3ClientBuilder builder = S3Client.builder()
                 .region(Region.of(config.getS3ArchiveRegion()));
             if (config.getS3ArchiveEndpoint() != null && !config.getS3ArchiveEndpoint().isEmpty()) {
-                builder.endpointOverride(URI.create(config.getS3ArchiveEndpoint()));
+                builder.endpointOverride(URI.create(config.getS3ArchiveEndpoint()))
+                       .forcePathStyle(true);
             }
             this.s3Client = builder.build();
             this.infinityLogResolver = new InfinityLogResolver(this.s3Client, config, logManager);
@@ -84,7 +85,7 @@ public class MessageStore implements Closeable {
 
         long retentionMs = config.getLogRetentionMs();
         if (retentionMs > 0) {
-            cleanerScheduler.scheduleWithFixedDelay(this::cleanupOldSegments, 1, 1, TimeUnit.MINUTES);
+            cleanerScheduler.scheduleWithFixedDelay(this::cleanupOldSegments, 5, 10, TimeUnit.SECONDS);
         }
     }
 
@@ -404,9 +405,17 @@ public class MessageStore implements Closeable {
         
         List<StoredMessage> result = new ArrayList<>();
         long currentOffset = fromOffset;
+        LogSegment lastSegment = null;
         
         while (result.size() < maxCount) {
             LogSegment segment = logManager.getSegmentForOffset(topic, currentOffset);
+            
+            if (segment != null && segment == lastSegment) {
+                // The local segment floorEntry returned is the same one we just exhausted.
+                // This means the segment containing currentOffset is missing locally (archived).
+                segment = null;
+            }
+            
             if (segment == null) {
                 // Not found locally? Ask the InfinityLog!
                 if (infinityLogResolver != null) {
@@ -451,20 +460,7 @@ public class MessageStore implements Closeable {
                     position += 4 + message.getSerializedSize();
                 }
                 
-                if (position >= segmentSize) {
-                    // Reached end of segment, will loop and fetch next segment
-                    ConcurrentSkipListMap<Long, LogSegment> allTopicSegments = logManager.getAllSegments().get(topic);
-                    if (allTopicSegments != null) {
-                        java.util.Map.Entry<Long, LogSegment> higherEntry = allTopicSegments.higherEntry(segment.getBaseOffset());
-                        if (higherEntry != null) {
-                            currentOffset = higherEntry.getKey();
-                        } else {
-                            break; // No more segments
-                        }
-                    } else {
-                        break;
-                    }
-                }
+                lastSegment = segment;
             } catch (IOException e) {
                 logger.warn("Error reading messages from disk for topic {} segment {}: {}", topic, segment.getFilePath(), e.getMessage());
                 break;
@@ -563,6 +559,9 @@ public class MessageStore implements Closeable {
                 cleanerScheduler.shutdownNow();
                 Thread.currentThread().interrupt();
             }
+        }
+        if (s3Client != null) {
+            s3Client.close();
         }
     }
 

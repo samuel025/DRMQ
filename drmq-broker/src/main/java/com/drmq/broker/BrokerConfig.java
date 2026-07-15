@@ -59,7 +59,7 @@ public class BrokerConfig {
         this.dlqTopicPrefix = dlqTopicPrefix != null ? dlqTopicPrefix : "dlq.";
         this.logSegmentFsync = logSegmentFsync;
         this.s3ArchiveBucket = s3ArchiveBucket;
-        this.s3ArchiveRegion = s3ArchiveRegion;
+        this.s3ArchiveRegion = (s3ArchiveRegion != null && !s3ArchiveRegion.isBlank()) ? s3ArchiveRegion : "us-east-1";
         this.s3ArchiveEndpoint = s3ArchiveEndpoint;
     }
 

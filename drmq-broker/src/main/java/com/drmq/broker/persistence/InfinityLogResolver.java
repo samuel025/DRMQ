@@ -11,6 +11,7 @@ import software.amazon.awssdk.services.s3.model.S3Object;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.concurrent.ConcurrentSkipListMap;
 
 /**
  * InfinityLogResolver enables transparent tiered storage for DRMQ.
@@ -53,18 +54,34 @@ public class InfinityLogResolver {
             long bestBaseOffset = -1;
             String bestKey = null;
 
-            for (S3Object obj : listRes.contents()) {
-                String key = obj.key();
-                String filename = key.substring(key.lastIndexOf('/') + 1);
-                if (filename.endsWith(".log")) {
-                    try {
-                        long baseOffset = Long.parseLong(filename.replace(".log", ""));
-                        if (baseOffset <= targetOffset && baseOffset > bestBaseOffset) {
-                            bestBaseOffset = baseOffset;
-                            bestKey = key;
-                        }
-                    } catch (NumberFormatException ignored) { }
+            boolean done = false;
+            while (!done) {
+                ListObjectsV2Response listResp = s3Client.listObjectsV2(listReq);
+                
+                for (S3Object obj : listResp.contents()) {
+                    String key = obj.key();
+                    String filename = key.substring(key.lastIndexOf('/') + 1);
+                    if (filename.endsWith(".log")) {
+                        try {
+                            long baseOffset = Long.parseLong(filename.replace(".log", ""));
+                            if (baseOffset <= targetOffset && baseOffset > bestBaseOffset) {
+                                bestBaseOffset = baseOffset;
+                                bestKey = key;
+                            } else if (baseOffset > targetOffset) {
+                                // Since S3 returns keys in lexicographical order, and we format them with zero-padding
+                                // (e.g. 00000000000000000000.log), they are sorted by baseOffset.
+                                // We can safely abort early once we surpass targetOffset.
+                                done = true;
+                                break;
+                            }
+                        } catch (NumberFormatException ignored) { }
+                    }
                 }
+                
+                if (done || !listRes.isTruncated()) {
+                    break;
+                }
+                listReq = listReq.toBuilder().continuationToken(listRes.nextContinuationToken()).build();
             }
 
             if (bestKey != null) {
@@ -73,23 +90,37 @@ public class InfinityLogResolver {
                 Path topicDir = Paths.get(config.getDataDir()).resolve(topic);
                 Path localPath = topicDir.resolve(String.format("%020d.log", bestBaseOffset));
                 
-                // If it already exists somehow, don't download it again
-                if (!localPath.toFile().exists()) {
-                    logger.info("[InfinityLog] Downloading segment from cloud to {}", localPath);
-                    GetObjectRequest getReq = GetObjectRequest.builder()
-                        .bucket(config.getS3ArchiveBucket())
-                        .key(bestKey)
-                        .build();
-                        
-                    s3Client.getObject(getReq, localPath);
-                    logger.info("[InfinityLog] Successfully recovered segment to {}", localPath);
+                synchronized ((topic + "-" + bestBaseOffset).intern()) {
+                    java.util.concurrent.ConcurrentSkipListMap<Long, LogSegment> topicMap = logManager.getAllSegments()
+                            .computeIfAbsent(topic, k -> new java.util.concurrent.ConcurrentSkipListMap<>());
+                            
+                    if (topicMap.containsKey(bestBaseOffset)) {
+                        return topicMap.get(bestBaseOffset);
+                    }
+                    
+                    // If it already exists somehow, don't download it again
+                    if (!localPath.toFile().exists()) {
+                        if (!topicDir.toFile().exists()) {
+                            topicDir.toFile().mkdirs();
+                        }
+                        Path tmpPath = topicDir.resolve(String.format("%020d.log.tmp", bestBaseOffset));
+                        logger.info("[InfinityLog] Downloading segment from cloud to {}", tmpPath);
+                        GetObjectRequest getReq = GetObjectRequest.builder()
+                            .bucket(config.getS3ArchiveBucket())
+                            .key(bestKey)
+                            .build();
+                            
+                        s3Client.getObject(getReq, tmpPath);
+                        java.nio.file.Files.move(tmpPath, localPath, java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                        logger.info("[InfinityLog] Successfully recovered segment to {}", localPath);
+                    }
+                    
+                    // Load it into LogManager memory
+                    LogSegment segment = new LogSegment(localPath, config.isLogSegmentFsync());
+                    topicMap.put(bestBaseOffset, segment);
+                    
+                    return segment;
                 }
-                
-                // Load it into LogManager memory
-                LogSegment segment = new LogSegment(localPath, config.isLogSegmentFsync());
-                logManager.getAllSegments().get(topic).put(bestBaseOffset, segment);
-                
-                return segment;
             } else {
                 logger.debug("[InfinityLog] Offset {} not found in any archived segment for topic {}", targetOffset, topic);
             }

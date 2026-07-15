@@ -128,27 +128,34 @@ public class LogManager implements AutoCloseable {
             return -1;
         }
 
-        LogSegment targetSegment = null;
+        LogSegment prevSegment = null;
         for (LogSegment segment : segments.values()) {
             try {
                 com.drmq.protocol.DRMQProtocol.StoredMessage firstMsg = segment.read(0);
                 if (firstMsg != null) {
-                    if (firstMsg.getTimestamp() > targetTimestamp) {
-                        if (targetSegment == null) {
-                            targetSegment = segment;
+                    if (firstMsg.getTimestamp() >= targetTimestamp) {
+                        // The current segment starts at or after the target timestamp.
+                        // The very first message >= targetTimestamp might be at the tail of the previous segment.
+                        if (prevSegment != null) {
+                            long offset = prevSegment.findOffsetByTimestamp(targetTimestamp);
+                            if (offset != -1) {
+                                return offset;
+                            }
                         }
-                        break;
+                        // If not found in the previous segment (or no previous segment exists), it must be here.
+                        return segment.findOffsetByTimestamp(targetTimestamp);
                     }
                 }
-            } catch (CorruptRecordException ignored) {}
-            targetSegment = segment;
+            } catch (CorruptRecordException e) {
+                logger.warn("Skipping corrupt segment in timestamp search: {}", segment.getFilePath());
+                continue;
+            }
+            prevSegment = segment;
         }
 
-        if (targetSegment != null) {
-            long offset = targetSegment.findOffsetByTimestamp(targetTimestamp);
-            if (offset != -1) {
-                return offset;
-            }
+        // If all segments start strictly before the targetTimestamp, check the final segment.
+        if (prevSegment != null) {
+            return prevSegment.findOffsetByTimestamp(targetTimestamp);
         }
         
         return -1;
