@@ -336,7 +336,7 @@ export default function ClusterTopology({ nodes, metrics, latencies }: any) {
   const latencyValues = [latencies.alphaBeta, latencies.betaGamma, latencies.raftRpcMs];
 
   return (
-    <div className="topology-canvas flex-1 rounded-2xl overflow-hidden relative min-h-0"
+    <div className="topology-canvas flex-1 rounded-2xl overflow-hidden relative min-h-0 technical-grid"
       style={{ border: '1px solid rgba(255,255,255,0.04)' }} onClick={handleCanvasClick}>
 
       {/* Corner labels */}

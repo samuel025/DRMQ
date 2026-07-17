@@ -64,6 +64,10 @@ export class MockTelemetryProvider implements TelemetryProvider {
         throughputHistory: Array.from({ length: 30 }, (_, i) =>
           Math.max(5, 50 + Math.sin(i / 4) * 30 + Math.random() * 10)
         ),
+        consumeHistory: Array.from({ length: 30 }, (_, i) =>
+          Math.min(100, Math.max(3, ((0.9 + Math.sin(i / 4 + 1) * 0.4 + Math.random() * 0.2) / 50) * 100))
+        ),
+        errorHistory: Array.from({ length: 30 }, () => 0),
       },
       latencies: { alphaBeta: 3.2, betaGamma: 2.8, raftRpcMs: 3.2 },
       events: [],
@@ -151,6 +155,8 @@ export class MockTelemetryProvider implements TelemetryProvider {
       logSegments:  metrics.logSegments + (newCommitIndex % 5000 === 0 ? 1 : 0),
       cachedMessages: Math.min(3000, metrics.cachedMessages + produceRate - consumeRate * 0.8),
       throughputHistory: newHistory,
+      consumeHistory: [...metrics.consumeHistory.slice(1), Math.min(100, Math.max(3, ((consumeMB) / 50) * 100))],
+      errorHistory: [...metrics.errorHistory.slice(1), errorRate],
     };
 
     this.state.nodes = nodes.map((node, idx) => ({

@@ -952,14 +952,6 @@ public class RaftNode {
             lock.unlock();
         }
         
-        if (peers.isEmpty()) {
-            lock.lock();
-            try {
-                advanceCommitIndex();
-            } finally {
-                lock.unlock();
-            }
-        }
         sendHeartbeats();
         try {
             return future.get(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -1028,15 +1020,6 @@ public class RaftNode {
         } finally {
             lock.unlock();
         }
-        
-        if (peers.isEmpty()) {
-            lock.lock();
-            try {
-                advanceCommitIndex();
-            } finally {
-                lock.unlock();
-            }
-        }
         sendHeartbeats();
         try {
             return future.get(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -1103,14 +1086,6 @@ public class RaftNode {
             lock.unlock();
         }
 
-        if (peers.isEmpty()) {
-            lock.lock();
-            try {
-                advanceCommitIndex();
-            } finally {
-                lock.unlock();
-            }
-        }
         sendHeartbeats();
 
         try {
@@ -1329,7 +1304,6 @@ public class RaftNode {
             leaderId = request.getLeaderId();
             state = RaftState.FOLLOWER;
 
-            // Initialize or reset receive state for the first chunk or if index changes
             if (request.getOffset() == 0 || request.getLastIncludedIndex() != expectedSnapshotIndex) {
                 if (snapshotReceiveStream != null) {
                     try { snapshotReceiveStream.close(); } catch (Exception ignored) {}
@@ -1343,19 +1317,16 @@ public class RaftNode {
                 expectedSnapshotIndex = request.getLastIncludedIndex();
             }
 
-            // Verify offset
             if (request.getOffset() != snapshotReceiveOffset) {
                 throw new IllegalStateException("Expected chunk offset " + snapshotReceiveOffset + 
                                                 " but got " + request.getOffset());
             }
 
-            // Append chunk data
             if (request.getData().size() > 0) {
                 snapshotReceiveStream.write(request.getData().toByteArray());
                 snapshotReceiveOffset += request.getData().size();
             }
 
-            // If final chunk, process hot-swap
             if (request.getDone()) {
                 snapshotReceiveStream.close();
                 snapshotReceiveStream = null;
@@ -1364,14 +1335,12 @@ public class RaftNode {
                 if (snapshotIndex > lastApplied) {
                     logger.info("[{}] Received full snapshot. Applying hot-swap up to index {}", nodeId, snapshotIndex);
                     
-                    // Restore snapshot and clear memory state
                     snapshotManager.restoreSnapshot(snapshotTempFile);
                     messageStore.reload();
                     if (offsetManager != null) {
                         offsetManager.reload();
                     }
 
-                    // Discard all local log entries up to the snapshot point
                     if (raftLog.getLastIndex() > 0) {
                         try {
                             long compactUpTo = Math.min(snapshotIndex, raftLog.getLastIndex());

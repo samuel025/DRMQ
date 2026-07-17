@@ -19,6 +19,14 @@
   --color-surface-2: #0c1019;
   --color-surface-3: #111827;
   --color-surface-4: #1a2035;
+
+  /* Dither Kit Theme Variables */
+  --color-foreground: #f4f4f5;
+  --color-muted-foreground: #71717a;
+  --color-border: rgba(255, 255, 255, 0.1);
+  --color-background: #000000;
+  --color-popover-foreground: #f4f4f5;
+  --color-popover: #18181b;
 }
 
 @layer base {
@@ -213,6 +221,15 @@
 /* ── Mono numbers ────────────────────────────────────────────────────── */
 .mono {
   font-family: 'JetBrains Mono', monospace;
+}
+
+/* ── Technical Grid Background ───────────────────────────────────────── */
+.technical-grid {
+  background-image: 
+    linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+  background-size: 20px 20px;
+  background-position: center center;
 }
 
 /* ── Reduced motion ──────────────────────────────────────────────────── */

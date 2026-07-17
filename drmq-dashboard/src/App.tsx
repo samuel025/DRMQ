@@ -1,5 +1,6 @@
 import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router-dom';
 import { LayoutDashboard, Book, Server, ChevronRight } from 'lucide-react';
+import { useState, useCallback } from 'react';
 import Dashboard from './pages/Dashboard';
 import { useClusterTelemetry } from './useClusterTelemetry';
 
@@ -91,15 +92,44 @@ function Sidebar({ telemetryState }: { telemetryState: any }) {
 }
 
 export default function App() {
-  const { data: telemetryState, error: telemetryError } = useClusterTelemetry();
+  const [paused, setPaused] = useState(false);
+  const { data: telemetryState, error: telemetryError, provider } = useClusterTelemetry();
+
+  const handleTogglePause = useCallback(() => {
+    setPaused(prev => {
+      const next = !prev;
+      // Side effects scheduled outside the updater via queueMicrotask so
+      // they run exactly once even under StrictMode's double-invoke.
+      queueMicrotask(() => {
+        if (next) provider.disconnect();
+        else provider.reconnect();
+      });
+      return next;
+    });
+  }, [provider]);
+
   return (
     <BrowserRouter>
       <div className="h-screen flex overflow-hidden" style={{ background: '#000', color: '#d4d4d8', fontFamily: "'Inter', sans-serif" }}>
         <Sidebar telemetryState={telemetryState} />
         <main className="flex-1 min-w-0 overflow-y-auto">
           <Routes>
-            <Route path="/" element={<Dashboard telemetryState={telemetryState} telemetryError={telemetryError} />} />
-            <Route path="/docs" element={<div className="p-8 text-zinc-400">Documentation is available at <a href="https://drmq.vercel.app" target="_blank" rel="noreferrer" className="text-brand-400 hover:underline">drmq.vercel.app</a></div>} />
+            <Route path="/" element={
+              <Dashboard
+                telemetryState={telemetryState}
+                telemetryError={telemetryError}
+                paused={paused}
+                onTogglePause={handleTogglePause}
+              />
+            } />
+            <Route path="/docs" element={
+              <iframe
+                src="https://drmq.vercel.app"
+                className="w-full h-full border-0"
+                title="DRMQ Documentation"
+                style={{ minHeight: '100vh' }}
+              />
+            } />
           </Routes>
         </main>
       </div>
