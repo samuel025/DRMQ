@@ -104,6 +104,19 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
   }
 
   /**
+   * Backfill any history arrays the broker doesn't send yet.
+   * This prevents the dashboard from crashing on undefined.slice().
+   */
+  private static normalizeMetrics(m: ClusterMetrics): ClusterMetrics {
+    return {
+      ...m,
+      throughputHistory: m.throughputHistory ?? [],
+      consumeHistory:    m.consumeHistory    ?? [],
+      errorHistory:      m.errorHistory      ?? [],
+    };
+  }
+
+  /**
    * Merge all latest frames into one coherent TelemetryState.
    *
    * Key invariants:
@@ -111,8 +124,7 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
    *    the leader frame. Followers don't receive client traffic, so their
    *    counts are meaningless for the cluster-level view.
    *  - Node list is a union of all frames, with each broker's self-report
-   *    preferred for its own entry (most accurate), but replicationLag from
-   *    the leader preserved via merge.
+   *    preferred for its own entry (most accurate self-knowledge).
    *  - followerSync uses a fixed scale: 0 lag = 100%, ≥1000 lag = 0%.
    */
   private merge(): TelemetryState {
@@ -125,13 +137,20 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
           produceRate: 0, consumeRate: 0, errorRate: 0, produceLatencyMs: 0, consumeLatencyMs: 0,
           activeProducers: 0, activeConsumers: 0, totalConnections: 0,
           health: 'CRITICAL', term: 0, commitIndex: 0, lastApplied: 0, followerSync: 0,
-          globalOffset: 0, topicCount: 0, logSegments: 0, cachedMessages: 0, throughputHistory: []
+          globalOffset: 0, topicCount: 0, logSegments: 0, cachedMessages: 0,
+          throughputHistory: [], consumeHistory: [], errorHistory: []
         },
         latencies: { alphaBeta: 0, betaGamma: 0, raftRpcMs: 0 },
         events: [],
       };
     }
-    if (frames.length === 1) return { ...frames[0], events: frames[0].events ?? [] };
+    if (frames.length === 1) {
+      return {
+        ...frames[0],
+        metrics: WebSocketTelemetryProvider.normalizeMetrics(frames[0].metrics),
+        events: frames[0].events ?? [],
+      };
+    }
 
     // Find the most authoritative frame (leader with highest term)
     const maxTerm = Math.max(...frames.map(f => f.metrics.term ?? 0));
@@ -182,7 +201,7 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
     // ── 2. Metrics: exclusively from the leader frame ─────────────────────────
     // This prevents doubling of activeProducers/activeConsumers when multiple
     // surviving brokers each report their own Netty connection count.
-    const metrics: ClusterMetrics = { ...leaderFrame.metrics };
+    const metrics: ClusterMetrics = WebSocketTelemetryProvider.normalizeMetrics(leaderFrame.metrics);
 
     // Recompute followerSync with a FIXED scale (not proportional to commitIndex).
     // Scale: 0 lag = 100%, 1000+ lag = 0%.

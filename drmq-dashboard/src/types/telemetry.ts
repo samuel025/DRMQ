@@ -46,6 +46,8 @@ export interface ClusterMetrics {
 
   // Chart
   throughputHistory: number[]; // 0-100 scaled, 30 points
+  consumeHistory: number[];    // 0-100 scaled, 30 points
+  errorHistory: number[];      // errors/s per tick, 30 points
 }
 
 export interface Latencies {

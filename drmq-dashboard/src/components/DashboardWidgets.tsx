@@ -8,10 +8,11 @@ export interface StatCardProps {
   unit?: string;
   color?: string;
   sub?: ReactNode;
+  spark?: ReactNode;
 }
 
 /* ── Stat Card ───────────────────────────────────────────────────────── */
-export function StatCard({ icon: Icon, label, value, unit, color = '#06b6d4', sub }: StatCardProps) {
+export function StatCard({ icon: Icon, label, value, unit, color = '#06b6d4', sub, spark }: StatCardProps) {
   return (
     <div className="stat-card p-4 flex flex-col gap-1.5" style={{ '--accent-color': `${color}40` } as any}>
       <div className="flex items-center justify-between">
@@ -26,6 +27,7 @@ export function StatCard({ icon: Icon, label, value, unit, color = '#06b6d4', su
         {unit && <span className="mono text-[10px] text-zinc-500">{unit}</span>}
       </div>
       {sub && <div className="mono text-[10px] text-zinc-600">{sub}</div>}
+      {spark && <div className="mt-1">{spark}</div>}
     </div>
   );
 }
