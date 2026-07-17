@@ -186,7 +186,10 @@ export function usePolarController({
   const ready = plotWidth > 0 && plotHeight > 0
   const pad = chartType === "radar" ? 20 : 6
   const outerRadius = Math.max(0, Math.min(plotWidth, plotHeight) / 2 - pad)
-  const innerRadius = chartType === "pie" ? outerRadius * innerRadiusRatio : 0
+  const clampedRatio = Number.isFinite(innerRadiusRatio)
+    ? Math.max(0, Math.min(1, innerRadiusRatio))
+    : 0
+  const innerRadius = chartType === "pie" ? outerRadius * clampedRatio : 0
   const centerX = plotWidth / 2
   const centerY = plotHeight / 2
 

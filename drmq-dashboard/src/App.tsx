@@ -98,8 +98,12 @@ export default function App() {
   const handleTogglePause = useCallback(() => {
     setPaused(prev => {
       const next = !prev;
-      if (next) provider.disconnect();
-      else provider.reconnect();
+      // Side effects scheduled outside the updater via queueMicrotask so
+      // they run exactly once even under StrictMode's double-invoke.
+      queueMicrotask(() => {
+        if (next) provider.disconnect();
+        else provider.reconnect();
+      });
       return next;
     });
   }, [provider]);

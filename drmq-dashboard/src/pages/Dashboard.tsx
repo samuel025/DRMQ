@@ -77,6 +77,31 @@ export default function Dashboard({
   onTogglePause: () => void;
 }) {
 
+  /* ── Hooks (must come before any early returns) ───────────────── */
+  const prevCommit = useRef<number>(0);
+  const [latencyHistory, setLatencyHistory] = useState<any[]>([]);
+
+  useEffect(() => {
+    if (telemetryState?.metrics) {
+      prevCommit.current = telemetryState.metrics.commitIndex;
+    }
+  }, [telemetryState?.metrics?.commitIndex]);
+
+  useEffect(() => {
+    if (!paused && telemetryState) {
+      const { metrics, latencies } = telemetryState;
+      setLatencyHistory(prev => {
+        const next = [...prev, {
+          t: new Date().toLocaleTimeString([], { second: '2-digit', minute: '2-digit' }),
+          produce: metrics.produceLatencyMs,
+          consume: metrics.consumeLatencyMs,
+          rpc: latencies.raftRpcMs
+        }].slice(-30);
+        return next;
+      });
+    }
+  }, [telemetryState?.metrics?.produceLatencyMs, telemetryState?.metrics?.consumeLatencyMs, telemetryState?.latencies?.raftRpcMs, paused, telemetryState]);
+
   /* ── Error state ───────────────────────────────────────────────── */
   if (telemetryError) {
     return (
@@ -113,15 +138,19 @@ export default function Dashboard({
   const leaderName = nodes.find((n: any) => n.status === 'LEADER')?.name ?? 'No Leader';
 
   /* ── Throughput chart data ─────────────────────────────────────── */
-  const produceHist = metrics.throughputHistory ?? [];
-  const consumeHist = metrics.consumeHistory ?? [];
-  const errorHist   = metrics.errorHistory ?? [];
+  const totalHist    = metrics.throughputHistory ?? [];
+  const consumeHist  = metrics.consumeHistory ?? [];
+  const errorHist    = metrics.errorHistory ?? [];
 
-  const throughputData = produceHist.map((v: number, i: number) => ({
-    t: `-${produceHist.length - i}s`,
-    produce: parseFloat(((v / 100) * 50).toFixed(2)),
-    consume: parseFloat((((consumeHist[i] ?? 0) / 100) * 50).toFixed(2)),
-  }));
+  const throughputData = totalHist.map((v: number, i: number) => {
+    const consumeVal = consumeHist[i] ?? 0;
+    const produceVal = Math.max(0, v - consumeVal);
+    return {
+      t: `-${totalHist.length - i}s`,
+      produce: parseFloat(((produceVal / 100) * 50).toFixed(2)),
+      consume: parseFloat(((consumeVal / 100) * 50).toFixed(2)),
+    };
+  });
 
   /* ── Radar data for selected/leader node ──────────────────────── */
   const leaderNode = nodes.find((n: any) => n.status === 'LEADER');
@@ -136,26 +165,7 @@ export default function Dashboard({
   ];
 
   /* ── Commit index delta ────────────────────────────────────────── */
-  const prevCommit = useRef<number>(metrics.commitIndex);
   const delta = metrics.commitIndex - prevCommit.current;
-  useEffect(() => { prevCommit.current = metrics.commitIndex; }, [metrics.commitIndex]);
-
-  /* ── Latency History (Local) ───────────────────────────────────── */
-  const [latencyHistory, setLatencyHistory] = useState<any[]>([]);
-  
-  useEffect(() => {
-    if (!paused) {
-      setLatencyHistory(prev => {
-        const next = [...prev, {
-          t: new Date().toLocaleTimeString([], { second: '2-digit', minute: '2-digit' }),
-          produce: metrics.produceLatencyMs,
-          consume: metrics.consumeLatencyMs,
-          rpc: latencies.raftRpcMs
-        }].slice(-30);
-        return next;
-      });
-    }
-  }, [metrics.produceLatencyMs, metrics.consumeLatencyMs, latencies.raftRpcMs, paused]);
 
 
   return (
@@ -210,7 +220,7 @@ export default function Dashboard({
             <StatCard icon={Zap} label="Produce Rate"
               value={formatNum(metrics.produceRate)} unit="msg/s" color="#06b6d4"
               sub={`${metrics.produceThroughputMB.toFixed(2)} MB/s`}
-              spark={<Sparkline data={produceHist.slice(-15)} color="blue" bloom="low" className="h-6 w-full" />} />
+              spark={<Sparkline data={totalHist.slice(-15)} color="blue" bloom="low" className="h-6 w-full" />} />
             <StatCard icon={Activity} label="Consume Rate"
               value={formatNum(metrics.consumeRate)} unit="msg/s" color="#a855f7"
               sub={`${metrics.consumeThroughputMB.toFixed(2)} MB/s`}

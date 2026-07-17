@@ -37,9 +37,14 @@ export function Legend({
           <button
             key={name}
             type="button"
-            disabled={!isClickable}
-            onClick={() =>
-              chart.selectDataKey(chart.selectedDataKey === name ? null : name)
+            disabled={false}
+            onClick={
+              isClickable
+                ? () =>
+                    chart.selectDataKey(
+                      chart.selectedDataKey === name ? null : name
+                    )
+                : undefined
             }
             // Hovering an entry spotlights its series so overlapping layers
             // (e.g. two meshed radar polygons) can be told apart at a glance.
@@ -48,9 +53,8 @@ export function Legend({
             onFocus={() => chart.setFocusDataKey(name)}
             onBlur={() => chart.setFocusDataKey(null)}
             className={cn(
-              "flex items-center gap-1.5 font-mono text-[11px] text-muted-foreground transition-opacity",
-              isClickable &&
-                "pointer-events-auto cursor-pointer hover:text-foreground",
+              "pointer-events-auto flex items-center gap-1.5 font-mono text-[11px] text-muted-foreground transition-opacity",
+              isClickable && "cursor-pointer hover:text-foreground",
               dimmed && "opacity-40"
             )}
           >

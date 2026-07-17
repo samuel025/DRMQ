@@ -1,6 +1,12 @@
 "use client"
 
-import { type ComponentProps, useEffect, useRef } from "react"
+import {
+  type ComponentProps,
+  type Ref,
+  useCallback,
+  useEffect,
+  useRef,
+} from "react"
 import { cn } from "./lib"
 import { rgb } from "./palette"
 import {
@@ -17,13 +23,15 @@ const CELL = 2 // css px per dither cell — same chunk as the charts
 
 export type ButtonVariant = "gradient" | "dotted" | "hatched" | "solid"
 
-export type DitherButtonProps = ComponentProps<"button"> & {
+export type DitherButtonProps = Omit<ComponentProps<"button">, "ref"> & {
   /** Fill colour — a palette name or a hue (0–360). */
   color?: PixelColor
   /** Fill texture — the same four variants the charts use. */
   variant?: ButtonVariant
   /** Glow on the dither fill. */
   bloom?: PixelBloom
+  /** Forward a ref to the underlying button. */
+  ref?: Ref<HTMLButtonElement>
 }
 
 type PaintState = {
@@ -89,11 +97,23 @@ export function DitherButton({
   bloom = "off",
   className,
   children,
+  ref: consumerRef,
   ...props
 }: DitherButtonProps) {
   const buttonRef = useRef<HTMLButtonElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const bloomRef = useRef<HTMLCanvasElement>(null)
+
+  // Compose the internal buttonRef with any consumer-supplied ref so both
+  // receive the rendered button element.
+  const composedRef = useCallback(
+    (el: HTMLButtonElement | null) => {
+      (buttonRef as React.MutableRefObject<HTMLButtonElement | null>).current = el
+      if (typeof consumerRef === "function") consumerRef(el)
+      else if (consumerRef) (consumerRef as React.MutableRefObject<HTMLButtonElement | null>).current = el
+    },
+    [consumerRef]
+  )
 
   useEffect(() => {
     const button = buttonRef.current
@@ -188,7 +208,7 @@ export function DitherButton({
 
   return (
     <button
-      ref={buttonRef}
+      ref={composedRef}
       type="button"
       className={cn(
         "relative isolate overflow-hidden rounded-md px-4 py-2 font-mono text-xs text-foreground transition-opacity focus-visible:ring-1 focus-visible:ring-foreground/40 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-40",

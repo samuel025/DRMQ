@@ -59,8 +59,6 @@ function startCartesianLoop({
 
   const reduce = prefersReducedMotion()
   const EASE = reduce ? 1 : 0.18
-  const animate = state.current.animate && !reduce
-  const duration = state.current.animationDuration
   const current: Record<string, Surface> = {}
 
   // `reveal` (0–1) sweeps the fill in left-to-right on first paint.
@@ -106,7 +104,7 @@ function startCartesianLoop({
   let animStart = 0
   let lastProg = -1
   let lastRevision = state.current.revision
-  let entranceReported = !animate
+  let entranceReported = false
   let intensity = 0
   let needsFill = true
   let lastPaintSig = ""
@@ -116,15 +114,6 @@ function startCartesianLoop({
     raf = requestAnimationFrame(draw)
     const s = state.current
     if (!s.ready) return
-    // Keep the bloom layer in sync with the crisp canvas while it's active.
-    if (bloomCtx) {
-      const on =
-        s.bloom !== "off" && (!s.bloomOnHover || s.isMouseInChart || s.hovered)
-      if (on) {
-        bloomCtx.clearRect(0, 0, cols, rows)
-        bloomCtx.drawImage(canvas, 0, 0)
-      }
-    }
     const tgt = targets.current
     if (s.revision !== lastRevision) {
       lastRevision = s.revision
@@ -133,7 +122,10 @@ function startCartesianLoop({
       entranceReported = false
     }
     if (!animStart) animStart = now
-    const prog = animate ? Math.min(1, (now - animStart) / duration) : 1
+    const animate = s.animate && !reduce
+    const duration = s.animationDuration
+    const safeDuration = duration > 0 ? duration : 1
+    const prog = animate ? Math.min(1, (now - animStart) / safeDuration) : 1
     const progChanged = prog !== lastProg
     // Tell the context the reveal is done so DOM markers fade in in sync.
     if (prog >= 1 && !entranceReported) {
@@ -192,7 +184,7 @@ function startCartesianLoop({
     // Repaint when a tweak-driven paint input changes (variant, stacking) so
     // the panel updates the fill live — without resetting the entrance reveal.
     const paintSig = `${s.stackType}|${s.configKeys
-      .map((k) => s.seriesSpecs[k]?.variant ?? "")
+      .map((k) => `${s.seriesSpecs[k]?.variant ?? ""}:${s.seedOf(k).fill.join(",")}`)
       .join(",")}`
     const sigChanged = paintSig !== lastPaintSig
     if (sigChanged) {
@@ -230,6 +222,15 @@ function startCartesianLoop({
     }
     c.clearRect(0, 0, cols, rows)
     c.drawImage(off, 0, 0)
+    // Keep the bloom layer in sync after a fresh fill.
+    if (bloomCtx) {
+      const on =
+        s.bloom !== "off" && (!s.bloomOnHover || s.isMouseInChart || s.hovered)
+      if (on) {
+        bloomCtx.clearRect(0, 0, cols, rows)
+        bloomCtx.drawImage(canvas, 0, 0)
+      }
+    }
 
     const mx =
       marker != null && s.dataLength > 1

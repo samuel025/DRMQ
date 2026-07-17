@@ -47,7 +47,8 @@ export function Bar({
   if (!ctx.ready || !band) return null
 
   const seed = ctx.seedOf(dataKey)
-  const dimmed = ctx.selectedDataKey !== null && ctx.selectedDataKey !== dataKey
+  const emphasis = ctx.selectedDataKey ?? ctx.focusDataKey
+  const dimmed = emphasis !== null && emphasis !== dataKey
   const si = ctx.configKeys.indexOf(dataKey)
   const n = ctx.configKeys.length
   const onClick = () =>

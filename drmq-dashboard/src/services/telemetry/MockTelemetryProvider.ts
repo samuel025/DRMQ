@@ -65,7 +65,7 @@ export class MockTelemetryProvider implements TelemetryProvider {
           Math.max(5, 50 + Math.sin(i / 4) * 30 + Math.random() * 10)
         ),
         consumeHistory: Array.from({ length: 30 }, (_, i) =>
-          Math.max(3, 30 + Math.sin(i / 4 + 1) * 20 + Math.random() * 8)
+          Math.min(100, Math.max(3, ((0.9 + Math.sin(i / 4 + 1) * 0.4 + Math.random() * 0.2) / 50) * 100))
         ),
         errorHistory: Array.from({ length: 30 }, () => 0),
       },

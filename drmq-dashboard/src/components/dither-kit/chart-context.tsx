@@ -284,7 +284,7 @@ export function useChartController({
   if (entrance.revision !== revision) {
     setEntrance({ revision, done: !animate })
   }
-  const entranceDone = entrance.revision === revision ? entrance.done : !animate
+  const entranceDone = !animate || (entrance.revision === revision ? entrance.done : true)
   // Stable across renders at the same revision; the canvas holds this in a ref.
   const markEntranceDone = useCallback(
     () => setEntrance({ revision, done: true }),
