@@ -16,6 +16,7 @@ export default function Topics() {
 
   const [inspectorTopic, setInspectorTopic] = useState<string | null>(null);
   const [inspectOffset, setInspectOffset] = useState<number | string>(0);
+  const [inspectTimestamp, setInspectTimestamp] = useState<string>('');
   const [inspectLimit, setInspectLimit] = useState<number | string>(10);
   const [messages, setMessages] = useState<any[]>([]);
   const [inspectLoading, setInspectLoading] = useState(false);
@@ -28,11 +29,29 @@ export default function Topics() {
     try {
       const offsetParam = inspectOffset === '' ? 0 : inspectOffset;
       const limitParam = inspectLimit === '' ? 1 : inspectLimit;
-      const res = await fetch(`http://localhost:9392/api/messages?topic=${inspectorTopic}&offset=${offsetParam}&limit=${limitParam}`);
+      
+      let url = `http://localhost:9392/api/messages?topic=${inspectorTopic}&limit=${limitParam}`;
+      if (inspectTimestamp) {
+        const ts = new Date(inspectTimestamp).getTime();
+        if (!isNaN(ts)) {
+          url += `&timestamp=${ts}`;
+        } else {
+          url += `&offset=${offsetParam}`;
+        }
+      } else {
+        url += `&offset=${offsetParam}`;
+      }
+
+      const res = await fetch(url);
       if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
       const data = await res.json();
       if (data.error) throw new Error(data.error);
       setMessages(data);
+
+      // Snap the input offset to the actual returned offset to show compaction jumps
+      if (data && data.length > 0) {
+        setInspectOffset(data[0].offset);
+      }
     } catch (err: any) {
       setInspectError(err.message || 'Failed to fetch messages');
     } finally {
@@ -82,10 +101,13 @@ export default function Topics() {
           </h1>
           <p className="text-sm text-zinc-400 mt-1">Live visibility into DRMQ active topics</p>
         </div>
-        <DitherButton color="blue" bloom="aura" onClick={fetchTopics} className="flex items-center gap-2 px-4 py-2">
+        <button 
+          onClick={fetchTopics} 
+          className="flex items-center gap-2 px-4 py-2 bg-white/5 hover:bg-white/10 text-white border border-white/10 rounded-lg text-sm font-medium transition-colors"
+        >
           <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
           Refresh
-        </DitherButton>
+        </button>
       </header>
 
       <Panel title="Active Topics" className="flex-1 overflow-hidden flex flex-col">
@@ -132,7 +154,7 @@ export default function Topics() {
                   <td className="py-3 px-4 text-right">
                     <button 
                       onClick={() => setInspectorTopic(topic.name)}
-                      className="text-xs font-medium text-cyan-400 hover:text-cyan-300 transition-colors bg-cyan-400/10 hover:bg-cyan-400/20 px-3 py-1.5 rounded-lg border border-cyan-400/20"
+                      className="text-xs font-mono text-zinc-300 hover:text-white transition-colors bg-white/5 hover:bg-white/10 px-3 py-1.5 rounded border border-white/10 uppercase tracking-wider"
                     >
                       Inspect
                     </button>
@@ -170,31 +192,48 @@ export default function Topics() {
               </button>
             </header>
             
-            <div className="px-6 py-4 border-b border-white/10 flex items-center gap-3 bg-black/40">
-              <div className="flex flex-col gap-1.5 flex-1">
-                <label className="mono text-[10px] text-zinc-500 tracking-wider">START OFFSET</label>
-                <input 
-                  type="number" 
-                  value={inspectOffset}
-                  onChange={e => setInspectOffset(e.target.value === '' ? '' : parseInt(e.target.value))}
-                  className="bg-black/40 border border-white/10 rounded px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-cyan-500/50 transition-colors"
-                />
+            <div className="px-6 py-4 border-b border-white/10 bg-black/40 flex flex-col gap-3">
+              <div className="flex items-end gap-3">
+                <div className="flex flex-col gap-1.5 flex-1">
+                  <label className="mono text-[10px] text-zinc-500 tracking-wider">SEEK BY OFFSET</label>
+                  <input 
+                    type="number" 
+                    value={inspectOffset}
+                    disabled={!!inspectTimestamp}
+                    onChange={e => setInspectOffset(e.target.value === '' ? '' : parseInt(e.target.value))}
+                    className="bg-black/40 border border-white/10 rounded px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-cyan-500/50 transition-colors disabled:opacity-30"
+                    placeholder="e.g. 100"
+                  />
+                </div>
+                <div className="flex flex-col gap-1.5 flex-1">
+                  <label className="mono text-[10px] text-zinc-500 tracking-wider">OR SEEK BY TIME</label>
+                  <input 
+                    type="datetime-local" 
+                    value={inspectTimestamp}
+                    onChange={e => setInspectTimestamp(e.target.value)}
+                    className="bg-black/40 border border-white/10 rounded px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-cyan-500/50 transition-colors [&::-webkit-calendar-picker-indicator]:invert"
+                  />
+                </div>
               </div>
-              <div className="flex flex-col gap-1.5 w-24">
-                <label className="mono text-[10px] text-zinc-500 tracking-wider">LIMIT</label>
-                <input 
-                  type="number" 
-                  value={inspectLimit}
-                  onChange={e => setInspectLimit(e.target.value === '' ? '' : parseInt(e.target.value))}
-                  className="bg-black/40 border border-white/10 rounded px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-cyan-500/50 transition-colors"
-                />
-              </div>
-              <div className="flex flex-col gap-1.5">
-                <label className="mono text-[10px] transparent tracking-wider">&nbsp;</label>
-                <DitherButton color="blue" bloom="low" onClick={fetchMessages} className="px-4 py-2 flex items-center gap-2 text-sm">
-                  <RefreshCw className={`w-3.5 h-3.5 ${inspectLoading ? 'animate-spin' : ''}`} />
-                  Fetch
-                </DitherButton>
+              <div className="flex items-end gap-3">
+                <div className="flex flex-col gap-1.5 flex-1">
+                  <label className="mono text-[10px] text-zinc-500 tracking-wider">LIMIT</label>
+                  <input 
+                    type="number" 
+                    value={inspectLimit}
+                    onChange={e => setInspectLimit(e.target.value === '' ? '' : parseInt(e.target.value))}
+                    className="bg-black/40 border border-white/10 rounded px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-cyan-500/50 transition-colors"
+                  />
+                </div>
+                <div className="flex flex-col gap-1.5 flex-1">
+                  <button 
+                    onClick={fetchMessages} 
+                    className="px-4 py-2 flex items-center justify-center gap-2 text-sm w-full bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 transition-colors rounded"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${inspectLoading ? 'animate-spin' : ''}`} />
+                    Fetch Messages
+                  </button>
+                </div>
               </div>
             </div>
 

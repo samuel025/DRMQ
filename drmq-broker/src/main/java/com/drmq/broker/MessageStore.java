@@ -706,9 +706,16 @@ public class MessageStore implements Closeable {
         public List<StoredMessage> getMessagesFrom(long fromOffset, int maxCount) {
             lock.readLock().lock();
             try {
+                if (!cache.containsKey(fromOffset)) {
+                    return Collections.emptyList();
+                }
                 List<StoredMessage> result = new ArrayList<>();
+                boolean found = false;
                 for (Map.Entry<Long, StoredMessage> entry : cache.entrySet()) {
-                    if (entry.getKey() >= fromOffset) {
+                    if (entry.getKey() == fromOffset) {
+                        found = true;
+                    }
+                    if (found) {
                         result.add(entry.getValue());
                         if (result.size() >= maxCount) {
                             break;

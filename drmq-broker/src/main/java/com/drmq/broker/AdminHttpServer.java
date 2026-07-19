@@ -139,6 +139,7 @@ public class AdminHttpServer {
             String topic = null;
             long offset = 0;
             int limit = 10;
+            Long timestamp = null;
 
             for (String param : query.split("&")) {
                 String[] pair = param.split("=");
@@ -146,6 +147,7 @@ public class AdminHttpServer {
                     if ("topic".equals(pair[0])) topic = pair[1];
                     else if ("offset".equals(pair[0])) offset = Long.parseLong(pair[1]);
                     else if ("limit".equals(pair[0])) limit = Integer.parseInt(pair[1]);
+                    else if ("timestamp".equals(pair[0])) timestamp = Long.parseLong(pair[1]);
                 }
             }
 
@@ -156,6 +158,14 @@ public class AdminHttpServer {
 
             // Limit bounds to avoid OOM
             limit = Math.min(100, Math.max(1, limit));
+
+            if (timestamp != null && timestamp > 0) {
+                offset = messageStore.findOffsetByTimestamp(topic, timestamp);
+                if (offset == -1) {
+                    sendJsonResponse(exchange, 200, "[]");
+                    return;
+                }
+            }
 
             List<com.drmq.protocol.DRMQProtocol.StoredMessage> messages = messageStore.getMessages(topic, offset, limit);
             JsonArray msgsArray = new JsonArray();
