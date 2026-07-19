@@ -78,6 +78,7 @@ export default function Dashboard({
 }) {
 
   /* ── Hooks (must come before any early returns) ───────────────── */
+  const [historyWindowSeconds, setHistoryWindowSeconds] = useState(30);
   const prevCommit = useRef<number>(0);
   const [latencyHistory, setLatencyHistory] = useState<any[]>([]);
 
@@ -138,10 +139,15 @@ export default function Dashboard({
   const leaderName = nodes.find((n: any) => n.status === 'LEADER')?.name ?? 'No Leader';
 
   /* ── Throughput chart data ─────────────────────────────────────── */
-  const totalHist    = metrics.throughputHistory ?? [];
-  const produceHist  = metrics.produceHistory ?? [];
-  const consumeHist  = metrics.consumeHistory ?? [];
-  const errorHist    = metrics.errorHistory ?? [];
+  const totalHistFull    = metrics.throughputHistory ?? [];
+  const produceHistFull  = metrics.produceHistory ?? [];
+  const consumeHistFull  = metrics.consumeHistory ?? [];
+  const errorHistFull    = metrics.errorHistory ?? [];
+
+  const totalHist   = totalHistFull.slice(-historyWindowSeconds);
+  const produceHist = produceHistFull.slice(-historyWindowSeconds);
+  const consumeHist = consumeHistFull.slice(-historyWindowSeconds);
+  const errorHist   = errorHistFull.slice(-historyWindowSeconds);
 
   const throughputData = totalHist.map((v: number, i: number) => {
     const consumeVal = consumeHist[i] ?? 0;
@@ -321,6 +327,22 @@ export default function Dashboard({
                 <Line key="produce" dataKey="produce" />
                 <Line key="consume" dataKey="consume" strokeVariant="dashed" />
               </LineChart>
+            </div>
+            <div className="mt-4 pt-4 border-t border-white/5 flex items-center justify-between gap-4">
+              <span className="mono text-[10px] text-zinc-500 w-16">30s</span>
+              <input 
+                type="range" 
+                min="30" 
+                max="300" 
+                step="30"
+                value={historyWindowSeconds} 
+                onChange={(e) => setHistoryWindowSeconds(Number(e.target.value))}
+                className="flex-1 h-1.5 bg-white/10 rounded-full appearance-none [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-cyan-400 [&::-webkit-slider-thumb]:rounded-full cursor-pointer"
+              />
+              <span className="mono text-[10px] text-zinc-500 w-16 text-right">5min</span>
+            </div>
+            <div className="text-center mt-1">
+              <span className="mono text-[9px] text-zinc-600 tracking-wider">VIEWING LAST {historyWindowSeconds >= 60 ? `${historyWindowSeconds / 60} MIN` : `${historyWindowSeconds} SEC`}</span>
             </div>
           </Panel>
 

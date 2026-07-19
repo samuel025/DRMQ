@@ -34,6 +34,7 @@ public class AdminHttpServer {
         
         this.server.createContext("/api/topics", this::handleTopics);
         this.server.createContext("/api/consumers", this::handleConsumers);
+        this.server.createContext("/api/messages", this::handleMessages);
         
         // CORS and standard executor
         this.server.setExecutor(null); 
@@ -119,6 +120,63 @@ public class AdminHttpServer {
         }
 
         sendJsonResponse(exchange, 200, gson.toJson(groupsArray));
+    }
+
+    private void handleMessages(HttpExchange exchange) throws IOException {
+        addCorsHeaders(exchange);
+        if ("OPTIONS".equals(exchange.getRequestMethod())) {
+            exchange.sendResponseHeaders(204, -1);
+            return;
+        }
+
+        try {
+            String query = exchange.getRequestURI().getQuery();
+            if (query == null) {
+                sendJsonResponse(exchange, 400, "{\"error\":\"Missing query parameters\"}");
+                return;
+            }
+
+            String topic = null;
+            long offset = 0;
+            int limit = 10;
+
+            for (String param : query.split("&")) {
+                String[] pair = param.split("=");
+                if (pair.length == 2) {
+                    if ("topic".equals(pair[0])) topic = pair[1];
+                    else if ("offset".equals(pair[0])) offset = Long.parseLong(pair[1]);
+                    else if ("limit".equals(pair[0])) limit = Integer.parseInt(pair[1]);
+                }
+            }
+
+            if (topic == null) {
+                sendJsonResponse(exchange, 400, "{\"error\":\"Missing 'topic' parameter\"}");
+                return;
+            }
+
+            // Limit bounds to avoid OOM
+            limit = Math.min(100, Math.max(1, limit));
+
+            List<com.drmq.protocol.DRMQProtocol.StoredMessage> messages = messageStore.getMessages(topic, offset, limit);
+            JsonArray msgsArray = new JsonArray();
+
+            for (com.drmq.protocol.DRMQProtocol.StoredMessage msg : messages) {
+                JsonObject obj = new JsonObject();
+                obj.addProperty("offset", msg.getOffset());
+                obj.addProperty("timestamp", msg.getTimestamp());
+                obj.addProperty("storedAt", msg.getStoredAt());
+                if (msg.hasKey()) {
+                    obj.addProperty("key", msg.getKey());
+                }
+                obj.addProperty("payload", msg.getPayload().toStringUtf8());
+                msgsArray.add(obj);
+            }
+
+            sendJsonResponse(exchange, 200, gson.toJson(msgsArray));
+        } catch (Exception e) {
+            logger.error("Error handling messages request", e);
+            sendJsonResponse(exchange, 500, "{\"error\":\"" + e.getMessage() + "\"}");
+        }
     }
 
     private void addCorsHeaders(HttpExchange exchange) {

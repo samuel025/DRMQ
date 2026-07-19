@@ -54,7 +54,7 @@ public class TelemetryWebSocketServer extends WebSocketServer {
         this.broadcastTimer = new Timer("TelemetryBroadcastTimer", true);
         this.gson = new Gson();
         
-        for (int i = 0; i < 30; i++) {
+        for (int i = 0; i < 300; i++) {
             throughputHistory.add(0.0);
             produceHistory.add(0.0);
             consumeHistory.add(0.0);
