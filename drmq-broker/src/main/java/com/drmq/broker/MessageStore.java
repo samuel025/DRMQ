@@ -48,6 +48,9 @@ public class MessageStore implements Closeable {
     
     // Topic -> Total number of messages
     private final ConcurrentHashMap<String, AtomicLong> topicMessageCounts = new ConcurrentHashMap<>();
+
+    // Topic -> Highest offset appended
+    private final ConcurrentHashMap<String, AtomicLong> topicHeadOffsets = new ConcurrentHashMap<>();
     
     // In-memory cache for recent messages (Topic -> BoundedMessageCache)
     private final ConcurrentHashMap<String, BoundedMessageCache> messageCache = new ConcurrentHashMap<>();
@@ -124,6 +127,11 @@ public class MessageStore implements Closeable {
                         addToCache(topic, message);
                         topicMessageCounts.computeIfAbsent(topic, k -> new AtomicLong()).incrementAndGet();
                         
+                        AtomicLong head = topicHeadOffsets.computeIfAbsent(topic, k -> new AtomicLong(-1));
+                        if (offset > head.get()) {
+                            head.set(offset);
+                        }
+                        
                         if (offset > maxOffset) {
                             maxOffset = offset;
                         }
@@ -156,6 +164,7 @@ public class MessageStore implements Closeable {
             logger.info("Reloading MessageStore state from disk...");
             topicIndex.clear();
             topicMessageCounts.clear();
+            topicHeadOffsets.clear();
             messageCache.clear();
             topicWriteLocks.clear();
             
@@ -222,6 +231,11 @@ public class MessageStore implements Closeable {
 
             addToCache(topic, message);
             topicMessageCounts.computeIfAbsent(topic, k -> new AtomicLong()).incrementAndGet();
+            
+            AtomicLong head = topicHeadOffsets.computeIfAbsent(topic, k -> new AtomicLong(-1));
+            if (offset > head.get()) {
+                head.set(offset);
+            }
 
             logger.debug("Persisted and indexed message: topic={}, offset={}, position={}, segment={}", 
                     topic, offset, position, segment.getFilePath().getFileName());
@@ -292,11 +306,15 @@ public class MessageStore implements Closeable {
             }
 
             AtomicLong counter = topicMessageCounts.computeIfAbsent(topic, k -> new AtomicLong());
+            AtomicLong head = topicHeadOffsets.computeIfAbsent(topic, k -> new AtomicLong(-1));
             for (int i = 0; i < messages.size(); i++) {
                 StoredMessage msg = messages.get(i);
                 indexMessage(topic, msg.getOffset(), positions.get(i));
                 addToCache(topic, msg);
                 counter.incrementAndGet();
+                if (msg.getOffset() > head.get()) {
+                    head.set(msg.getOffset());
+                }
             }
 
             logger.debug("Batch persisted: topic={}, baseOffset={}, count={}", topic, baseOffset, batchSize);
@@ -523,6 +541,11 @@ public class MessageStore implements Closeable {
         return count == null ? 0 : count.intValue();
     }
 
+    public long getHeadOffset(String topic) {
+        AtomicLong head = topicHeadOffsets.get(topic);
+        return head == null ? -1 : head.get();
+    }
+
     public List<String> getTopics() {
         return new ArrayList<>(topicMessageCounts.keySet());
     }
@@ -542,6 +565,7 @@ public class MessageStore implements Closeable {
     public void clear() {
         topicIndex.clear();
         topicMessageCounts.clear();
+        topicHeadOffsets.clear();
         messageCache.clear();
         globalOffset.set(0);
         logger.info("Message store memory state cleared");

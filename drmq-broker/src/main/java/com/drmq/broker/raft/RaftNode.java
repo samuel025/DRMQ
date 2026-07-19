@@ -45,16 +45,16 @@ public class RaftNode {
     private static final int MAX_PENDING_PROPOSALS = 10000;  // Safety limit
 
     //  Persistent state (survives restart) 
-    private long currentTerm;
-    private String votedFor;    
+    private volatile long currentTerm;
+    private volatile String votedFor;    
     private final RaftLog raftLog;
 
     //  Volatile state 
-    private RaftState state;
-    private long commitIndex; 
-    private long lastApplied;   
-    private long lastAppliedTerm;
-    private String leaderId;  
+    private volatile RaftState state;
+    private volatile long commitIndex; 
+    private volatile long lastApplied;   
+    private volatile long lastAppliedTerm;
+    private volatile String leaderId;  
 
     // Leader-only volatile state 
     private final Map<String, Long> nextIndex;   

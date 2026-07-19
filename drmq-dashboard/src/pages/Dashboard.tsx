@@ -92,7 +92,7 @@ export default function Dashboard({
       const { metrics, latencies } = telemetryState;
       setLatencyHistory(prev => {
         const next = [...prev, {
-          t: new Date().toLocaleTimeString([], { second: '2-digit', minute: '2-digit' }),
+          t: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
           produce: metrics.produceLatencyMs,
           consume: metrics.consumeLatencyMs,
           rpc: latencies.raftRpcMs
@@ -139,18 +139,24 @@ export default function Dashboard({
 
   /* ── Throughput chart data ─────────────────────────────────────── */
   const totalHist    = metrics.throughputHistory ?? [];
+  const produceHist  = metrics.produceHistory ?? [];
   const consumeHist  = metrics.consumeHistory ?? [];
   const errorHist    = metrics.errorHistory ?? [];
 
   const throughputData = totalHist.map((v: number, i: number) => {
     const consumeVal = consumeHist[i] ?? 0;
-    const produceVal = Math.max(0, v - consumeVal);
+    let produceVal = produceHist[i];
+    if (produceVal === undefined) {
+      produceVal = Math.max(0, v - consumeVal);
+    }
     return {
       t: `-${totalHist.length - i}s`,
-      produce: parseFloat(((produceVal / 100) * 50).toFixed(2)),
-      consume: parseFloat(((consumeVal / 100) * 50).toFixed(2)),
+      produce: parseFloat(produceVal.toFixed(2)),
+      consume: parseFloat(consumeVal.toFixed(2)),
     };
   });
+  
+  const formatMBps = (val: number) => val > 0 && val < 0.005 ? '< 0.01' : val.toFixed(2);
 
   /* ── Radar data for selected/leader node ──────────────────────── */
   const leaderNode = nodes.find((n: any) => n.status === 'LEADER');
@@ -219,11 +225,11 @@ export default function Dashboard({
           <div className="shrink-0 grid grid-cols-5 gap-2.5">
             <StatCard icon={Zap} label="Produce Rate"
               value={formatNum(metrics.produceRate)} unit="msg/s" color="#06b6d4"
-              sub={`${metrics.produceThroughputMB.toFixed(2)} MB/s`}
+              sub={`${formatMBps(metrics.produceThroughputMB)} MB/s`}
               spark={<Sparkline data={totalHist.slice(-15)} color="blue" bloom="low" className="h-6 w-full" />} />
             <StatCard icon={Activity} label="Consume Rate"
               value={formatNum(metrics.consumeRate)} unit="msg/s" color="#a855f7"
-              sub={`${metrics.consumeThroughputMB.toFixed(2)} MB/s`}
+              sub={`${formatMBps(metrics.consumeThroughputMB)} MB/s`}
               spark={<Sparkline data={consumeHist.slice(-15)} color="purple" bloom="low" className="h-6 w-full" />} />
             <StatCard icon={Users} label="Connections"
               value={metrics.totalConnections} color="#f59e0b"
@@ -295,10 +301,10 @@ export default function Dashboard({
             </div>
           } className="shrink-0">
             <div className="text-2xl font-semibold text-white tracking-tight mb-0.5">
-              {metrics.totalThroughputMB.toFixed(2)} <span className="mono text-xs text-zinc-500">MB/s</span>
+              {formatMBps(metrics.totalThroughputMB)} <span className="mono text-xs text-zinc-500">MB/s</span>
             </div>
             <div className="mono text-[10px] text-zinc-600 mb-3">
-              ↑ {metrics.produceThroughputMB.toFixed(2)} · ↓ {metrics.consumeThroughputMB.toFixed(2)}
+              ↑ {formatMBps(metrics.produceThroughputMB)} · ↓ {formatMBps(metrics.consumeThroughputMB)}
             </div>
             <div className="h-[80px] w-full">
               <LineChart
@@ -345,7 +351,7 @@ export default function Dashboard({
                 margins={{ top: 24, right: 8, bottom: 20, left: 28 }}
                 animationDuration={400}
               >
-                <XAxis key="x" dataKey="t" />
+                <XAxis key="x" dataKey="t" maxTicks={4} />
                 <YAxis key="y" />
                 <Legend key="legend" isClickable />
                 <Tooltip key="tooltip" labelKey="t" />
