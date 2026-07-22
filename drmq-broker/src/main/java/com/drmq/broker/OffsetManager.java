@@ -74,6 +74,14 @@ public class OffsetManager implements Closeable {
         return offsets.size();
     }
 
+    /**
+     * Get a snapshot of all committed offsets across all groups and topics.
+     * @return map of "group/topic" to offset
+     */
+    public Map<String, Long> getAllOffsets() {
+        return new java.util.HashMap<>(offsets);
+    }
+
     /** Load all offsets from disk on startup. */
     private void load() throws IOException {
         if (!Files.exists(offsetsFile)) {
