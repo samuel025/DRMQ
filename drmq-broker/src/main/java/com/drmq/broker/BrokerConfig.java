@@ -141,7 +141,7 @@ public class BrokerConfig {
         String metricsPath = "/metrics";
         long logSegmentBytes = 100 * 1024 * 1024L; // 100MB
         long logRetentionMs = 7L * 24 * 60 * 60 * 1000; // 7 days
-        long raftCompactThreshold = 50000L; // Keep 50,000 entries to buffer followers during short outages
+        long raftCompactThreshold = 1000L; 
         int maxDeliveries = 5;
         String dlqTopicPrefix = "dlq.";
         boolean logSegmentFsync = true;
@@ -188,12 +188,12 @@ public class BrokerConfig {
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
-                case "--config" -> i++; // skip the value, already handled
+                case "--config" -> i++; 
                 case "--id", "--node-id" -> nodeId = args[++i];
                 case "--port" -> port = Integer.parseInt(args[++i]);
                 case "--data-dir" -> dataDir = args[++i];
                 case "--peers" -> {
-                    peers.clear(); // Override config file peers
+                    peers.clear(); 
                     String[] peerStrs = args[++i].split(",");
                     for (String peerStr : peerStrs) {
                         peers.add(PeerAddress.parse(peerStr));

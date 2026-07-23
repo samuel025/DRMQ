@@ -93,16 +93,24 @@ public class TelemetryWebSocketServer extends WebSocketServer {
         broadcastTimer.scheduleAtFixedRate(new TimerTask() {
             @Override
             public void run() {
-                updateRates();
-                if (!connections.isEmpty()) {
-                    String payload = buildTelemetryPayload();
-                    for (WebSocket conn : connections) {
-                        try {
-                            conn.send(payload);
-                        } catch (Exception e) {
-                            logger.debug("Failed to send telemetry to client", e);
+                try {
+                    updateRates();
+                    if (!connections.isEmpty()) {
+                        String payload = buildTelemetryPayload();
+                        for (WebSocket conn : connections) {
+                            try {
+                                conn.send(payload);
+                            } catch (Exception e) {
+                                logger.debug("Failed to send telemetry to client", e);
+                            }
                         }
                     }
+                } catch (Exception e) {
+                    // CRITICAL: TimerTask kills the schedule permanently on any
+                    // uncaught exception. During leader failovers, concurrent Raft
+                    // state mutations can cause CME/NPE in buildTelemetryPayload().
+                    // Swallow and retry on the next tick instead of dying forever.
+                    logger.warn("Telemetry broadcast tick failed (will retry): {}", e.getMessage());
                 }
             }
         }, 1000, 1000);
