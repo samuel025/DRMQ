@@ -43,11 +43,29 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
     for (const url of this.urls) {
       this.openSocket(url);
     }
-    setTimeout(() => {
-      if (!this.stopped && this.onErrorCallback && Array.from(this.sockets.values()).every(s => !s || s.readyState !== WebSocket.OPEN)) {
+
+    // Retry-aware connection check: don't show timeout error if sockets are
+    // still actively handshaking (CONNECTING). Only give up after 15s total.
+    const startTime = Date.now();
+    const checkConnection = () => {
+      if (this.stopped) return;
+      const sockets = Array.from(this.sockets.values());
+      const anyOpen = sockets.some(s => s && s.readyState === WebSocket.OPEN);
+      if (anyOpen) return; // At least one connected — all good
+
+      const anyConnecting = sockets.some(s => s && s.readyState === WebSocket.CONNECTING);
+      if (anyConnecting && Date.now() - startTime < 15000) {
+        // Still handshaking — check again in 2s instead of giving up
+        setTimeout(checkConnection, 2000);
+        return;
+      }
+
+      // All sockets are closed/null or we've waited 15s — show error
+      if (this.onErrorCallback) {
         this.onErrorCallback('Connection timeout. Check if brokers are running.');
       }
-    }, 5000);
+    };
+    setTimeout(checkConnection, 5000);
   }
 
   disconnect(): void {
@@ -62,6 +80,14 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
 
   private openSocket(url: string): void {
     if (this.stopped) return;
+
+    // Cancel any pending reconnect for this URL to prevent duplicate timers
+    const existingTimer = this.reconnectTimers.get(url);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+      this.reconnectTimers.delete(url);
+    }
+
     console.log(`[DRMQ] Connecting to ${url}…`);
     try {
       const ws = new WebSocket(url);
@@ -84,12 +110,25 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
 
       ws.onclose = () => {
         console.log(`[DRMQ] Disconnected: ${url}`);
-        this.sockets.set(url, null);
-        this.latestFrames.delete(url);
-        if (!this.stopped && this.onErrorCallback && Array.from(this.sockets.values()).every(s => !s || s.readyState !== WebSocket.OPEN)) {
-          this.onErrorCallback('Cluster offline. Retrying connection...');
+
+        // Guard: only clear if THIS socket is still the current one for this URL.
+        // A reconnect may have already replaced us with a newer WebSocket instance.
+        if (this.sockets.get(url) === ws) {
+          this.sockets.set(url, null);
+          this.latestFrames.delete(url);
+
+          // Immediately re-merge with surviving nodes so the dashboard doesn't
+          // freeze on the dead leader's last telemetry snapshot.
+          if (this.onDataCallback && this.latestFrames.size > 0) {
+            this.onDataCallback(this.merge());
+          }
+
+          if (!this.stopped && this.onErrorCallback && Array.from(this.sockets.values()).every(s => !s || s.readyState !== WebSocket.OPEN)) {
+            this.onErrorCallback('Cluster offline. Retrying connection...');
+          }
+          this.scheduleReconnect(url);
         }
-        this.scheduleReconnect(url);
+        // else: a newer socket already took over — do nothing
       };
     } catch (e) {
       console.error(`[DRMQ] Cannot create WebSocket for ${url}`, e);

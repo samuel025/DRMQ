@@ -271,6 +271,87 @@ class DRMQProducer(DRMQClient):
         for pm in batch:
             pm.future.set_exception(Exception("Failed to send batch: timeout exhausted"))
 
+    def send_atomic(self, topic_messages: dict) -> concurrent.futures.Future:
+        """
+        Atomically sends messages to multiple topics in a single Raft entry.
+        topic_messages: a dict mapping topic name to payload bytes.
+        """
+        future = concurrent.futures.Future()
+        if len(topic_messages) < 2:
+            future.set_exception(ValueError("send_atomic() requires at least 2 topics"))
+            return future
+
+        def _do_send():
+            try:
+                req = pb.AtomicProduceRequest()
+                for topic, payload in topic_messages.items():
+                    slice = req.slices.add()
+                    slice.topic = topic
+                    entry = slice.entries.add()
+                    entry.payload = payload
+                    entry.client_timestamp = int(time.time() * 1000)
+                
+                envelope_bytes = req.SerializeToString()
+            except Exception as e:
+                future.set_exception(e)
+                return
+
+            delivery_timeout_ms = 120000
+            start_ms = int(time.time() * 1000)
+            current_backoff_ms = 100
+
+            while True:
+                if not self.running:
+                    future.set_exception(Exception("Producer closed during retry"))
+                    return
+
+                if int(time.time() * 1000) - start_ms > delivery_timeout_ms:
+                    break
+
+                try:
+                    self._ensure_connected()
+                    resp_payload = self._send_envelope(pb.MessageType.ATOMIC_PRODUCE_REQUEST, envelope_bytes)
+                    
+                    resp = pb.AtomicProduceResponse()
+                    resp.ParseFromString(resp_payload)
+
+                    if resp.success:
+                        future.set_result(dict(resp.base_offsets))
+                        return
+                    else:
+                        error_code = resp.error_code
+                        error_msg = resp.error_message
+                        if error_code == pb.ErrorCode.NOT_LEADER or (error_msg and error_msg.startswith("NOT_LEADER")):
+                            leader_addr = error_msg[len("NOT_LEADER:"):] if error_msg and error_msg.startswith("NOT_LEADER:") else "UNKNOWN"
+                            if leader_addr != "UNKNOWN":
+                                parts = leader_addr.split(":")
+                                if len(parts) == 2:
+                                    self.host = parts[0]
+                                    self.port = int(parts[1])
+                                    super(DRMQProducer, self).close()
+                                    self._ensure_connected()
+                                    continue
+                            super(DRMQProducer, self).close()
+                            self._rotate_server()
+                        elif error_msg and ("timed out" in error_msg or "Lost leadership" in error_msg or "Raft batch proposal" in error_msg):
+                            super(DRMQProducer, self).close()
+                            self._rotate_server()
+                        else:
+                            future.set_exception(Exception(f"Failed to send atomic batch: {error_msg}"))
+                            return
+                except Exception as e:
+                    logger.warning("Network error during atomic send: %s", e)
+                    super(DRMQProducer, self).close()
+                    self._rotate_server()
+                    
+                time.sleep(current_backoff_ms / 1000.0)
+                current_backoff_ms = min(2000, current_backoff_ms * 2)
+
+            future.set_exception(Exception("Failed to send atomic batch: timeout exhausted"))
+
+        threading.Thread(target=_do_send, daemon=True, name="drmq-producer-atomic-sender").start()
+        return future
+
     def close(self):
         self.running = False
         if self.send_thread and self.send_thread.is_alive():
@@ -483,11 +564,20 @@ if __name__ == "__main__":
     producer = DRMQProducer(servers)
     try:
         producer.connect()
-        res = producer.send("python-topic", b"Hello from Python!")
+        res = producer.send("python-topic", b"Hello from Python!").result()
         if res.success:
             print(f"Message sent successfully at offset {res.offset}")
         else:
             print(f"Failed to send: {res.error_message}")
+            
+        print("\n--- Testing Atomic Producer ---")
+        batch = {
+            "python-topic-1": b"Atomic message 1",
+            "python-topic-2": b"Atomic message 2"
+        }
+        atomic_res = producer.send_atomic(batch).result(timeout=10)
+        print(f"Atomic commit successful! Base offsets: {atomic_res}")
+        
     except Exception as e:
         print(f"Producer error: {e}")
     finally:

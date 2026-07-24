@@ -9,6 +9,7 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadLocalRandom;
@@ -21,7 +22,7 @@ public class DRMQProducer implements AutoCloseable {
     private static final Logger logger = LoggerFactory.getLogger(DRMQProducer.class);
     private static final int MAX_RETRIES = 5;
     private static final long RECONNECT_DELAY_MS = 500;
-    private static final int BATCH_SIZE_BYTES = 16384; // 16KB
+    private static final int BATCH_SIZE_BYTES = 1048576; // 1MB
     private static final long LINGER_MS = 5;
 
     private String host;
@@ -36,7 +37,7 @@ public class DRMQProducer implements AutoCloseable {
     private volatile boolean connected = false;
     private volatile boolean running = true;
 
-    private static final int MAX_ACCUMULATOR_MESSAGES = 100000;
+    private static final int MAX_ACCUMULATOR_MESSAGES = 10000;
     private final LinkedBlockingQueue<PendingMessage> accumulator = new LinkedBlockingQueue<>(MAX_ACCUMULATOR_MESSAGES);
     private final Thread senderThread;
 
@@ -230,7 +231,7 @@ public class DRMQProducer implements AutoCloseable {
         long currentBackoffMs = 100;
 
         while (true) {
-            if (!running || Thread.currentThread().isInterrupted()) {
+            if (Thread.currentThread().isInterrupted()) {
                 lastException = new IOException("Producer stopped or interrupted during retry");
                 break;
             }
@@ -317,6 +318,132 @@ public class DRMQProducer implements AutoCloseable {
             pm.future.completeExceptionally(new IOException("Failed to send batch: " + 
                 (lastException != null ? lastException.getMessage() : "unknown error")));
         }
+    }
+
+    /**
+     * Atomically sends messages to multiple topics in a single Raft entry.
+     * Either all writes are committed, or none.
+     *
+     * @param topicMessages map of topic -> payload
+     * @return CompletableFuture<Map<String, Long>> of topic -> base offset
+     */
+    public CompletableFuture<java.util.Map<String, Long>> sendAtomic(java.util.Map<String, byte[]> topicMessages) {
+        CompletableFuture<java.util.Map<String, Long>> future = new CompletableFuture<>();
+
+        if (topicMessages.size() < 2) {
+            future.completeExceptionally(new IllegalArgumentException("sendAtomic() requires at least 2 topics"));
+            return future;
+        }
+
+        com.drmq.protocol.DRMQProtocol.AtomicProduceRequest.Builder reqBuilder = com.drmq.protocol.DRMQProtocol.AtomicProduceRequest.newBuilder();
+        for (java.util.Map.Entry<String, byte[]> e : topicMessages.entrySet()) {
+            reqBuilder.addSlices(com.drmq.protocol.DRMQProtocol.AtomicBatchTopicSlice.newBuilder()
+                .setTopic(e.getKey())
+                .addEntries(com.drmq.protocol.DRMQProtocol.ProduceBatchRequest.BatchEntry.newBuilder()
+                    .setPayload(com.google.protobuf.ByteString.copyFrom(e.getValue()))
+                    .setClientTimestamp(System.currentTimeMillis())
+                    .build())
+                .build());
+        }
+
+        AtomicProduceRequest request = reqBuilder.build();
+        CompletableFuture.runAsync(() -> sendAtomicWithRetry(request, future));
+        return future;
+    }
+
+    private void sendAtomicWithRetry(AtomicProduceRequest request, CompletableFuture<Map<String, Long>> future) {
+        MessageEnvelope envelope = MessageEnvelope.newBuilder()
+                .setType(MessageType.ATOMIC_PRODUCE_REQUEST)
+                .setPayload(request.toByteString())
+                .build();
+
+        IOException lastException = null;
+        long deliveryTimeoutMs = 120_000;
+        long startMs = System.currentTimeMillis();
+        long currentBackoffMs = 100;
+
+        while (true) {
+            if (Thread.currentThread().isInterrupted()) {
+                lastException = new IOException("Producer stopped or interrupted during retry");
+                break;
+            }
+            if (System.currentTimeMillis() - startMs > deliveryTimeoutMs) {
+                break;
+            }
+
+            try {
+                ensureConnectedWithRetry();
+                
+                synchronized (sendLock) {
+                    byte[] envelopeBytes = envelope.toByteArray();
+                    out.writeInt(envelopeBytes.length);
+                    out.write(envelopeBytes);
+                    out.flush();
+
+                    int responseLength = in.readInt();
+                    byte[] responseBytes = new byte[responseLength];
+                    in.readFully(responseBytes);
+
+                    MessageEnvelope responseEnvelope = MessageEnvelope.parseFrom(responseBytes);
+                    com.drmq.protocol.DRMQProtocol.AtomicProduceResponse response = com.drmq.protocol.DRMQProtocol.AtomicProduceResponse.parseFrom(responseEnvelope.getPayload());
+
+                    if (response.getSuccess()) {
+                        future.complete(response.getBaseOffsetsMap());
+                        return; // Success
+                    } else {
+                        com.drmq.protocol.DRMQProtocol.ErrorCode errorCode = response.getErrorCode();
+                        String errorMsg = response.getErrorMessage();
+                        if (errorCode == com.drmq.protocol.DRMQProtocol.ErrorCode.NOT_LEADER || 
+                                (errorMsg != null && errorMsg.startsWith("NOT_LEADER"))) {
+                            String leaderAddr = errorMsg != null && errorMsg.startsWith("NOT_LEADER:") 
+                                                ? errorMsg.substring("NOT_LEADER:".length()) 
+                                                : "UNKNOWN";
+                            if (!leaderAddr.equals("UNKNOWN")) {
+                                try {
+                                    redirectToLeader(leaderAddr);
+                                    continue; // Try again immediately on new leader
+                                } catch (IOException e) {
+                                    lastException = e;
+                                    closeConnection();
+                                    rotateToNextServer();
+                                }
+                            } else {
+                                lastException = new IOException("Leader unknown");
+                                closeConnection();
+                                rotateToNextServer();
+                            }
+                        } else if (errorMsg != null && (
+                                errorMsg.contains("timed out") || 
+                                errorMsg.contains("Lost leadership") ||
+                                errorMsg.contains("Raft batch proposal")
+                        )) {
+                            lastException = new IOException("Broker cluster error: " + errorMsg);
+                            closeConnection();
+                            rotateToNextServer();
+                        } else {
+                            future.completeExceptionally(new IOException("Failed to send atomic batch: " + errorMsg));
+                            return;
+                        }
+                    }
+                }
+            } catch (IOException e) {
+                lastException = e;
+                closeConnection();
+                rotateToNextServer();
+            }
+
+            // Exponential backoff before retrying
+            try { 
+                Thread.sleep(currentBackoffMs); 
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            currentBackoffMs = Math.min(2000, currentBackoffMs * 2);
+        }
+
+        // Complete exceptionally if we exhausted retries
+        future.completeExceptionally(new IOException("Failed to send atomic batch: " + 
+            (lastException != null ? lastException.getMessage() : "unknown error")));
     }
 
     private void rotateToNextServer() {

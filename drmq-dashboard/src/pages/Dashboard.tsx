@@ -78,6 +78,7 @@ export default function Dashboard({
 }) {
 
   /* ── Hooks (must come before any early returns) ───────────────── */
+  const [historyWindowSeconds, setHistoryWindowSeconds] = useState(30);
   const prevCommit = useRef<number>(0);
   const [latencyHistory, setLatencyHistory] = useState<any[]>([]);
 
@@ -92,7 +93,7 @@ export default function Dashboard({
       const { metrics, latencies } = telemetryState;
       setLatencyHistory(prev => {
         const next = [...prev, {
-          t: new Date().toLocaleTimeString([], { second: '2-digit', minute: '2-digit' }),
+          t: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
           produce: metrics.produceLatencyMs,
           consume: metrics.consumeLatencyMs,
           rpc: latencies.raftRpcMs
@@ -102,8 +103,8 @@ export default function Dashboard({
     }
   }, [telemetryState?.metrics?.produceLatencyMs, telemetryState?.metrics?.consumeLatencyMs, telemetryState?.latencies?.raftRpcMs, paused, telemetryState]);
 
-  /* ── Error state ───────────────────────────────────────────────── */
-  if (telemetryError) {
+  /* ── Error state (only block rendering when we have NO data at all) ── */
+  if (telemetryError && !telemetryState) {
     return (
       <div className="flex h-full items-center justify-center" style={{ background: '#000' }}>
         <div className="flex flex-col items-center gap-4">
@@ -138,19 +139,30 @@ export default function Dashboard({
   const leaderName = nodes.find((n: any) => n.status === 'LEADER')?.name ?? 'No Leader';
 
   /* ── Throughput chart data ─────────────────────────────────────── */
-  const totalHist    = metrics.throughputHistory ?? [];
-  const consumeHist  = metrics.consumeHistory ?? [];
-  const errorHist    = metrics.errorHistory ?? [];
+  const totalHistFull    = metrics.throughputHistory ?? [];
+  const produceHistFull  = metrics.produceHistory ?? [];
+  const consumeHistFull  = metrics.consumeHistory ?? [];
+  const errorHistFull    = metrics.errorHistory ?? [];
+
+  const totalHist   = totalHistFull.slice(-historyWindowSeconds);
+  const produceHist = produceHistFull.slice(-historyWindowSeconds);
+  const consumeHist = consumeHistFull.slice(-historyWindowSeconds);
+  const errorHist   = errorHistFull.slice(-historyWindowSeconds);
 
   const throughputData = totalHist.map((v: number, i: number) => {
     const consumeVal = consumeHist[i] ?? 0;
-    const produceVal = Math.max(0, v - consumeVal);
+    let produceVal = produceHist[i];
+    if (produceVal === undefined) {
+      produceVal = Math.max(0, v - consumeVal);
+    }
     return {
       t: `-${totalHist.length - i}s`,
-      produce: parseFloat(((produceVal / 100) * 50).toFixed(2)),
-      consume: parseFloat(((consumeVal / 100) * 50).toFixed(2)),
+      produce: parseFloat(produceVal.toFixed(2)),
+      consume: parseFloat(consumeVal.toFixed(2)),
     };
   });
+  
+  const formatMBps = (val: number) => val > 0 && val < 0.005 ? '< 0.01' : val.toFixed(2);
 
   /* ── Radar data for selected/leader node ──────────────────────── */
   const leaderNode = nodes.find((n: any) => n.status === 'LEADER');
@@ -219,11 +231,11 @@ export default function Dashboard({
           <div className="shrink-0 grid grid-cols-5 gap-2.5">
             <StatCard icon={Zap} label="Produce Rate"
               value={formatNum(metrics.produceRate)} unit="msg/s" color="#06b6d4"
-              sub={`${metrics.produceThroughputMB.toFixed(2)} MB/s`}
+              sub={`${formatMBps(metrics.produceThroughputMB)} MB/s`}
               spark={<Sparkline data={totalHist.slice(-15)} color="blue" bloom="low" className="h-6 w-full" />} />
             <StatCard icon={Activity} label="Consume Rate"
               value={formatNum(metrics.consumeRate)} unit="msg/s" color="#a855f7"
-              sub={`${metrics.consumeThroughputMB.toFixed(2)} MB/s`}
+              sub={`${formatMBps(metrics.consumeThroughputMB)} MB/s`}
               spark={<Sparkline data={consumeHist.slice(-15)} color="purple" bloom="low" className="h-6 w-full" />} />
             <StatCard icon={Users} label="Connections"
               value={metrics.totalConnections} color="#f59e0b"
@@ -295,10 +307,10 @@ export default function Dashboard({
             </div>
           } className="shrink-0">
             <div className="text-2xl font-semibold text-white tracking-tight mb-0.5">
-              {metrics.totalThroughputMB.toFixed(2)} <span className="mono text-xs text-zinc-500">MB/s</span>
+              {formatMBps(metrics.totalThroughputMB)} <span className="mono text-xs text-zinc-500">MB/s</span>
             </div>
             <div className="mono text-[10px] text-zinc-600 mb-3">
-              ↑ {metrics.produceThroughputMB.toFixed(2)} · ↓ {metrics.consumeThroughputMB.toFixed(2)}
+              ↑ {formatMBps(metrics.produceThroughputMB)} · ↓ {formatMBps(metrics.consumeThroughputMB)}
             </div>
             <div className="h-[80px] w-full">
               <LineChart
@@ -315,6 +327,22 @@ export default function Dashboard({
                 <Line key="produce" dataKey="produce" />
                 <Line key="consume" dataKey="consume" strokeVariant="dashed" />
               </LineChart>
+            </div>
+            <div className="mt-4 pt-4 border-t border-white/5 flex items-center justify-between gap-4">
+              <span className="mono text-[10px] text-zinc-500 w-16">30s</span>
+              <input 
+                type="range" 
+                min="30" 
+                max="300" 
+                step="30"
+                value={historyWindowSeconds} 
+                onChange={(e) => setHistoryWindowSeconds(Number(e.target.value))}
+                className="flex-1 h-1.5 bg-white/10 rounded-full appearance-none [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-cyan-400 [&::-webkit-slider-thumb]:rounded-full cursor-pointer"
+              />
+              <span className="mono text-[10px] text-zinc-500 w-16 text-right">5min</span>
+            </div>
+            <div className="text-center mt-1">
+              <span className="mono text-[9px] text-zinc-600 tracking-wider">VIEWING LAST {historyWindowSeconds >= 60 ? `${historyWindowSeconds / 60} MIN` : `${historyWindowSeconds} SEC`}</span>
             </div>
           </Panel>
 
@@ -345,7 +373,7 @@ export default function Dashboard({
                 margins={{ top: 24, right: 8, bottom: 20, left: 28 }}
                 animationDuration={400}
               >
-                <XAxis key="x" dataKey="t" />
+                <XAxis key="x" dataKey="t" maxTicks={4} />
                 <YAxis key="y" />
                 <Legend key="legend" isClickable />
                 <Tooltip key="tooltip" labelKey="t" />

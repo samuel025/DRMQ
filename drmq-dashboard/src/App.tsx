@@ -1,8 +1,10 @@
 import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router-dom';
-import { LayoutDashboard, Book, Server, ChevronRight } from 'lucide-react';
+import { LayoutDashboard, Book, Server, ChevronRight, Layers, Users } from 'lucide-react';
 import { useState, useCallback } from 'react';
 import Dashboard from './pages/Dashboard';
 import { useClusterTelemetry } from './useClusterTelemetry';
+import Topics from './pages/Topics';
+import Consumers from './pages/Consumers';
 
 function Sidebar({ telemetryState }: { telemetryState: any }) {
   const location = useLocation();
@@ -11,6 +13,8 @@ function Sidebar({ telemetryState }: { telemetryState: any }) {
 
   const navItems = [
     { to: '/', icon: LayoutDashboard, label: 'Telemetry' },
+    { to: '/topics', icon: Layers, label: 'Topics' },
+    { to: '/consumers', icon: Users, label: 'Consumers' },
     { to: '/docs', icon: Book, label: 'Documentation' },
   ];
 
@@ -130,6 +134,8 @@ export default function App() {
                 style={{ minHeight: '100vh' }}
               />
             } />
+            <Route path="/topics" element={<Topics />} />
+            <Route path="/consumers" element={<Consumers />} />
           </Routes>
         </main>
       </div>

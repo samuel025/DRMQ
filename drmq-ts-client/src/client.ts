@@ -17,6 +17,8 @@ import {
   ProduceBatchResponse,
   SearchOffsetByTimeRequest,
   SearchOffsetByTimeResponse,
+  AtomicProduceRequest,
+  AtomicProduceResponse,
   ErrorCode
 } from './messages';
 
@@ -311,6 +313,82 @@ export class DRMQProducer extends DRMQClient {
     }
 
     throw new Error("Failed to send batch: timeout exhausted");
+  }
+
+  public async sendAtomic(topicMessages: Record<string, Uint8Array>): Promise<Record<string, number>> {
+    if (this.isClosed) throw new Error("Producer is closed");
+
+    const topics = Object.keys(topicMessages);
+    if (topics.length < 2) {
+      throw new Error("sendAtomic() requires at least 2 topics");
+    }
+
+    const req = AtomicProduceRequest.create({
+      slices: topics.map(topic => ({
+        topic,
+        entries: [{
+          payload: Buffer.from(topicMessages[topic]),
+          clientTimestamp: Date.now()
+        }]
+      }))
+    });
+
+    const envelopeBytes = AtomicProduceRequest.encode(req).finish();
+    const deliveryTimeoutMs = 120000;
+    const startMs = Date.now();
+    let currentBackoffMs = 100;
+
+    while (true) {
+      if (Date.now() - startMs > deliveryTimeoutMs) {
+        break;
+      }
+
+      try {
+        await this.ensureConnected();
+        const respBytes = await this.sendEnvelope(MessageType.ATOMIC_PRODUCE_REQUEST, envelopeBytes);
+        const resp = AtomicProduceResponse.decode(respBytes);
+
+        if (resp.success) {
+          const result: Record<string, number> = {};
+          for (const [k, v] of Object.entries(resp.baseOffsets)) {
+            result[k] = Number(v);
+          }
+          return result;
+        } else {
+          const errorMsg = resp.errorMessage;
+          if (resp.errorCode === ErrorCode.NOT_LEADER || (errorMsg && errorMsg.startsWith("NOT_LEADER:"))) {
+            const leaderAddr = errorMsg && errorMsg.startsWith("NOT_LEADER:") 
+                ? errorMsg.substring("NOT_LEADER:".length) 
+                : "UNKNOWN";
+            if (leaderAddr !== "UNKNOWN") {
+              const parts = leaderAddr.split(":");
+              if (parts.length === 2) {
+                this.host = parts[0];
+                this.port = parseInt(parts[1], 10);
+                super.closeConnection();
+                await this.ensureConnected();
+                continue;
+              }
+            }
+            super.closeConnection();
+            this.rotateServer();
+          } else if (errorMsg && (errorMsg.includes("timed out") || errorMsg.includes("Lost leadership") || errorMsg.includes("Raft batch proposal"))) {
+            super.closeConnection();
+            this.rotateServer();
+          } else {
+            throw new Error(`Failed to send atomic batch: ${errorMsg}`);
+          }
+        }
+      } catch (e) {
+        super.closeConnection();
+        this.rotateServer();
+      }
+
+      await new Promise(res => setTimeout(res, currentBackoffMs));
+      currentBackoffMs = Math.min(2000, currentBackoffMs * 2);
+    }
+
+    throw new Error("Failed to send atomic batch: timeout exhausted");
   }
 
   public close() {

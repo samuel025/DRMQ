@@ -6,23 +6,19 @@ option java_package = "com.drmq.protocol";
 option java_outer_classname = "DRMQProtocol";
 option java_multiple_files = false;
 
-// Request to produce a message to a topic
 message ProduceRequest {
     string topic = 1;
     bytes payload = 2;
-    optional string key = 3;  // Optional message key for partitioning (future use)
-    int64 timestamp = 4;      // Client-side timestamp
+    optional string key = 3;
+    int64 timestamp = 4;
 }
 
-// Response after producing a message
 message ProduceResponse {
     bool success = 1;
-    int64 offset = 2;         // Assigned offset if successful
-    string error_message = 3; // Error details if failed
+    int64 offset = 2;          
+    string error_message = 3;
     ErrorCode error_code = 4;
 }
-
-// Request to produce a batch of messages to a topic
 message ProduceBatchRequest {
     string topic = 1;
 
@@ -35,179 +31,172 @@ message ProduceBatchRequest {
     repeated BatchEntry entries = 2;
 }
 
-// Response after producing a batch of messages
 message ProduceBatchResponse {
     bool success = 1;
-    int64 base_offset = 2;    // The offset assigned to the FIRST message in the batch
-    int32 count = 3;          // Number of messages successfully written
-    string error_message = 4; // Error details if failed
+    int64 base_offset = 2;  
+    int32 count = 3;          
+    string error_message = 4; 
     ErrorCode error_code = 5;
 }
 
-// Internal message representation stored in  the broker
+message AtomicBatchTopicSlice {
+    string topic = 1;
+    repeated ProduceBatchRequest.BatchEntry entries = 2;
+}
+message AtomicBatchRequest {
+    repeated AtomicBatchTopicSlice slices = 1;
+}
+message AtomicProduceRequest {
+    repeated AtomicBatchTopicSlice slices = 1;
+}
+message AtomicProduceResponse {
+    bool success = 1;
+    map<string, int64> base_offsets = 2; 
+    string error_message = 3;
+    ErrorCode error_code = 4;
+}
+
 message StoredMessage {
     int64 offset = 1;
     string topic = 2;
     bytes payload = 3;
     optional string key = 4;
-    int64 timestamp = 5;      // Original client timestamp
-    int64 stored_at = 6;      // Broker storage timestamp
+    int64 timestamp = 5;     
+    int64 stored_at = 6;     
 }
 
-// Request to consume messages from a topic
 message ConsumeRequest {
     string topic = 1;
-    int64 from_offset = 2;    // Starting offset (inclusive) — ignored when consumer_group is set
-    int32 max_messages = 3;   // Maximum number of messages to fetch
-    int64 timeout_ms = 4;     // Long-poll timeout (0 = return immediately)
-    optional string consumer_group = 5;  // If set, broker manages offset via group coordination
-    optional string consumer_id = 6;     // Unique ID for this consumer instance within the group
+    int64 from_offset = 2;  
+    int32 max_messages = 3;   
+    int64 timeout_ms = 4;    
+    optional string consumer_group = 5; 
+    optional string consumer_id = 6; 
 }
 
-// Response containing consumed messages
 message ConsumeResponse {
     bool success = 1;
-    repeated StoredMessage messages = 2;  // List of messages
-    string error_message = 3;             // Error details if failed
+    repeated StoredMessage messages = 2; 
+    string error_message = 3;           
 }
 
-// Request to commit a consumer group's offset for a topic
 message CommitOffsetRequest {
     string consumer_group = 1;
     string topic = 2;
-    int64 offset = 3;   // The next offset to read (last processed + 1)
-    optional string consumer_id = 4;  // Consumer instance ID (for group coordination)
+    int64 offset = 3;   
+    optional string consumer_id = 4;  
 }
 
-// Response to a commit offset request
 message CommitOffsetResponse {
     bool success = 1;
     string error_message = 2;
 }
-
-// Request to fetch a consumer group's committed offset for a topic
 message FetchOffsetRequest {
     string consumer_group = 1;
     string topic = 2;
 }
 
-// Response with the committed offset
 message FetchOffsetResponse {
     bool success = 1;
-    int64 offset = 2;         // The committed offset, or -1 if none exists
+    int64 offset = 2;         
     string error_message = 3;
 }
 
-// Request to find an offset by a given timestamp
 message SearchOffsetByTimeRequest {
     string topic = 1;
-    int64 timestamp = 2;      // The target timestamp
+    int64 timestamp = 2;      
 }
 
-// Response with the found offset
 message SearchOffsetByTimeResponse {
     bool success = 1;
-    int64 offset = 2;         // The found offset, or -1 if none
+    int64 offset = 2;         
     string error_message = 3;
 }
 
-// --- Dead-Letter Queue (DLQ) support ---
-
-// Request to negatively acknowledge (NACK) a message, triggering redelivery or DLQ routing
 message NackRequest {
     string consumer_group = 1;
     string topic = 2;
-    int64 offset = 3;                  // The offset of the message being rejected
-    optional string consumer_id = 4;   // Consumer instance ID (for group coordination)
+    int64 offset = 3;                  
+    optional string consumer_id = 4;   
 }
 
-// Response to a NACK request
 message NackResponse {
     bool success = 1;
-    bool routed_to_dlq = 2;            // True if the message was sent to the DLQ instead of being requeued
+    bool routed_to_dlq = 2;            
     string error_message = 3;
 }
 
-// Envelope for TCP framing - wraps all messages with type info
 message MessageEnvelope {
     MessageType type = 1;
-    bytes payload = 2;  // Serialized inner message
+    bytes payload = 2; 
 }
 
-// --- Raft command types (for multiplexing different operations on the Raft log) ---
 enum RaftCommandType {
-    MESSAGE = 0;        // Normal message append (default)
-    OFFSET_COMMIT = 1;  // Consumer offset commit (replicated for durability)
-    BATCH_MESSAGE = 2;  // Batch message append (multiple messages in a single Raft entry)
+    MESSAGE = 0;       
+    OFFSET_COMMIT = 1; 
+    BATCH_MESSAGE = 2; 
+    ATOMIC_BATCH = 3;  
 }
 
-// --- Raft log entry (wraps a user message for Raft replication) ---
 message RaftEntry {
-    int64 term = 1;           // Term in which the entry was created
-    int64 index = 2;          // Position in the Raft log (1-indexed)
-    string topic = 3;         // Target topic for the message
-    bytes payload = 4;        // Message payload
-    optional string key = 5;  // Optional message key
-    int64 timestamp = 6;      // Client-side timestamp
-    RaftCommandType command_type = 7;        // Type of command (default: MESSAGE)
-    optional string consumer_group = 8;      // Consumer group (for OFFSET_COMMIT)
-    optional int64 offset_value = 9;         // Offset value (for OFFSET_COMMIT)
+    int64 term = 1;           
+    int64 index = 2;          
+    string topic = 3;         
+    bytes payload = 4;        
+    optional string key = 5;  
+    int64 timestamp = 6;      
+    RaftCommandType command_type = 7;        
+    optional string consumer_group = 8;      
+    optional int64 offset_value = 9;         
 }
 
-// --- Raft leader election ---
 message RequestVoteRequest {
-    int64 term = 1;              // Candidate's term
-    string candidate_id = 2;    // Candidate requesting vote
-    int64 last_log_index = 3;   // Index of candidate's last log entry
-    int64 last_log_term = 4;    // Term of candidate's last log entry
+    int64 term = 1;              
+    string candidate_id = 2;    
+    int64 last_log_index = 3;   
+    int64 last_log_term = 4;    
 }
 
 message RequestVoteResponse {
-    int64 term = 1;           // Current term, for candidate to update itself
-    bool vote_granted = 2;    // True = vote granted
+    int64 term = 1;           
+    bool vote_granted = 2;   
 }
 
-// --- Raft Pre-Vote (§9.6 disruption prevention) ---
-// Sent before a real election to check if the candidate COULD win
-// without incrementing the term. Prevents restarting nodes from
-// disrupting a healthy leader.
 message PreVoteRequest {
-    int64 term = 1;              // The term the candidate WOULD use (currentTerm + 1)
-    string candidate_id = 2;    // Candidate requesting pre-vote
-    int64 last_log_index = 3;   // Index of candidate's last log entry
-    int64 last_log_term = 4;    // Term of candidate's last log entry
+    int64 term = 1;           
+    string candidate_id = 2;    
+    int64 last_log_index = 3;   
+    int64 last_log_term = 4;   
 }
 
 message PreVoteResponse {
-    int64 term = 1;           // Current term of the responder
-    bool vote_granted = 2;    // True = would vote for this candidate
+    int64 term = 1;           
+    bool vote_granted = 2;   
 }
 
-// --- Raft log replication (also used as heartbeat when entries is empty) ---
 message AppendEntriesRequest {
-    int64 term = 1;                   // Leader's term
-    string leader_id = 2;            // So followers know who the leader is
-    int64 prev_log_index = 3;        // Index of log entry immediately preceding new ones
-    int64 prev_log_term = 4;         // Term of prevLogIndex entry
-    repeated RaftEntry entries = 5;  // Log entries to store (empty for heartbeat)
-    int64 leader_commit = 6;         // Leader's commitIndex
+    int64 term = 1;                  
+    string leader_id = 2;            
+    int64 prev_log_index = 3;       
+    int64 prev_log_term = 4;         
+    repeated RaftEntry entries = 5;  
+    int64 leader_commit = 6;         
 }
 
 message AppendEntriesResponse {
-    int64 term = 1;           // Current term, for leader to update itself
-    bool success = 2;         // True if follower contained entry matching prevLogIndex/prevLogTerm
-    int64 match_index = 3;    // Follower's last replicated index (for leader's matchIndex tracking)
+    int64 term = 1;           
+    bool success = 2;         
+    int64 match_index = 3;   
 }
 
-// --- Raft InstallSnapshot (for followers that fell too far behind) ---
 message InstallSnapshotRequest {
     int64 term = 1;
     string leader_id = 2;
     int64 last_included_index = 3;
     int64 last_included_term = 4;
-    int64 offset = 5;       // Byte offset of this chunk in the file
-    bytes data = 6;         // Raw zip chunk payload
-    bool done = 7;          // True if this is the final chunk
+    int64 offset = 5;       
+    bytes data = 6;         
+    bool done = 7;          
 }
 
 message InstallSnapshotResponse {
@@ -239,6 +228,8 @@ enum MessageType {
     PRODUCE_BATCH_RESPONSE = 21;
     SEARCH_OFFSET_BY_TIME_REQUEST = 22;
     SEARCH_OFFSET_BY_TIME_RESPONSE = 23;
+    ATOMIC_PRODUCE_REQUEST = 24;
+    ATOMIC_PRODUCE_RESPONSE = 25;
 }
 
 // --- Standard Error Codes ---
