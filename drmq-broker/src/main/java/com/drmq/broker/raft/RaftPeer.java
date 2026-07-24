@@ -77,10 +77,7 @@ public class RaftPeer {
                 }
                 BrokerMetrics.get().recordRaftRpc("request_vote", false,
                         System.nanoTime() - startNanos);
-                return RequestVoteResponse.newBuilder()
-                        .setTerm(0)
-                        .setVoteGranted(false)
-                        .build();
+                throw new RuntimeException("RequestVote RPC failed", e);
             }
         }
     }
@@ -117,10 +114,7 @@ public class RaftPeer {
                 }
                 BrokerMetrics.get().recordRaftRpc("pre_vote", false,
                         System.nanoTime() - startNanos);
-                return PreVoteResponse.newBuilder()
-                        .setTerm(0)
-                        .setVoteGranted(false)
-                        .build();
+                throw new RuntimeException("PreVote RPC failed", e);
             }
         }
     }
@@ -156,11 +150,7 @@ public class RaftPeer {
                 }
                 BrokerMetrics.get().recordRaftRpc("append_entries", false,
                         System.nanoTime() - startNanos);
-                return AppendEntriesResponse.newBuilder()
-                        .setTerm(0)
-                        .setSuccess(false)
-                        .setMatchIndex(0)
-                        .build();
+                throw new RuntimeException("AppendEntries RPC failed", e);
             }
         }
     }
@@ -192,9 +182,7 @@ public class RaftPeer {
                 logger.debug("InstallSnapshot to {} failed: {}", address, e.getMessage());
                 BrokerMetrics.get().recordRaftRpc("install_snapshot", false,
                         System.nanoTime() - startNanos);
-                return InstallSnapshotResponse.newBuilder()
-                        .setTerm(0)
-                        .build();
+                throw new RuntimeException("InstallSnapshot RPC failed", e);
             }
         }
     }

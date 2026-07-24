@@ -585,6 +585,53 @@ public class RaftNode {
                         replicating.set(false);
                     }
                 }, raftExecutor);
+            } else {
+                // If replication is blocked (e.g., generating a massive snapshot),
+                // send a lightweight heartbeat so the follower's election timer doesn't fire.
+                CompletableFuture.runAsync(() -> {
+                    sendLightweightHeartbeat(peer);
+                });
+            }
+        }
+    }
+
+    private void sendLightweightHeartbeat(PeerAddress peer) {
+        long peerNextIndex;
+        long prevLogIndex;
+        long prevLogTerm = 0;
+        long currentTermLocal;
+        long commitIndexLocal;
+        
+        lock.lock();
+        try {
+            if (state != RaftState.LEADER) return;
+            currentTermLocal = currentTerm;
+            commitIndexLocal = commitIndex;
+            peerNextIndex = nextIndex.getOrDefault(peer.id(), raftLog.getLastIndex() + 1);
+            prevLogIndex = peerNextIndex - 1;
+            
+            if (prevLogIndex > 0 && prevLogIndex >= raftLog.getStartIndex() && prevLogIndex <= raftLog.getLastIndex()) {
+                prevLogTerm = raftLog.getTermAt(prevLogIndex);
+            } else if (prevLogIndex == lastApplied && lastApplied > 0) {
+                prevLogTerm = lastAppliedTerm;
+            }
+        } finally {
+            lock.unlock();
+        }
+
+        AppendEntriesRequest request = AppendEntriesRequest.newBuilder()
+                .setTerm(currentTermLocal)
+                .setLeaderId(nodeId)
+                .setPrevLogIndex(prevLogIndex)
+                .setPrevLogTerm(prevLogTerm)
+                .setLeaderCommit(commitIndexLocal)
+                .build();
+
+        java.util.function.Function<AppendEntriesRequest, AppendEntriesResponse> handler = appendRpcHandlers.get(peer.id());
+        if (handler != null) {
+            try {
+                handler.apply(request);
+            } catch (Exception ignored) {
             }
         }
     }

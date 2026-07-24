@@ -59,8 +59,11 @@ public class SnapshotManager {
         messageStore.lockForSnapshot(() -> {
             try (OutputStream fos = Files.newOutputStream(zipFile, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
                  ZipOutputStream zos = new ZipOutputStream(fos)) {
-                Path storeDir = dataDir.resolve("store");
-                zipDirectory(storeDir, "store", zos);
+                // 3a. Zip all topic directories
+                for (String topic : messageStore.getTopics()) {
+                    Path topicDir = dataDir.resolve(topic);
+                    zipDirectory(topicDir, topic, zos);
+                }
 
                 // 3b. Zip the consumer offsets directory
                 Path offsetsDir = dataDir.resolve("__consumer_offsets");
@@ -140,9 +143,10 @@ public class SnapshotManager {
         logger.info("Restoring state from snapshot zip: {}", zipFile);
 
         // Delete existing directories first
-        Path storeDir = dataDir.resolve("store");
+        for (String topic : messageStore.getTopics()) {
+            deleteDirectory(dataDir.resolve(topic));
+        }
         Path offsetsDir = dataDir.resolve("__consumer_offsets");
-        deleteDirectory(storeDir);
         deleteDirectory(offsetsDir);
 
         // Unzip

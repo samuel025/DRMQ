@@ -15,7 +15,7 @@ import java.util.List;
 import java.util.concurrent.*;
 
 
-public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
+public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.ByteBuf> {
     private static final Logger logger = LoggerFactory.getLogger(ClientHandler.class);
 
     private static final int MAX_BATCH_MESSAGES = 10000;
@@ -61,10 +61,24 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
     }
 
     @Override
-    protected void channelRead0(ChannelHandlerContext ctx, byte[] msg) throws Exception {
-        MessageEnvelope envelope = MessageEnvelope.parseFrom(msg);
+    protected void channelRead0(ChannelHandlerContext ctx, io.netty.buffer.ByteBuf msg) throws Exception {
+        java.nio.ByteBuffer nioBuffer = msg.nioBuffer();
+        com.google.protobuf.CodedInputStream input = com.google.protobuf.CodedInputStream.newInstance(nioBuffer);
+        MessageEnvelope envelope = MessageEnvelope.parseFrom(input);
+        
         handleMessage(envelope).thenAccept(response -> {
-            ctx.writeAndFlush(response.toByteArray());
+            int size = response.getSerializedSize();
+            io.netty.buffer.ByteBuf outBuf = ctx.alloc().directBuffer(size);
+            try {
+                com.google.protobuf.CodedOutputStream output = com.google.protobuf.CodedOutputStream.newInstance(outBuf.nioBuffer(0, size));
+                response.writeTo(output);
+                output.flush();
+                outBuf.writerIndex(size);
+                ctx.writeAndFlush(outBuf);
+            } catch (Exception e) {
+                outBuf.release();
+                logger.error("Failed to serialize response", e);
+            }
         }).exceptionally(e -> {
             logger.error("Unhandled error processing request", e);
             return null;

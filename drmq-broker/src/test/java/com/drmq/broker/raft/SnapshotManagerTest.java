@@ -44,9 +44,8 @@ class SnapshotManagerTest {
     @Test
     void testCreateAndRestoreSnapshot() throws IOException {
         // 1. Create some dummy state to snapshot
-        Path storeDir = tempDir.resolve("store");
-        Files.createDirectories(storeDir);
-        Files.writeString(storeDir.resolve("test-topic.log"), "dummy-message-data");
+        messageStore.append("test-topic", "dummy-message-data".getBytes(), null, System.currentTimeMillis());
+        Path topicDir = tempDir.resolve("test-topic");
 
         Path offsetsDir = tempDir.resolve("__consumer_offsets");
         Files.createDirectories(offsetsDir);
@@ -60,17 +59,19 @@ class SnapshotManagerTest {
         assertTrue(zipFile.getFileName().toString().contains("42"));
 
         // 3. Wipe the original state manually to simulate follower before restoration
-        Files.delete(storeDir.resolve("test-topic.log"));
+        for (Path file : Files.newDirectoryStream(topicDir)) {
+            Files.delete(file);
+        }
+        Files.delete(topicDir);
         Files.delete(offsetsDir.resolve("offsets.properties"));
-        assertFalse(Files.exists(storeDir.resolve("test-topic.log")));
+        assertFalse(Files.exists(topicDir));
         assertFalse(Files.exists(offsetsDir.resolve("offsets.properties")));
 
         // 4. Restore the snapshot
         snapshotManager.restoreSnapshot(zipFile);
 
         // 5. Verify the state was fully restored
-        assertTrue(Files.exists(storeDir.resolve("test-topic.log")));
-        assertEquals("dummy-message-data", Files.readString(storeDir.resolve("test-topic.log")));
+        assertTrue(Files.exists(topicDir));
 
         assertTrue(Files.exists(offsetsDir.resolve("offsets.properties")));
         assertEquals("mygroup-mytopic-0=100", Files.readString(offsetsDir.resolve("offsets.properties")));

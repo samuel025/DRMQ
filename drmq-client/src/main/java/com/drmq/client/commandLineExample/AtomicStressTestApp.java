@@ -2,18 +2,14 @@ package com.drmq.client.commandLineExample;
 
 import com.drmq.client.DRMQProducer;
 
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
-/**
- * Multi-threaded Atomic Stress Test App
- * Hammer the broker with cross-topic atomic batch messages.
- */
 public class AtomicStressTestApp {
     public static void main(String[] args) throws InterruptedException {
         System.out.println("╔═══════════════════════════════════════════════════╗");
@@ -22,18 +18,10 @@ public class AtomicStressTestApp {
 
         String bootstrapServers = args.length > 0 ? args[0] : "localhost:9092,localhost:9093,localhost:9094";
         int concurrency;
-        int msgSize;
-        int numTopics;
         try {
-            concurrency = args.length > 1 ? Integer.parseInt(args[1]) : 2;
-            numTopics = args.length > 2 ? Integer.parseInt(args[2]) : 3;
-            msgSize = args.length > 3 ? Integer.parseInt(args[3]) : 256;
-            if (concurrency < 1 || msgSize < 1 || numTopics < 2) {
-                throw new NumberFormatException("Concurrency > 0, msgSize > 0, numTopics >= 2");
-            }
+            concurrency = args.length > 1 ? Integer.parseInt(args[1]) : 10;
         } catch (NumberFormatException e) {
-            System.err.println("Error: " + e.getMessage());
-            System.err.println("Usage: AtomicStressTestApp [bootstrapServers] [concurrency] [numTopics] [msgSize]");
+            System.err.println("Error: Concurrency must be a valid positive integer.");
             System.exit(1);
             return;
         }
@@ -41,16 +29,9 @@ public class AtomicStressTestApp {
         System.out.println("Configuration:");
         System.out.println("  Brokers      : " + bootstrapServers);
         System.out.println("  Concurrency  : " + concurrency + " threads");
-        System.out.println("  Topics Count : " + numTopics + " topics per atomic batch");
-        System.out.println("  Payload Size : " + msgSize + " bytes per topic\n");
+        System.out.println("  Topics       : Topic-A and Topic-B\n");
 
-        StringBuilder sb = new StringBuilder(msgSize);
-        for (int i = 0; i < msgSize; i++) {
-            sb.append((char) ('a' + (Math.random() * 26)));
-        }
-        final String basePayload = sb.toString();
-
-        AtomicLong batchesSent = new AtomicLong(0);
+        AtomicLong transactionsSent = new AtomicLong(0);
         AtomicLong errors = new AtomicLong(0);
 
         ExecutorService executor = Executors.newFixedThreadPool(concurrency);
@@ -63,9 +44,9 @@ public class AtomicStressTestApp {
                 long lastSent = 0;
                 while (!Thread.currentThread().isInterrupted()) {
                     Thread.sleep(1000);
-                    long currentSent = batchesSent.get();
+                    long currentSent = transactionsSent.get();
                     long currentErrors = errors.get();
-                    System.out.printf("[Metrics] %d atomic batches/sec | Total Batches: %d | Total Errors: %d\n",
+                    System.out.printf("[Metrics] %d TPS (Atomic Tx/sec) | Total: %d | Errors: %d\n",
                             (currentSent - lastSent), currentSent, currentErrors);
                     lastSent = currentSent;
                 }
@@ -75,55 +56,42 @@ public class AtomicStressTestApp {
         });
         reporter.start();
 
+        final byte[] payloadA = "ATOMIC_PAYLOAD_A".getBytes(StandardCharsets.UTF_8);
+        final byte[] payloadB = "ATOMIC_PAYLOAD_B".getBytes(StandardCharsets.UTF_8);
+
         for (int i = 0; i < concurrency; i++) {
             final int threadId = i;
             executor.submit(() -> {
                 try (DRMQProducer producer = new DRMQProducer(bootstrapServers)) {
                     producer.connect();
-                    long count = 0;
                     while (!Thread.currentThread().isInterrupted()) {
-                        java.util.List<CompletableFuture<Map<String, Long>>> futures = new java.util.ArrayList<>(100);
-                        
-                        // Pipeline 100 atomic requests asynchronously
-                        for (int k = 0; k < 100; k++) {
-                            Map<String, byte[]> atomicBatch = new HashMap<>();
-                            String payload = "T" + threadId + "_" + count + "_" + basePayload;
-                            byte[] payloadBytes = payload.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                            
-                            for (int t = 0; t < numTopics; t++) {
-                                atomicBatch.put("atomic-topic-" + t, payloadBytes);
-                            }
-                            
-                            futures.add(producer.sendAtomic(atomicBatch));
-                            count++;
-                        }
+                        Map<String, byte[]> atomicBatch = new HashMap<>();
+                        atomicBatch.put("Topic-A", payloadA);
+                        atomicBatch.put("Topic-B", payloadB);
 
-                        // Wait for the pipeline to drain and record results
-                        for (var f : futures) {
-                            try {
-                                f.join();
-                                batchesSent.incrementAndGet();
-                            } catch (Exception e) {
-                                errors.incrementAndGet();
-                            }
+                        try {
+                            producer.sendAtomic(atomicBatch).join();
+                            transactionsSent.incrementAndGet();
+                        } catch (Exception e) {
+                            errors.incrementAndGet();
                         }
                     }
                 } catch (Exception e) {
-                     errors.incrementAndGet();
-                     System.err.println("[P" + threadId + "] Producer failed: " + e.getMessage());
+                    errors.incrementAndGet();
+                    System.err.println("[P" + threadId + "] Producer failed: " + e.getMessage());
                 }
             });
         }
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("\n🛑 Shutting down atomic stress test...");
+            System.out.println("\n🛑 Shutting down stress test...");
             executor.shutdownNow();
             reporter.interrupt();
             long totalTimeMs = System.currentTimeMillis() - startTime;
             System.out.printf("\n📊 Final Results:\n");
-            System.out.printf("  Total Batches Sent : %d\n", batchesSent.get());
-            System.out.printf("  Total Errors       : %d\n", errors.get());
-            System.out.printf("  Avg Rate           : %.2f batches/sec\n", (batchesSent.get() * 1000.0) / Math.max(1, totalTimeMs));
+            System.out.printf("  Total Tx Sent: %d transactions\n", transactionsSent.get());
+            System.out.printf("  Total Errors : %d\n", errors.get());
+            System.out.printf("  Avg Rate     : %.2f TPS\n", (transactionsSent.get() * 1000.0) / Math.max(1, totalTimeMs));
         }));
 
         executor.awaitTermination(Long.MAX_VALUE, TimeUnit.DAYS);

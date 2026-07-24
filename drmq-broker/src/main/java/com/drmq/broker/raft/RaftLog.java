@@ -58,7 +58,10 @@ public class RaftLog {
         if (logicalFileSize + additionalBytes > mappedBuffer.capacity()) {
             long newCapacity = Math.max(mappedBuffer.capacity() * 2L, logicalFileSize + additionalBytes + INITIAL_MAPPED_SIZE);
             if (newCapacity > Integer.MAX_VALUE) {
-                throw new IOException("Raft log exceeded 2GB limit of MappedByteBuffer segment");
+                if (logicalFileSize + additionalBytes > Integer.MAX_VALUE) {
+                    throw new IOException("Raft log exceeded 2GB limit of MappedByteBuffer segment");
+                }
+                newCapacity = Integer.MAX_VALUE;
             }
             int pos = mappedBuffer.position();
             mappedBuffer = fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, newCapacity);
@@ -326,27 +329,27 @@ public class RaftLog {
             MappedByteBuffer tempMapped = tempChannel.map(FileChannel.MapMode.READ_WRITE, 0, Math.max(logicalFileSize, INITIAL_MAPPED_SIZE));
             
             long startReadPos;
+            java.nio.MappedByteBuffer readerBuffer;
             synchronized(this) {
                 if (removeCount < initialSize) {
                     startReadPos = filePositions.get(removeCount);
                 } else {
                     startReadPos = logicalFileSize;
                 }
+                readerBuffer = (java.nio.MappedByteBuffer) mappedBuffer.duplicate();
             }
             
-            int originalPos = mappedBuffer.position();
-            mappedBuffer.position((int) startReadPos);
+            readerBuffer.position((int) startReadPos);
             
             for (int i = removeCount; i < initialSize; i++) {
                 newPositions.add((long) tempMapped.position());
-                int length = mappedBuffer.getInt();
+                int length = readerBuffer.getInt();
                 byte[] data = new byte[length];
-                mappedBuffer.get(data);
+                readerBuffer.get(data);
                 
                 tempMapped.putInt(length);
                 tempMapped.put(data);
             }
-            mappedBuffer.position(originalPos);
             
             newLogicalFileSize = tempMapped.position();
             if (fsyncEnabled) tempMapped.force();

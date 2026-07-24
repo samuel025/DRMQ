@@ -22,8 +22,8 @@ public class DRMQProducer implements AutoCloseable {
     private static final Logger logger = LoggerFactory.getLogger(DRMQProducer.class);
     private static final int MAX_RETRIES = 5;
     private static final long RECONNECT_DELAY_MS = 500;
-    private static final int BATCH_SIZE_BYTES = 1048576; // 1MB
-    private static final long LINGER_MS = 5;
+    private int batchSizeBytes = 1048576; // 1MB default
+    private long lingerMs = 5;
 
     private String host;
     private int port;
@@ -86,6 +86,14 @@ public class DRMQProducer implements AutoCloseable {
 
     public DRMQProducer() {
         this("localhost", 9092);
+    }
+
+    public void setBatchSizeBytes(int batchSizeBytes) {
+        this.batchSizeBytes = batchSizeBytes;
+    }
+
+    public void setLingerMs(long lingerMs) {
+        this.lingerMs = lingerMs;
     }
 
     public void connect() throws IOException {
@@ -175,7 +183,7 @@ public class DRMQProducer implements AutoCloseable {
                 long firstMsgTime = System.currentTimeMillis();
                 String currentTopic = firstMsg.topic;
 
-                while (currentBytes < BATCH_SIZE_BYTES) {
+                while (currentBytes < batchSizeBytes) {
                     PendingMessage peeked = accumulator.peek();
                     if (peeked != null) {
                         if (!currentTopic.equals(peeked.topic)) {
@@ -186,7 +194,7 @@ public class DRMQProducer implements AutoCloseable {
                     currentBatch.add(msg);
                     currentBytes += msg.payload.length;
                     } else {
-                        if (System.currentTimeMillis() - firstMsgTime >= LINGER_MS) {
+                        if (System.currentTimeMillis() - firstMsgTime >= lingerMs) {
                             break;
                         }
                         Thread.sleep(1); // Brief yield during linger window
