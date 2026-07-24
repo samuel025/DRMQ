@@ -20,7 +20,7 @@ class RaftLogTest {
 
     @BeforeEach
     void setUp() throws IOException {
-        raftLog = new RaftLog(tempDir);
+        raftLog = new RaftLog(tempDir, true);
     }
 
     @Test

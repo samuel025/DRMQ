@@ -165,7 +165,10 @@ public class OffsetManager implements Closeable {
         Files.move(tmp, offsetsFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
     }
 
-    @Override
+    public void forceFlush() throws IOException {
+        forcePersist();
+    }
+
     public void close() throws IOException {
         scheduler.shutdownNow();
         try {

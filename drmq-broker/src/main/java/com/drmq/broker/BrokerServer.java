@@ -88,7 +88,8 @@ public class BrokerServer {
                     messageStore,
                     offsetManager,
                     Paths.get(config.getDataDir()),
-                    config.getRaftCompactThreshold()
+                    config.getRaftCompactThreshold(),
+                    config.isRaftFsyncEnabled()
             );
 
             for (BrokerConfig.PeerAddress peer : config.getPeers()) {

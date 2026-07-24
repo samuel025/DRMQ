@@ -225,7 +225,14 @@ public class LogManager implements AutoCloseable {
         return topicSegments.values().stream().mapToInt(ConcurrentSkipListMap::size).sum();
     }
 
-    @Override
+    public void forceFlush() throws IOException {
+        for (ConcurrentSkipListMap<Long, LogSegment> segments : topicSegments.values()) {
+            for (LogSegment segment : segments.values()) {
+                segment.forceFlush();
+            }
+        }
+    }
+
     public void close() throws IOException {
         IOException primaryException = null;
         

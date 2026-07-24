@@ -247,7 +247,7 @@ class RaftNodeTest {
         // RequestVote with term=10 should cause step-down to term 10
         // (standard Raft — no lease interference)
         // Wait for heartbeat lease to expire
-        try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+        try { Thread.sleep(2500); } catch (InterruptedException ignored) {}
 
         RequestVoteResponse response = raftNode.handleRequestVote(RequestVoteRequest.newBuilder()
                 .setTerm(10).setCandidateId("node3").setLastLogIndex(0).setLastLogTerm(0).build());
@@ -266,7 +266,7 @@ class RaftNodeTest {
                 .build());
 
         // Wait for heartbeat lease to expire
-        try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+        try { Thread.sleep(2500); } catch (InterruptedException ignored) {}
 
         // Candidate with stale log (term 3, index 0) should be rejected
         RequestVoteResponse response = raftNode.handleRequestVote(RequestVoteRequest.newBuilder()
@@ -284,7 +284,7 @@ class RaftNodeTest {
         // Make node1 become leader
         registerAllHandlers(true, true, true);
         raftNode.start();
-        Thread.sleep(1500);
+        Thread.sleep(8500);
         assertEquals(RaftState.LEADER, raftNode.getState(), "Node should be leader");
 
         // A restarting node sends PreVote — leader must reject
@@ -320,7 +320,7 @@ class RaftNodeTest {
                 .setTerm(5).setLeaderId("node2").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0).build());
 
         // Wait for heartbeat lease to expire (> ELECTION_TIMEOUT_MIN_MS = 150ms)
-        Thread.sleep(200);
+        Thread.sleep(2500);
 
         // Now PreVote should be granted (no recent heartbeat = leader might be dead)
         PreVoteResponse response = raftNode.handlePreVote(PreVoteRequest.newBuilder()
@@ -339,7 +339,7 @@ class RaftNodeTest {
                 .setTerm(5).setLeaderId("node2").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0).build());
 
         // Wait for lease to expire
-        try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+        try { Thread.sleep(2500); } catch (InterruptedException ignored) {}
 
         // PreVote with proposedTerm=3 (behind node's term=5) — must reject
         PreVoteResponse response = raftNode.handlePreVote(PreVoteRequest.newBuilder()
@@ -361,7 +361,7 @@ class RaftNodeTest {
                 .build());
 
         // Wait for heartbeat lease to expire
-        Thread.sleep(200);
+        Thread.sleep(2500);
 
         // PreVote with stale log (term 3) — must reject even though heartbeat is stale
         PreVoteResponse response = raftNode.handlePreVote(PreVoteRequest.newBuilder()
@@ -384,7 +384,7 @@ class RaftNodeTest {
         String leaderBefore = raftNode.getLeaderId();
 
         // Wait for lease to expire so pre-vote is actually processed
-        try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+        try { Thread.sleep(2500); } catch (InterruptedException ignored) {}
 
         // Send pre-vote with higher term
         raftNode.handlePreVote(PreVoteRequest.newBuilder()
@@ -405,7 +405,7 @@ class RaftNodeTest {
                 .setTerm(5).setLeaderId("node2").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0).build());
 
         // Wait for lease expiry
-        Thread.sleep(200);
+        Thread.sleep(2500);
 
         // Candidate with same (empty) log — should be granted
         PreVoteResponse response = raftNode.handlePreVote(PreVoteRequest.newBuilder()
@@ -454,7 +454,7 @@ class RaftNodeTest {
 
         raftNode.start();
         // Startup grace = 900ms + normal timeout ~225ms + some buffer
-        Thread.sleep(1500);
+        Thread.sleep(8500);
 
         assertTrue(preVotesSent.get() > 0, "Should have sent PreVote RPCs before real election");
         assertTrue(votesSent.get() > 0, "Should have sent real RequestVote after pre-vote succeeded");
@@ -465,7 +465,7 @@ class RaftNodeTest {
     void winsElectionAndBecomesLeader() throws InterruptedException {
         registerAllHandlers(true, true, true);
         raftNode.start();
-        Thread.sleep(1500);
+        Thread.sleep(8500);
 
         assertEquals(RaftState.LEADER, raftNode.getState());
         assertEquals(nodeId, raftNode.getLeaderId());
@@ -490,7 +490,7 @@ class RaftNodeTest {
         }
 
         raftNode.start();
-        Thread.sleep(1500);
+        Thread.sleep(8500);
 
         assertEquals(0, raftNode.getCurrentTerm(),
                 "Term must NOT be incremented when pre-vote fails — this is the core Pre-Vote guarantee");
@@ -506,7 +506,7 @@ class RaftNodeTest {
     void stepsDownWhenQuorumIsLost() throws InterruptedException {
         registerAllHandlers(true, true, true);
         raftNode.start();
-        Thread.sleep(1500);
+        Thread.sleep(8500);
         assertEquals(RaftState.LEADER, raftNode.getState());
 
         // Simulate complete network partition — all RPCs throw exceptions.
@@ -524,7 +524,7 @@ class RaftNodeTest {
         // checkQuorum every 900ms. The quorum window is 900ms.
         // Need: staleness > 900ms, i.e., we need at least one full check cycle
         // AFTER the contacts go stale. With generous buffer for scheduling jitter.
-        Thread.sleep(6000);
+        Thread.sleep(14000);
 
         assertNotEquals(RaftState.LEADER, raftNode.getState(),
                 "Leader should step down after losing quorum");

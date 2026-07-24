@@ -32,9 +32,9 @@ public class RaftNode {
     private static final Logger logger = LoggerFactory.getLogger(RaftNode.class);
 
     // Raft timing constants — randomized election timeout prevents split votes
-    private static final long ELECTION_TIMEOUT_MIN_MS = 150;
-    private static final long ELECTION_TIMEOUT_MAX_MS = 300;
-    private static final long HEARTBEAT_INTERVAL_MS = 75;
+    private static final long ELECTION_TIMEOUT_MIN_MS = 1000;
+    private static final long ELECTION_TIMEOUT_MAX_MS = 2000;
+    private static final long HEARTBEAT_INTERVAL_MS = 300;
 
     // Proposal timeout — how long a client blocks waiting for Raft commitment
     private static final long PROPOSAL_TIMEOUT_SECONDS = 60;
@@ -118,7 +118,7 @@ public class RaftNode {
 
     public RaftNode(String nodeId, int port, List<PeerAddress> peers,
                     MessageStore messageStore, OffsetManager offsetManager, Path dataDir,
-                    long raftCompactThreshold) throws IOException {
+                    long raftCompactThreshold, boolean raftFsyncEnabled) throws IOException {
         this.nodeId = nodeId;
         this.port = port;
         this.peers = peers;
@@ -127,7 +127,7 @@ public class RaftNode {
         this.dataDir = dataDir;
         this.snapshotManager = new SnapshotManager(dataDir, messageStore, offsetManager);
         this.raftCompactThreshold = raftCompactThreshold;
-        this.raftLog = new RaftLog(dataDir);
+        this.raftLog = new RaftLog(dataDir, raftFsyncEnabled);
         this.state = RaftState.FOLLOWER;
         this.commitIndex = 0;
         this.lastApplied = 0;
@@ -150,7 +150,7 @@ public class RaftNode {
 
     public RaftNode(String nodeId, int port, List<PeerAddress> peers,
                     MessageStore messageStore, OffsetManager offsetManager, Path dataDir) throws IOException {
-        this(nodeId, port, peers, messageStore, offsetManager, dataDir, 1000L);
+        this(nodeId, port, peers, messageStore, offsetManager, dataDir, 1000L, true);
     }
 
   
@@ -905,6 +905,8 @@ public class RaftNode {
                 if (isCompacting.compareAndSet(false, true)) {
                     raftExecutor.execute(() -> {
                         try {
+                            if (messageStore != null) messageStore.forceFlush();
+                            if (offsetManager != null) offsetManager.forceFlush();
                             raftLog.compact(finalCompactIndex);
                             logger.debug("[{}] Chunked compaction complete: log now starts at {}",
                                     nodeId, finalCompactIndex + 1);

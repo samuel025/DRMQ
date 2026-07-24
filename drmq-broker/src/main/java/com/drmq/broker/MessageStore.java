@@ -656,7 +656,10 @@ public class MessageStore implements Closeable {
         logger.info("Message store memory state cleared");
     }
 
-    @Override
+    public void forceFlush() throws IOException {
+        logManager.forceFlush();
+    }
+
     public void close() throws IOException {
         if (cleanerScheduler != null) {
             cleanerScheduler.shutdown();

@@ -30,8 +30,10 @@ public class RaftLog {
     private final List<Long> filePositions;     
     private RandomAccessFile raf;
     private long startIndex = 1;
+    private final boolean fsyncEnabled;
 
-    public RaftLog(Path dataDir) throws IOException {
+    public RaftLog(Path dataDir, boolean fsyncEnabled) throws IOException {
+        this.fsyncEnabled = fsyncEnabled;
         Path raftDir = dataDir.resolve("raft");
         Files.createDirectories(raftDir);
         this.logPath = raftDir.resolve("raft.log");
@@ -65,7 +67,7 @@ public class RaftLog {
                 byte[] data = new byte[length];
                 raf.readFully(data);
                 RaftEntry entry = RaftEntry.parseFrom(data);
-                entries.add(entry);
+                entries.add(entry.toBuilder().clearPayload().build());
                 filePositions.add(entryStart);
                 count++;
             } catch (EOFException e) {
@@ -91,12 +93,12 @@ public class RaftLog {
             byte[] data = entry.toByteArray();
             raf.writeInt(data.length);
             raf.write(data);
-            raf.getFD().sync(); 
+            if (fsyncEnabled) raf.getFD().sync(); 
         } catch (IOException e) {
             raf.setLength(entryStart);
             throw e;
         }
-        entries.add(entry);
+        entries.add(entry.toBuilder().clearPayload().build());
         filePositions.add(entryStart);
         logger.debug("Appended raft entry: index={}, term={}", entry.getIndex(), entry.getTerm());
     }
@@ -119,13 +121,15 @@ public class RaftLog {
                 raf.write(data);
             }
             
-            raf.getFD().sync(); 
+            if (fsyncEnabled) raf.getFD().sync(); 
         } catch (IOException e) {
             raf.setLength(entryStart);
             throw e;
         }
         
-        entries.addAll(batch);
+        for (RaftEntry e : batch) {
+            entries.add(e.toBuilder().clearPayload().build());
+        }
         filePositions.addAll(newPositions);
         logger.debug("Appended {} raft entries (indices {} to {})", 
                 batch.size(), batch.get(0).getIndex(), batch.get(batch.size() - 1).getIndex());
@@ -139,7 +143,20 @@ public class RaftLog {
         if (index < startIndex || index > getLastIndex()) {
             return null;
         }
-        return entries.get((int) (index - startIndex));
+        int listIndex = (int) (index - startIndex);
+        try {
+            long pos = filePositions.get(listIndex);
+            long originalPos = raf.getFilePointer();
+            raf.seek(pos);
+            int length = raf.readInt();
+            byte[] data = new byte[length];
+            raf.readFully(data);
+            raf.seek(originalPos);
+            return RaftEntry.parseFrom(data);
+        } catch (IOException e) {
+            logger.error("Failed to read raft entry at index {} from disk", index, e);
+            return null;
+        }
     }
 
     /**
@@ -162,21 +179,34 @@ public class RaftLog {
         }
         int from = (int) (fromIndex - startIndex);
         
-        int to = from;
+        List<RaftEntry> result = new ArrayList<>();
         long currentBytes = 0;
         int maxBytes = 2 * 1024 * 1024; // 2 MB limit per RPC
         
-        while (to < entries.size() && to - from < maxEntries) {
-            RaftEntry entry = entries.get(to);
-            long entrySize = entry.getSerializedSize();
-            if (to > from && currentBytes + entrySize > maxBytes) {
-                break; // ensure at least one entry is sent if the single entry is > 2MB
+        try {
+            long originalPos = raf.getFilePointer();
+            raf.seek(filePositions.get(from));
+            int to = from;
+            while (to < entries.size() && to - from < maxEntries) {
+                int length = raf.readInt();
+                byte[] data = new byte[length];
+                raf.readFully(data);
+                RaftEntry entry = RaftEntry.parseFrom(data);
+                
+                long entrySize = entry.getSerializedSize();
+                if (to > from && currentBytes + entrySize > maxBytes) {
+                    break; // ensure at least one entry is sent if the single entry is > 2MB
+                }
+                currentBytes += entrySize;
+                result.add(entry);
+                to++;
             }
-            currentBytes += entrySize;
-            to++;
+            raf.seek(originalPos);
+        } catch (IOException e) {
+            logger.error("Failed to read raft entries from disk", e);
         }
         
-        return new ArrayList<>(entries.subList(from, to));
+        return result;
     }
 
     /**
@@ -249,7 +279,7 @@ public class RaftLog {
                 fromIndex, entries.size() - removeFromListIndex, truncateToPosition);
 
         raf.setLength(truncateToPosition);
-        raf.getFD().sync();
+        if (fsyncEnabled) raf.getFD().sync();
 
         entries.subList(removeFromListIndex, entries.size()).clear();
         filePositions.subList(removeFromListIndex, filePositions.size()).clear();
@@ -261,49 +291,59 @@ public class RaftLog {
      */
     public void compact(long upToIndex) throws IOException {
         int removeCount;
-        List<RaftEntry> remainingEntries;
+        int initialSize;
         
         synchronized(this) {
             if (upToIndex <= startIndex || upToIndex > getLastIndex()) {
                 return;
             }
             removeCount = (int) (upToIndex - startIndex + 1);
-            remainingEntries = new ArrayList<>(entries.subList(removeCount, entries.size()));
+            initialSize = entries.size();
         }
         
         java.io.File tempFile = new java.io.File(logPath.getParent().toFile(), logPath.getFileName().toString() + ".tmp");
-        List<Long> newPositions = new ArrayList<>(remainingEntries.size());
+        List<Long> newPositions = new ArrayList<>(initialSize - removeCount);
         
-        try (RandomAccessFile tempRaf = new RandomAccessFile(tempFile, "rw")) {
-            for (RaftEntry entry : remainingEntries) {
+        try (RandomAccessFile tempRaf = new RandomAccessFile(tempFile, "rw");
+             RandomAccessFile readRaf = new RandomAccessFile(logPath.toFile(), "r")) {
+            long startReadPos;
+            synchronized(this) {
+                startReadPos = filePositions.get(removeCount);
+            }
+            readRaf.seek(startReadPos);
+            for (int i = removeCount; i < initialSize; i++) {
                 newPositions.add(tempRaf.getFilePointer());
-                byte[] data = entry.toByteArray();
-                tempRaf.writeInt(data.length);
+                int length = readRaf.readInt();
+                byte[] data = new byte[length];
+                readRaf.readFully(data);
+                tempRaf.writeInt(length);
                 tempRaf.write(data);
             }
-            tempRaf.getFD().sync();
+            if (fsyncEnabled) tempRaf.getFD().sync();
         }
         
         synchronized(this) {
-            int currentExpectedSize = remainingEntries.size() + removeCount;
-            if (entries.size() < currentExpectedSize) {
+            if (entries.size() < initialSize) {
                 // Truncation happened during compaction! Abort to avoid restoring truncated entries.
                 tempFile.delete();
                 return;
             }
             
-            int addedCount = entries.size() - currentExpectedSize;
+            int addedCount = entries.size() - initialSize;
             if (addedCount > 0) {
-                List<RaftEntry> newlyAdded = entries.subList(entries.size() - addedCount, entries.size());
-                try (RandomAccessFile tempRaf = new RandomAccessFile(tempFile, "rw")) {
+                try (RandomAccessFile tempRaf = new RandomAccessFile(tempFile, "rw");
+                     RandomAccessFile readRaf = new RandomAccessFile(logPath.toFile(), "r")) {
                     tempRaf.seek(tempRaf.length());
-                    for (RaftEntry entry : newlyAdded) {
+                    readRaf.seek(filePositions.get(initialSize));
+                    for (int i = initialSize; i < entries.size(); i++) {
                         newPositions.add(tempRaf.getFilePointer());
-                        byte[] data = entry.toByteArray();
-                        tempRaf.writeInt(data.length);
+                        int length = readRaf.readInt();
+                        byte[] data = new byte[length];
+                        readRaf.readFully(data);
+                        tempRaf.writeInt(length);
                         tempRaf.write(data);
                     }
-                    tempRaf.getFD().sync();
+                    if (fsyncEnabled) tempRaf.getFD().sync();
                 }
             }
 
