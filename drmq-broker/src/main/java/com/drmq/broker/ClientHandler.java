@@ -63,8 +63,12 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, byte[] msg) throws Exception {
         MessageEnvelope envelope = MessageEnvelope.parseFrom(msg);
-        MessageEnvelope response = handleMessage(envelope);
-        ctx.writeAndFlush(response.toByteArray());
+        handleMessage(envelope).thenAccept(response -> {
+            ctx.writeAndFlush(response.toByteArray());
+        }).exceptionally(e -> {
+            logger.error("Unhandled error processing request", e);
+            return null;
+        });
     }
 
     @Override
@@ -77,129 +81,144 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
         ctx.close();
     }
 
-    private MessageEnvelope handleMessage(MessageEnvelope envelope) throws IOException {
+    private java.util.concurrent.CompletableFuture<MessageEnvelope> handleMessage(MessageEnvelope envelope) throws IOException {
         return switch (envelope.getType()) {
             case PRODUCE_REQUEST -> handleProduceRequest(envelope);
             case PRODUCE_BATCH_REQUEST -> handleProduceBatchRequest(envelope);
-            case CONSUME_REQUEST -> handleConsumeRequest(envelope);
+            case CONSUME_REQUEST -> java.util.concurrent.CompletableFuture.completedFuture(handleConsumeRequest(envelope));
             case COMMIT_OFFSET_REQUEST -> handleCommitOffsetRequest(envelope);
-            case FETCH_OFFSET_REQUEST -> handleFetchOffsetRequest(envelope);
-            case NACK_REQUEST -> handleNackRequest(envelope);
-            case REQUEST_VOTE_REQUEST -> handleRequestVoteRequest(envelope);
-            case PRE_VOTE_REQUEST -> handlePreVoteRequest(envelope);
-            case APPEND_ENTRIES_REQUEST -> handleAppendEntriesRequest(envelope);
-            case INSTALL_SNAPSHOT_REQUEST -> handleInstallSnapshotRequest(envelope);
-            case SEARCH_OFFSET_BY_TIME_REQUEST -> handleSearchOffsetByTimeRequest(envelope);
+            case FETCH_OFFSET_REQUEST -> java.util.concurrent.CompletableFuture.completedFuture(handleFetchOffsetRequest(envelope));
+            case NACK_REQUEST -> java.util.concurrent.CompletableFuture.completedFuture(handleNackRequest(envelope));
+            case REQUEST_VOTE_REQUEST -> java.util.concurrent.CompletableFuture.completedFuture(handleRequestVoteRequest(envelope));
+            case PRE_VOTE_REQUEST -> java.util.concurrent.CompletableFuture.completedFuture(handlePreVoteRequest(envelope));
+            case APPEND_ENTRIES_REQUEST -> java.util.concurrent.CompletableFuture.completedFuture(handleAppendEntriesRequest(envelope));
+            case INSTALL_SNAPSHOT_REQUEST -> java.util.concurrent.CompletableFuture.completedFuture(handleInstallSnapshotRequest(envelope));
+            case SEARCH_OFFSET_BY_TIME_REQUEST -> java.util.concurrent.CompletableFuture.completedFuture(handleSearchOffsetByTimeRequest(envelope));
             case ATOMIC_PRODUCE_REQUEST -> handleAtomicProduceRequest(envelope);
-            default -> createErrorResponse("Unknown message type: " + envelope.getType());
+            default -> java.util.concurrent.CompletableFuture.completedFuture(createErrorResponse("Unknown message type: " + envelope.getType()));
         };
     }
 
-    private MessageEnvelope handleProduceRequest(MessageEnvelope envelope) throws IOException {
+    private java.util.concurrent.CompletableFuture<MessageEnvelope> handleProduceRequest(MessageEnvelope envelope) {
         long startNanos = System.nanoTime();
-        long payloadBytes = 0;
         try {
             ProduceRequest request = ProduceRequest.parseFrom(envelope.getPayload());
 
             String topic = request.getTopic();
             byte[] payload = request.getPayload().toByteArray();
-            payloadBytes = payload.length;
+            long finalPayloadBytes = payload.length;
             String key = request.hasKey() ? request.getKey() : null;
             long timestamp = request.getTimestamp();
 
-            long offset;
+            java.util.concurrent.CompletableFuture<Long> offsetFuture;
             if (raftNode != null) {
                 if (!raftNode.isLeader()) {
                     String leaderAddr = raftNode.getLeaderAddress();
-                    return createProduceErrorResponse("NOT_LEADER:" +
-                            (leaderAddr != null ? leaderAddr : "UNKNOWN"), ErrorCode.NOT_LEADER);
+                    return java.util.concurrent.CompletableFuture.completedFuture(createProduceErrorResponse("NOT_LEADER:" +
+                            (leaderAddr != null ? leaderAddr : "UNKNOWN"), ErrorCode.NOT_LEADER));
                 }
-                offset = raftNode.propose(topic, payload, key, timestamp);
+                offsetFuture = raftNode.proposeAsync(topic, payload, key, timestamp);
             } else {
-                offset = messageStore.append(topic, payload, key, timestamp);
+                offsetFuture = java.util.concurrent.CompletableFuture.completedFuture(messageStore.append(topic, payload, key, timestamp));
             }
 
-            logger.debug("Produced message: topic={}, offset={}", topic, offset);
+            return offsetFuture.thenApply(offset -> {
+                logger.debug("Produced message: topic={}, offset={}", topic, offset);
 
-            ProduceResponse response = ProduceResponse.newBuilder()
-                    .setSuccess(true)
-                    .setOffset(offset)
-                    .build();
+                ProduceResponse response = ProduceResponse.newBuilder()
+                        .setSuccess(true)
+                        .setOffset(offset)
+                        .build();
 
-            BrokerMetrics.get().recordRequest("produce", true,
-                System.nanoTime() - startNanos, payloadBytes, 1);
+                BrokerMetrics.get().recordRequest("produce", true,
+                    System.nanoTime() - startNanos, finalPayloadBytes, 1);
 
-            return MessageEnvelope.newBuilder()
-                    .setType(MessageType.PRODUCE_RESPONSE)
-                    .setPayload(response.toByteString())
-                    .build();
+                return MessageEnvelope.newBuilder()
+                        .setType(MessageType.PRODUCE_RESPONSE)
+                        .setPayload(response.toByteString())
+                        .build();
+            }).exceptionally(e -> {
+                logger.error("Error processing produce request", e);
+                BrokerMetrics.get().recordRequest("produce", false,
+                    System.nanoTime() - startNanos, finalPayloadBytes, 1);
+                return createProduceErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR);
+            });
 
         } catch (Exception e) {
             logger.error("Error processing produce request", e);
             BrokerMetrics.get().recordRequest("produce", false,
-                System.nanoTime() - startNanos, payloadBytes, 1);
-            return createProduceErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR);
+                System.nanoTime() - startNanos, 0, 1);
+            return java.util.concurrent.CompletableFuture.completedFuture(createProduceErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR));
         }
     }
 
-    private MessageEnvelope handleProduceBatchRequest(MessageEnvelope envelope) throws IOException {
+    private java.util.concurrent.CompletableFuture<MessageEnvelope> handleProduceBatchRequest(MessageEnvelope envelope) {
         long startNanos = System.nanoTime();
-        long totalPayloadBytes = 0;
-        int batchCount = 0;
+        long payloadBytes = 0;
+        int count = 0;
         try {
             ProduceBatchRequest request = ProduceBatchRequest.parseFrom(envelope.getPayload());
 
             String topic = request.getTopic();
-            batchCount = request.getEntriesCount();
+            count = request.getEntriesCount();
+            final int finalBatchCount = count;
 
-            if (batchCount == 0) {
-                return createProduceBatchErrorResponse("Batch must contain at least one message", ErrorCode.UNKNOWN_ERROR);
+            if (finalBatchCount == 0) {
+                return java.util.concurrent.CompletableFuture.completedFuture(createProduceBatchErrorResponse("Batch must contain at least one message", ErrorCode.UNKNOWN_ERROR));
             }
-            if (batchCount > MAX_BATCH_MESSAGES) {
-                return createProduceBatchErrorResponse("Batch exceeds maximum message count of " + MAX_BATCH_MESSAGES, ErrorCode.UNKNOWN_ERROR);
+            if (finalBatchCount > MAX_BATCH_MESSAGES) {
+                return java.util.concurrent.CompletableFuture.completedFuture(createProduceBatchErrorResponse("Batch exceeds maximum message count of " + MAX_BATCH_MESSAGES, ErrorCode.UNKNOWN_ERROR));
             }
 
             for (var entry : request.getEntriesList()) {
-                totalPayloadBytes += entry.getPayload().size();
+                payloadBytes += entry.getPayload().size();
+            }
+            final long finalPayloadBytes = payloadBytes;
+
+            if (finalPayloadBytes > MAX_PAYLOAD_BYTES) {
+                return java.util.concurrent.CompletableFuture.completedFuture(createProduceBatchErrorResponse("Batch payload exceeds maximum size of " + MAX_PAYLOAD_BYTES + " bytes", ErrorCode.UNKNOWN_ERROR));
             }
 
-            if (totalPayloadBytes > MAX_PAYLOAD_BYTES) {
-                return createProduceBatchErrorResponse("Batch payload exceeds maximum size of " + MAX_PAYLOAD_BYTES + " bytes", ErrorCode.UNKNOWN_ERROR);
-            }
-
-            long baseOffset;
+            java.util.concurrent.CompletableFuture<Long> offsetFuture;
             if (raftNode != null) {
                 if (!raftNode.isLeader()) {
                     String leaderAddr = raftNode.getLeaderAddress();
-                    return createProduceBatchErrorResponse("NOT_LEADER:" +
-                            (leaderAddr != null ? leaderAddr : "UNKNOWN"), ErrorCode.NOT_LEADER);
+                    return java.util.concurrent.CompletableFuture.completedFuture(createProduceBatchErrorResponse("NOT_LEADER:" +
+                            (leaderAddr != null ? leaderAddr : "UNKNOWN"), ErrorCode.NOT_LEADER));
                 }
-                baseOffset = raftNode.proposeBatch(topic, request.getEntriesList());
+                offsetFuture = raftNode.proposeBatchAsync(topic, request.getEntriesList());
             } else {
-                baseOffset = messageStore.appendBatch(topic, request.getEntriesList());
+                offsetFuture = java.util.concurrent.CompletableFuture.completedFuture(messageStore.appendBatch(topic, request.getEntriesList()));
             }
 
-            logger.debug("Produced batch: topic={}, baseOffset={}, count={}", topic, baseOffset, batchCount);
+            return offsetFuture.thenApply(baseOffset -> {
+                logger.debug("Produced batch: topic={}, baseOffset={}, count={}", topic, baseOffset, finalBatchCount);
 
-            ProduceBatchResponse response = ProduceBatchResponse.newBuilder()
-                    .setSuccess(true)
-                    .setBaseOffset(baseOffset)
-                    .setCount(batchCount)
-                    .build();
+                ProduceBatchResponse response = ProduceBatchResponse.newBuilder()
+                        .setSuccess(true)
+                        .setBaseOffset(baseOffset)
+                        .setCount(finalBatchCount)
+                        .build();
 
-            BrokerMetrics.get().recordRequest("produce_batch", true,
-                System.nanoTime() - startNanos, totalPayloadBytes, batchCount);
+                BrokerMetrics.get().recordRequest("produce_batch", true,
+                    System.nanoTime() - startNanos, finalPayloadBytes, finalBatchCount);
 
-            return MessageEnvelope.newBuilder()
-                    .setType(MessageType.PRODUCE_BATCH_RESPONSE)
-                    .setPayload(response.toByteString())
-                    .build();
+                return MessageEnvelope.newBuilder()
+                        .setType(MessageType.PRODUCE_BATCH_RESPONSE)
+                        .setPayload(response.toByteString())
+                        .build();
+            }).exceptionally(e -> {
+                logger.error("Error processing produce batch request", e);
+                BrokerMetrics.get().recordRequest("produce_batch", false,
+                    System.nanoTime() - startNanos, finalPayloadBytes, finalBatchCount);
+                return createProduceBatchErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR);
+            });
 
         } catch (Exception e) {
             logger.error("Error processing produce batch request", e);
             BrokerMetrics.get().recordRequest("produce_batch", false,
-                System.nanoTime() - startNanos, totalPayloadBytes, batchCount);
-            return createProduceBatchErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR);
+                System.nanoTime() - startNanos, payloadBytes, count);
+            return java.util.concurrent.CompletableFuture.completedFuture(createProduceBatchErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR));
         }
     }
 
@@ -215,59 +234,68 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
                 .build();
     }
 
-    private MessageEnvelope handleAtomicProduceRequest(MessageEnvelope envelope) throws IOException {
+    private java.util.concurrent.CompletableFuture<MessageEnvelope> handleAtomicProduceRequest(MessageEnvelope envelope) {
         long startNanos = System.nanoTime();
-        long totalPayloadBytes = 0;
-        int batchCount = 0;
+        long payloadBytes = 0;
+        int count = 0;
         try {
             com.drmq.protocol.DRMQProtocol.AtomicProduceRequest request = com.drmq.protocol.DRMQProtocol.AtomicProduceRequest.parseFrom(envelope.getPayload());
 
             for (var slice : request.getSlicesList()) {
-                batchCount += slice.getEntriesCount();
+                count += slice.getEntriesCount();
                 for (var entry : slice.getEntriesList()) {
-                    totalPayloadBytes += entry.getPayload().size();
+                    payloadBytes += entry.getPayload().size();
                 }
             }
+            final int finalBatchCount = count;
+            final long finalPayloadBytes = payloadBytes;
 
-            if (batchCount == 0) {
-                return createAtomicProduceErrorResponse("Atomic batch must contain at least one message", ErrorCode.UNKNOWN_ERROR);
+            if (finalBatchCount == 0) {
+                return java.util.concurrent.CompletableFuture.completedFuture(createAtomicProduceErrorResponse("Atomic batch must contain at least one message", ErrorCode.UNKNOWN_ERROR));
             }
-            if (totalPayloadBytes > MAX_PAYLOAD_BYTES) {
-                return createAtomicProduceErrorResponse("Batch payload exceeds maximum size of " + MAX_PAYLOAD_BYTES + " bytes", ErrorCode.UNKNOWN_ERROR);
+            if (finalPayloadBytes > MAX_PAYLOAD_BYTES) {
+                return java.util.concurrent.CompletableFuture.completedFuture(createAtomicProduceErrorResponse("Batch payload exceeds maximum size of " + MAX_PAYLOAD_BYTES + " bytes", ErrorCode.UNKNOWN_ERROR));
             }
 
-            java.util.Map<String, Long> offsets;
+            java.util.concurrent.CompletableFuture<java.util.Map<String, Long>> offsetsFuture;
             if (raftNode != null) {
                 if (!raftNode.isLeader()) {
                     String leaderAddr = raftNode.getLeaderAddress();
-                    return createAtomicProduceErrorResponse("NOT_LEADER:" +
-                            (leaderAddr != null ? leaderAddr : "UNKNOWN"), ErrorCode.NOT_LEADER);
+                    return java.util.concurrent.CompletableFuture.completedFuture(createAtomicProduceErrorResponse("NOT_LEADER:" +
+                            (leaderAddr != null ? leaderAddr : "UNKNOWN"), ErrorCode.NOT_LEADER));
                 }
-                offsets = raftNode.proposeAtomicBatch(request.getSlicesList());
+                offsetsFuture = raftNode.proposeAtomicBatchAsync(request.getSlicesList());
             } else {
-                offsets = messageStore.appendAtomicBatch(request.getSlicesList());
+                offsetsFuture = java.util.concurrent.CompletableFuture.completedFuture(messageStore.appendAtomicBatch(request.getSlicesList()));
             }
 
-            logger.debug("Produced atomic batch: topics={}, count={}", offsets.keySet(), batchCount);
+            return offsetsFuture.thenApply(offsets -> {
+                logger.debug("Produced atomic batch: topics={}, count={}", offsets.keySet(), finalBatchCount);
 
-            com.drmq.protocol.DRMQProtocol.AtomicProduceResponse response = com.drmq.protocol.DRMQProtocol.AtomicProduceResponse.newBuilder()
-                    .setSuccess(true)
-                    .putAllBaseOffsets(offsets)
-                    .build();
+                com.drmq.protocol.DRMQProtocol.AtomicProduceResponse response = com.drmq.protocol.DRMQProtocol.AtomicProduceResponse.newBuilder()
+                        .setSuccess(true)
+                        .putAllBaseOffsets(offsets)
+                        .build();
 
-            BrokerMetrics.get().recordRequest("atomic_produce", true,
-                System.nanoTime() - startNanos, totalPayloadBytes, batchCount);
+                BrokerMetrics.get().recordRequest("atomic_produce", true,
+                    System.nanoTime() - startNanos, finalPayloadBytes, finalBatchCount);
 
-            return MessageEnvelope.newBuilder()
-                    .setType(MessageType.ATOMIC_PRODUCE_RESPONSE)
-                    .setPayload(response.toByteString())
-                    .build();
+                return MessageEnvelope.newBuilder()
+                        .setType(MessageType.ATOMIC_PRODUCE_RESPONSE)
+                        .setPayload(response.toByteString())
+                        .build();
+            }).exceptionally(e -> {
+                logger.error("Error processing atomic produce request", e);
+                BrokerMetrics.get().recordRequest("atomic_produce", false,
+                    System.nanoTime() - startNanos, finalPayloadBytes, finalBatchCount);
+                return createAtomicProduceErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR);
+            });
 
         } catch (Exception e) {
             logger.error("Error processing atomic produce request", e);
             BrokerMetrics.get().recordRequest("atomic_produce", false,
-                System.nanoTime() - startNanos, totalPayloadBytes, batchCount);
-            return createAtomicProduceErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR);
+                System.nanoTime() - startNanos, payloadBytes, count);
+            return java.util.concurrent.CompletableFuture.completedFuture(createAtomicProduceErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR));
         }
     }
 
@@ -450,7 +478,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
                 .build();
     }
 
-    private MessageEnvelope handleCommitOffsetRequest(MessageEnvelope envelope) throws IOException {
+    private java.util.concurrent.CompletableFuture<MessageEnvelope> handleCommitOffsetRequest(MessageEnvelope envelope) {
         long startNanos = System.nanoTime();
         try {
             CommitOffsetRequest request = CommitOffsetRequest.parseFrom(envelope.getPayload());
@@ -459,10 +487,13 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
             String topic = request.getTopic();
             long offset  = request.getOffset();
 
+            java.util.concurrent.CompletableFuture<Void> commitFuture = new java.util.concurrent.CompletableFuture<>();
+
             // Route through the coordinator if this group is actively coordinated
             if (groupCoordinator != null && groupCoordinator.isGroupActive(group, topic)) {
                 String consumerId = request.hasConsumerId() ? request.getConsumerId() : group;
                 groupCoordinator.commitOffset(group, topic, consumerId, offset);
+                commitFuture.complete(null);
             } else if (raftNode != null) {
                 if (!raftNode.isLeader()) {
                     String leaderAddr = raftNode.getLeaderAddress();
@@ -471,29 +502,44 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
                             .setErrorMessage("NOT_LEADER:" +
                                     (leaderAddr != null ? leaderAddr : "UNKNOWN"))
                             .build();
-                    return MessageEnvelope.newBuilder()
+                    return java.util.concurrent.CompletableFuture.completedFuture(MessageEnvelope.newBuilder()
                             .setType(MessageType.COMMIT_OFFSET_RESPONSE)
                             .setPayload(response.toByteString())
-                            .build();
+                            .build());
                 }
-                raftNode.proposeOffsetCommit(group, topic, offset);
+                commitFuture = raftNode.proposeOffsetCommitAsync(group, topic, offset).thenApply(idx -> null);
             } else {
                 offsetManager.commit(group, topic, offset);
+                commitFuture.complete(null);
             }
 
-            logger.debug("Committed offset: group={}, topic={}, offset={}", group, topic, offset);
+            return commitFuture.thenApply(v -> {
+                logger.debug("Committed offset: group={}, topic={}, offset={}", group, topic, offset);
 
-            CommitOffsetResponse response = CommitOffsetResponse.newBuilder()
-                    .setSuccess(true)
-                    .build();
+                CommitOffsetResponse response = CommitOffsetResponse.newBuilder()
+                        .setSuccess(true)
+                        .build();
 
-            BrokerMetrics.get().recordRequest("commit_offset", true,
-                System.nanoTime() - startNanos, 0, 0);
+                BrokerMetrics.get().recordRequest("commit_offset", true,
+                    System.nanoTime() - startNanos, 0, 0);
 
-            return MessageEnvelope.newBuilder()
-                    .setType(MessageType.COMMIT_OFFSET_RESPONSE)
-                    .setPayload(response.toByteString())
-                    .build();
+                return MessageEnvelope.newBuilder()
+                        .setType(MessageType.COMMIT_OFFSET_RESPONSE)
+                        .setPayload(response.toByteString())
+                        .build();
+            }).exceptionally(e -> {
+                logger.error("Error committing offset", e);
+                BrokerMetrics.get().recordRequest("commit_offset", false,
+                    System.nanoTime() - startNanos, 0, 0);
+                CommitOffsetResponse response = CommitOffsetResponse.newBuilder()
+                        .setSuccess(false)
+                        .setErrorMessage(e.getMessage() != null ? e.getMessage() : "Unknown error")
+                        .build();
+                return MessageEnvelope.newBuilder()
+                        .setType(MessageType.COMMIT_OFFSET_RESPONSE)
+                        .setPayload(response.toByteString())
+                        .build();
+            });
 
         } catch (Exception e) {
             logger.error("Error committing offset", e);
@@ -503,10 +549,10 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
                     .setSuccess(false)
                     .setErrorMessage(e.getMessage() != null ? e.getMessage() : "Unknown error")
                     .build();
-            return MessageEnvelope.newBuilder()
+            return java.util.concurrent.CompletableFuture.completedFuture(MessageEnvelope.newBuilder()
                     .setType(MessageType.COMMIT_OFFSET_RESPONSE)
                     .setPayload(response.toByteString())
-                    .build();
+                    .build());
         }
     }
 

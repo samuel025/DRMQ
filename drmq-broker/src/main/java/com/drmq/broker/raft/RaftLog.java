@@ -5,30 +5,32 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.*;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
 /**
  * Persistent Raft log — the ordered sequence of commands that all nodes agree on.
- *
- * Every proposed message or offset commit is first appended here as a RaftEntry,
- * then replicated to followers. Once a majority of nodes have the entry, it is
- * considered "committed" and applied to the state machine (MessageStore/OffsetManager).
- *
- * Indexing: The Raft log is 1-indexed (index 0 is a sentinel meaning "no entry").
- * Internally, entries are stored in a 0-indexed ArrayList, so raft index N maps
- * to list index N-1. 
+ * Uses mmap (FileChannel.map) for zero-copy off-heap persistence.
  */
 public class RaftLog {
     private static final Logger logger = LoggerFactory.getLogger(RaftLog.class);
 
+    private static final int INITIAL_MAPPED_SIZE = 16 * 1024 * 1024; // 16 MB
+
     private final Path logPath;
     private final List<RaftEntry> entries;       
     private final List<Long> filePositions;     
-    private RandomAccessFile raf;
+    
+    private FileChannel fileChannel;
+    private MappedByteBuffer mappedBuffer;
+    private long logicalFileSize = 0;
+    
     private long startIndex = 1;
     private final boolean fsyncEnabled;
 
@@ -39,92 +41,134 @@ public class RaftLog {
         this.logPath = raftDir.resolve("raft.log");
         this.entries = new ArrayList<>();
         this.filePositions = new ArrayList<>();
-        this.raf = new RandomAccessFile(logPath.toFile(), "rw");
+        
+        openChannelAndMap();
         recover();
     }
+    
+    private void openChannelAndMap() throws IOException {
+        this.fileChannel = FileChannel.open(logPath, 
+                StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
+        long fileSize = fileChannel.size();
+        long mapSize = Math.max(fileSize, INITIAL_MAPPED_SIZE);
+        this.mappedBuffer = fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, mapSize);
+    }
+    
+    private void ensureCapacity(int additionalBytes) throws IOException {
+        if (logicalFileSize + additionalBytes > mappedBuffer.capacity()) {
+            long newCapacity = Math.max(mappedBuffer.capacity() * 2L, logicalFileSize + additionalBytes + INITIAL_MAPPED_SIZE);
+            if (newCapacity > Integer.MAX_VALUE) {
+                throw new IOException("Raft log exceeded 2GB limit of MappedByteBuffer segment");
+            }
+            int pos = mappedBuffer.position();
+            mappedBuffer = fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, newCapacity);
+            mappedBuffer.position(pos);
+        }
+    }
 
-    /**
-     * Recovery: read all entries from the log file on disk.
-     */
     private void recover() throws IOException {
-        long fileLength = raf.length();
+        long fileLength = fileChannel.size();
         if (fileLength == 0) {
             logger.info("Raft log is empty, starting fresh");
             return;
         }
 
-        raf.seek(0);
+        mappedBuffer.position(0);
         int count = 0;
-        while (raf.getFilePointer() < fileLength) {
-            long entryStart = raf.getFilePointer();
+        
+        while (mappedBuffer.position() < fileLength) {
+            long entryStart = mappedBuffer.position();
             try {
-                int length = raf.readInt();
+                if (mappedBuffer.remaining() < 4) break;
+                
+                int length = mappedBuffer.getInt();
                 if (length <= 0 || length > 10 * 1024 * 1024) {
-                    logger.warn("Corrupt entry at pos {}, truncating", entryStart);
-                    raf.setLength(entryStart);
+                    if (length != 0) {
+                        logger.warn("Corrupt entry at pos {}, truncating", entryStart);
+                    }
+                    logicalFileSize = entryStart;
                     break;
                 }
+                if (mappedBuffer.remaining() < length) {
+                    logger.warn("Incomplete entry at pos {}, truncating", entryStart);
+                    logicalFileSize = entryStart;
+                    break;
+                }
+                
                 byte[] data = new byte[length];
-                raf.readFully(data);
+                mappedBuffer.get(data);
+                
                 RaftEntry entry = RaftEntry.parseFrom(data);
                 entries.add(entry.toBuilder().clearPayload().build());
                 filePositions.add(entryStart);
                 count++;
-            } catch (EOFException e) {
-                logger.warn("Unexpected EOF during raft log recovery, truncating");
-                raf.setLength(entryStart);
+                logicalFileSize = mappedBuffer.position();
+            } catch (Exception e) {
+                logger.warn("Error during raft log recovery at pos {}, truncating", entryStart);
+                logicalFileSize = entryStart;
                 break;
             }
         }
+        
+        // Truncate file physical size to logical file size to remove garbage
+        fileChannel.truncate(logicalFileSize);
+        mappedBuffer = fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, Math.max(logicalFileSize, INITIAL_MAPPED_SIZE));
+        mappedBuffer.position((int) logicalFileSize);
+        
         if (!entries.isEmpty()) {
             startIndex = entries.get(0).getIndex();
         }
-        logger.info("Raft log recovered: {} entries, startIndex={}, lastIndex={}, lastTerm={}",
-                count, startIndex, getLastIndex(), getLastTerm());
+        logger.info("Raft log recovered: {} entries, startIndex={}, lastIndex={}, lastTerm={}, logicalFileSize={}",
+                count, startIndex, getLastIndex(), getLastTerm(), logicalFileSize);
     }
 
-    /**
-     * Append an entry to the log. Writes to disk immediately.
-     */
     public synchronized void append(RaftEntry entry) throws IOException {
-        long entryStart = raf.length();
-        raf.seek(entryStart);
-        try {
-            byte[] data = entry.toByteArray();
-            raf.writeInt(data.length);
-            raf.write(data);
-            if (fsyncEnabled) raf.getFD().sync(); 
-        } catch (IOException e) {
-            raf.setLength(entryStart);
-            throw e;
+        byte[] data = entry.toByteArray();
+        ensureCapacity(4 + data.length);
+        
+        long entryStart = logicalFileSize;
+        mappedBuffer.position((int) entryStart);
+        
+        mappedBuffer.putInt(data.length);
+        mappedBuffer.put(data);
+        
+        logicalFileSize = mappedBuffer.position();
+        
+        if (fsyncEnabled) {
+            mappedBuffer.force();
         }
+        
         entries.add(entry.toBuilder().clearPayload().build());
         filePositions.add(entryStart);
         logger.debug("Appended raft entry: index={}, term={}", entry.getIndex(), entry.getTerm());
     }
 
-    /**
-     * Append a list of entries to the log. Writes to disk immediately with a single fsync.
-     */
     public synchronized void append(List<RaftEntry> batch) throws IOException {
         if (batch.isEmpty()) return;
         
-        long entryStart = raf.length();
-        raf.seek(entryStart);
+        int totalRequired = 0;
+        List<byte[]> serializedBatch = new ArrayList<>(batch.size());
+        for (RaftEntry entry : batch) {
+            byte[] data = entry.toByteArray();
+            serializedBatch.add(data);
+            totalRequired += 4 + data.length;
+        }
         
+        ensureCapacity(totalRequired);
+        
+        mappedBuffer.position((int) logicalFileSize);
         List<Long> newPositions = new ArrayList<>(batch.size());
-        try {
-            for (RaftEntry entry : batch) {
-                newPositions.add(raf.getFilePointer());
-                byte[] data = entry.toByteArray();
-                raf.writeInt(data.length);
-                raf.write(data);
-            }
-            
-            if (fsyncEnabled) raf.getFD().sync(); 
-        } catch (IOException e) {
-            raf.setLength(entryStart);
-            throw e;
+        
+        for (byte[] data : serializedBatch) {
+            newPositions.add((long) mappedBuffer.position());
+            mappedBuffer.putInt(data.length);
+            mappedBuffer.put(data);
+        }
+        
+        logicalFileSize = mappedBuffer.position();
+        
+        if (fsyncEnabled) {
+            mappedBuffer.force();
         }
         
         for (RaftEntry e : batch) {
@@ -135,10 +179,6 @@ public class RaftLog {
                 batch.size(), batch.get(0).getIndex(), batch.get(batch.size() - 1).getIndex());
     }
 
-    /**
-     * Get entry at the given Raft index (1-indexed).
-     * Returns null if index is out of bounds.
-     */
     public synchronized RaftEntry getEntry(long index) {
         if (index < startIndex || index > getLastIndex()) {
             return null;
@@ -146,24 +186,23 @@ public class RaftLog {
         int listIndex = (int) (index - startIndex);
         try {
             long pos = filePositions.get(listIndex);
-            long originalPos = raf.getFilePointer();
-            raf.seek(pos);
-            int length = raf.readInt();
+            
+            int originalPos = mappedBuffer.position();
+            mappedBuffer.position((int) pos);
+            
+            int length = mappedBuffer.getInt();
             byte[] data = new byte[length];
-            raf.readFully(data);
-            raf.seek(originalPos);
+            mappedBuffer.get(data);
+            
+            mappedBuffer.position(originalPos);
+            
             return RaftEntry.parseFrom(data);
-        } catch (IOException e) {
-            logger.error("Failed to read raft entry at index {} from disk", index, e);
+        } catch (Exception e) {
+            logger.error("Failed to read raft entry at index {} from mapped buffer", index, e);
             return null;
         }
     }
 
-    /**
-     * Get all entries from the given Raft index (inclusive) to the end.
-     */
-    /** Maximum number of log entries sent in a single AppendEntries RPC.
-     * Prevents oversized frames when catching up a lagging follower. */
     public static final int MAX_ENTRIES_PER_RPC = 500;
 
     public synchronized List<RaftEntry> getEntriesFrom(long fromIndex) {
@@ -184,13 +223,14 @@ public class RaftLog {
         int maxBytes = 2 * 1024 * 1024; // 2 MB limit per RPC
         
         try {
-            long originalPos = raf.getFilePointer();
-            raf.seek(filePositions.get(from));
+            int originalPos = mappedBuffer.position();
+            mappedBuffer.position((int) (long) filePositions.get(from));
+            
             int to = from;
             while (to < entries.size() && to - from < maxEntries) {
-                int length = raf.readInt();
+                int length = mappedBuffer.getInt();
                 byte[] data = new byte[length];
-                raf.readFully(data);
+                mappedBuffer.get(data);
                 RaftEntry entry = RaftEntry.parseFrom(data);
                 
                 long entrySize = entry.getSerializedSize();
@@ -201,69 +241,42 @@ public class RaftLog {
                 result.add(entry);
                 to++;
             }
-            raf.seek(originalPos);
-        } catch (IOException e) {
-            logger.error("Failed to read raft entries from disk", e);
+            mappedBuffer.position(originalPos);
+        } catch (Exception e) {
+            logger.error("Failed to read raft entries from mapped buffer", e);
         }
         
         return result;
     }
 
-    /**
-     * Get the Raft index of the last entry, or the last compacted index if the log is empty.
-     */
     public synchronized long getLastIndex() {
         if (entries.isEmpty()) return Math.max(0, startIndex - 1);
         return entries.get(entries.size() - 1).getIndex();
     }
 
-    /**
-     * Set the start index manually, used during recovery if the log is completely empty
-     * but the node has previously applied a snapshot.
-     */
     public synchronized void setStartIndex(long index) {
         this.startIndex = index;
     }
 
-    /**
-     * Get the starting index of the Raft log (useful to know if log was compacted).
-     */
     public synchronized long getStartIndex() {
         return startIndex;
     }
 
-    /**
-     * Get the term of the last entry, or 0 if the log is empty.
-     */
     public synchronized long getLastTerm() {
         if (entries.isEmpty()) return 0;
         return entries.get(entries.size() - 1).getTerm();
     }
 
-    /**
-     * Get the term of the entry at the given index.
-     * Returns 0 if index is 0 or out of range.
-     */
     public synchronized long getTermAt(long index) {
         if (index == 0) return 0;
         RaftEntry entry = getEntry(index);
         return entry != null ? entry.getTerm() : 0;
     }
 
-    /**
-     * Get the total number of entries in the log.
-     */
     public synchronized int size() {
         return entries.size();
     }
 
-    /**
-     * Truncate all entries from the given index onwards (inclusive).
-     * Used when a follower detects conflicting entries from a new leader .
-     *
-     * Crash-safe: uses setLength() to truncate the file to the byte position
-     * of the first removed entry, which is atomic on most filesystems.
-     */
     public synchronized void truncateFrom(long fromIndex) throws IOException {
         if (fromIndex < startIndex || fromIndex > getLastIndex() + 1) {
             return;
@@ -278,17 +291,20 @@ public class RaftLog {
         logger.warn("Truncating raft log from index {} (removing {} entries, truncating file to byte {})",
                 fromIndex, entries.size() - removeFromListIndex, truncateToPosition);
 
-        raf.setLength(truncateToPosition);
-        if (fsyncEnabled) raf.getFD().sync();
+        logicalFileSize = truncateToPosition;
+        fileChannel.truncate(logicalFileSize);
+        // Remap to adjust boundaries
+        mappedBuffer = fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, Math.max(logicalFileSize, INITIAL_MAPPED_SIZE));
+        mappedBuffer.position((int) logicalFileSize);
+        
+        if (fsyncEnabled) {
+            mappedBuffer.force();
+        }
 
         entries.subList(removeFromListIndex, entries.size()).clear();
         filePositions.subList(removeFromListIndex, filePositions.size()).clear();
     }
 
-    /**
-     * Compact the Raft log by removing entries from memory up to the given index,
-     * and rewriting the log file on disk to reclaim space.
-     */
     public void compact(long upToIndex) throws IOException {
         int removeCount;
         int initialSize;
@@ -304,68 +320,90 @@ public class RaftLog {
         java.io.File tempFile = new java.io.File(logPath.getParent().toFile(), logPath.getFileName().toString() + ".tmp");
         List<Long> newPositions = new ArrayList<>(initialSize - removeCount);
         
-        try (RandomAccessFile tempRaf = new RandomAccessFile(tempFile, "rw");
-             RandomAccessFile readRaf = new RandomAccessFile(logPath.toFile(), "r")) {
+        long newLogicalFileSize = 0;
+        try (FileChannel tempChannel = FileChannel.open(tempFile.toPath(), StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            
+            MappedByteBuffer tempMapped = tempChannel.map(FileChannel.MapMode.READ_WRITE, 0, Math.max(logicalFileSize, INITIAL_MAPPED_SIZE));
+            
             long startReadPos;
             synchronized(this) {
-                startReadPos = filePositions.get(removeCount);
+                if (removeCount < initialSize) {
+                    startReadPos = filePositions.get(removeCount);
+                } else {
+                    startReadPos = logicalFileSize;
+                }
             }
-            readRaf.seek(startReadPos);
+            
+            int originalPos = mappedBuffer.position();
+            mappedBuffer.position((int) startReadPos);
+            
             for (int i = removeCount; i < initialSize; i++) {
-                newPositions.add(tempRaf.getFilePointer());
-                int length = readRaf.readInt();
+                newPositions.add((long) tempMapped.position());
+                int length = mappedBuffer.getInt();
                 byte[] data = new byte[length];
-                readRaf.readFully(data);
-                tempRaf.writeInt(length);
-                tempRaf.write(data);
+                mappedBuffer.get(data);
+                
+                tempMapped.putInt(length);
+                tempMapped.put(data);
             }
-            if (fsyncEnabled) tempRaf.getFD().sync();
+            mappedBuffer.position(originalPos);
+            
+            newLogicalFileSize = tempMapped.position();
+            if (fsyncEnabled) tempMapped.force();
+            tempChannel.truncate(newLogicalFileSize);
         }
         
         synchronized(this) {
             if (entries.size() < initialSize) {
-                // Truncation happened during compaction! Abort to avoid restoring truncated entries.
                 tempFile.delete();
                 return;
             }
             
             int addedCount = entries.size() - initialSize;
             if (addedCount > 0) {
-                try (RandomAccessFile tempRaf = new RandomAccessFile(tempFile, "rw");
-                     RandomAccessFile readRaf = new RandomAccessFile(logPath.toFile(), "r")) {
-                    tempRaf.seek(tempRaf.length());
-                    readRaf.seek(filePositions.get(initialSize));
+                try (FileChannel tempChannel = FileChannel.open(tempFile.toPath(), StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+                    long mapSize = Math.max(newLogicalFileSize + (logicalFileSize - filePositions.get(initialSize)), INITIAL_MAPPED_SIZE);
+                    MappedByteBuffer tempMapped = tempChannel.map(FileChannel.MapMode.READ_WRITE, 0, mapSize);
+                    tempMapped.position((int) newLogicalFileSize);
+                    
+                    int originalPos = mappedBuffer.position();
+                    mappedBuffer.position((int) (long) filePositions.get(initialSize));
+                    
                     for (int i = initialSize; i < entries.size(); i++) {
-                        newPositions.add(tempRaf.getFilePointer());
-                        int length = readRaf.readInt();
+                        newPositions.add((long) tempMapped.position());
+                        int length = mappedBuffer.getInt();
                         byte[] data = new byte[length];
-                        readRaf.readFully(data);
-                        tempRaf.writeInt(length);
-                        tempRaf.write(data);
+                        mappedBuffer.get(data);
+                        
+                        tempMapped.putInt(length);
+                        tempMapped.put(data);
                     }
-                    if (fsyncEnabled) tempRaf.getFD().sync();
+                    mappedBuffer.position(originalPos);
+                    
+                    newLogicalFileSize = tempMapped.position();
+                    if (fsyncEnabled) tempMapped.force();
+                    tempChannel.truncate(newLogicalFileSize);
                 }
             }
 
-            // Swap files
-            raf.close();
+            fileChannel.close();
             try {
                 java.nio.file.Files.move(tempFile.toPath(), logPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
             } catch (Exception e) {
                 try {
-                    raf = new RandomAccessFile(logPath.toFile(), "rw");
-                    raf.seek(raf.length());
+                    openChannelAndMap();
                 } catch (Exception ignore) {
                 }
                 throw e;
             }
 
             try {
-                raf = new RandomAccessFile(logPath.toFile(), "rw");
+                openChannelAndMap();
+                logicalFileSize = newLogicalFileSize;
+                mappedBuffer.position((int) logicalFileSize);
             } catch (IOException e) {
                 throw new IOException("Failed to reopen compacted log: " + logPath, e);
             }
-            raf.seek(raf.length());
             
             entries.subList(0, removeCount).clear();
             filePositions.clear();
@@ -376,13 +414,10 @@ public class RaftLog {
         }
     }
 
-    /**
-     * Close the log file.
-     */
     public synchronized void close() throws IOException {
-        if (raf != null) {
-            raf.close();
+        if (fileChannel != null) {
+            fileChannel.truncate(logicalFileSize);
+            fileChannel.close();
         }
     }
 }
-

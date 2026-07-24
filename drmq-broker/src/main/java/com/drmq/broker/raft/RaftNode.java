@@ -927,22 +927,26 @@ public class RaftNode {
      * Blocks until the entry is committed (majority ACK) or times out.
 
      */
-    public long propose(String topic, byte[] payload, String key, long timestamp) throws IOException {
+    public CompletableFuture<Long> proposeAsync(String topic, byte[] payload, String key, long timestamp) {
         lock.lock();
         long index;
         long proposalTerm;
         CompletableFuture<Long> future;
         try {
             if (state != RaftState.LEADER) {
-                throw new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
+                CompletableFuture<Long> err = new CompletableFuture<>();
+                err.completeExceptionally(new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN")));
+                return err;
             }
 
             proposalTerm = currentTerm;
             index = raftLog.getLastIndex() + 1;
 
             if (pendingProposals.size() >= MAX_PENDING_PROPOSALS) {
-                throw new IOException("Too many pending proposals (" + pendingProposals.size()
-                        + "/" + MAX_PENDING_PROPOSALS + ")");
+                CompletableFuture<Long> err = new CompletableFuture<>();
+                err.completeExceptionally(new IOException("Too many pending proposals (" + pendingProposals.size()
+                        + "/" + MAX_PENDING_PROPOSALS + ")"));
+                return err;
             }
 
             RaftEntry.Builder entryBuilder = RaftEntry.newBuilder()
@@ -962,28 +966,41 @@ public class RaftNode {
             future = new CompletableFuture<>();
             pendingProposals.put(index, new ProposalState(proposalTerm, future));
 
+        } catch (Exception e) {
+            CompletableFuture<Long> err = new CompletableFuture<>();
+            err.completeExceptionally(e);
+            return err;
         } finally {
             lock.unlock();
         }
         
         sendHeartbeats();
+        final long finalIndex = index;
+        return future.orTimeout(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .exceptionally(e -> {
+                    if (e instanceof java.util.concurrent.TimeoutException) {
+                        ProposalState ps = pendingProposals.get(finalIndex);
+                        if (ps != null) {
+                            ps.timedOut = true;
+                            if (pendingProposals.size() > MAX_PENDING_PROPOSALS / 2) {
+                                logger.warn("[{}] High number of pending proposals: {} (threshold: {})",
+                                        nodeId, pendingProposals.size(), MAX_PENDING_PROPOSALS);
+                            }
+                        }
+                        throw new java.util.concurrent.CompletionException(new IOException("Raft proposal timed out (index=" + finalIndex + "); entry may still commit"));
+                    }
+                    throw new java.util.concurrent.CompletionException(new IOException("Raft proposal failed: " + e.getMessage(), e));
+                });
+    }
+
+    public long propose(String topic, byte[] payload, String key, long timestamp) throws IOException {
         try {
-            return future.get(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        } catch (TimeoutException e) {
-            ProposalState ps = pendingProposals.get(index);
-            if (ps != null) {
-                ps.timedOut = true;
-                if (pendingProposals.size() > MAX_PENDING_PROPOSALS / 2) {
-                    logger.warn("[{}] High number of pending proposals: {} (threshold: {})",
-                            nodeId, pendingProposals.size(), MAX_PENDING_PROPOSALS);
-                }
+            return proposeAsync(topic, payload, key, timestamp).join();
+        } catch (java.util.concurrent.CompletionException e) {
+            if (e.getCause() instanceof IOException) {
+                throw (IOException) e.getCause();
             }
-            throw new IOException("Raft proposal timed out (index=" + index + "); entry may still commit");
-        } catch (ExecutionException e) {
-            throw new IOException("Raft proposal failed: " + e.getCause().getMessage());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Raft proposal interrupted");
+            throw new IOException(e.getCause());
         }
     }
 
@@ -996,22 +1013,26 @@ public class RaftNode {
      * @param entries The batch entries from the ProduceBatchRequest
      * @return The base offset (offset of the first message in the batch)
      */
-    public long proposeBatch(String topic, List<ProduceBatchRequest.BatchEntry> entries) throws IOException {
+    public CompletableFuture<Long> proposeBatchAsync(String topic, List<ProduceBatchRequest.BatchEntry> entries) {
         lock.lock();
         long index;
         long proposalTerm;
         CompletableFuture<Long> future;
         try {
             if (state != RaftState.LEADER) {
-                throw new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
+                CompletableFuture<Long> err = new CompletableFuture<>();
+                err.completeExceptionally(new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN")));
+                return err;
             }
 
             proposalTerm = currentTerm;
             index = raftLog.getLastIndex() + 1;
 
             if (pendingProposals.size() >= MAX_PENDING_PROPOSALS) {
-                throw new IOException("Too many pending proposals (" + pendingProposals.size()
-                        + "/" + MAX_PENDING_PROPOSALS + ")");
+                CompletableFuture<Long> err = new CompletableFuture<>();
+                err.completeExceptionally(new IOException("Too many pending proposals (" + pendingProposals.size()
+                        + "/" + MAX_PENDING_PROPOSALS + ")"));
+                return err;
             }
 
             ProduceBatchRequest batchPayload = ProduceBatchRequest.newBuilder()
@@ -1031,27 +1052,40 @@ public class RaftNode {
             future = new CompletableFuture<>();
             pendingProposals.put(index, new ProposalState(proposalTerm, future));
 
+        } catch (Exception e) {
+            CompletableFuture<Long> err = new CompletableFuture<>();
+            err.completeExceptionally(e);
+            return err;
         } finally {
             lock.unlock();
         }
         sendHeartbeats();
+        final long finalIndex = index;
+        return future.orTimeout(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .exceptionally(e -> {
+                    if (e instanceof java.util.concurrent.TimeoutException) {
+                        ProposalState ps = pendingProposals.get(finalIndex);
+                        if (ps != null) {
+                            ps.timedOut = true;
+                            if (pendingProposals.size() > MAX_PENDING_PROPOSALS / 2) {
+                                logger.warn("[{}] High number of pending proposals: {} (threshold: {})",
+                                        nodeId, pendingProposals.size(), MAX_PENDING_PROPOSALS);
+                            }
+                        }
+                        throw new java.util.concurrent.CompletionException(new IOException("Raft batch proposal timed out (index=" + finalIndex + "); entry may still commit"));
+                    }
+                    throw new java.util.concurrent.CompletionException(new IOException("Raft batch proposal failed: " + e.getMessage(), e));
+                });
+    }
+
+    public long proposeBatch(String topic, List<ProduceBatchRequest.BatchEntry> entries) throws IOException {
         try {
-            return future.get(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        } catch (TimeoutException e) {
-            ProposalState ps = pendingProposals.get(index);
-            if (ps != null) {
-                ps.timedOut = true;
-                if (pendingProposals.size() > MAX_PENDING_PROPOSALS / 2) {
-                    logger.warn("[{}] High number of pending proposals: {} (threshold: {})",
-                            nodeId, pendingProposals.size(), MAX_PENDING_PROPOSALS);
-                }
+            return proposeBatchAsync(topic, entries).join();
+        } catch (java.util.concurrent.CompletionException e) {
+            if (e.getCause() instanceof IOException) {
+                throw (IOException) e.getCause();
             }
-            throw new IOException("Raft batch proposal timed out (index=" + index + "); entry may still commit");
-        } catch (ExecutionException e) {
-            throw new IOException("Raft batch proposal failed: " + e.getCause().getMessage());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Raft batch proposal interrupted");
+            throw new IOException(e.getCause());
         }
     }
 
@@ -1062,10 +1096,11 @@ public class RaftNode {
      * @param slices  list of (topic, entries) pairs — must contain ≥2 topics
      * @return map of topic -> base offset, populated after commit
      */
-    public Map<String, Long> proposeAtomicBatch(List<AtomicBatchTopicSlice> slices) throws IOException {
+    public CompletableFuture<Map<String, Long>> proposeAtomicBatchAsync(List<AtomicBatchTopicSlice> slices) {
         if (slices.size() < 2) {
-            throw new IllegalArgumentException(
-                "ATOMIC_BATCH requires at least 2 topics. Use proposeBatch() for single-topic.");
+            CompletableFuture<Map<String, Long>> err = new CompletableFuture<>();
+            err.completeExceptionally(new IllegalArgumentException("ATOMIC_BATCH requires at least 2 topics. Use proposeBatch() for single-topic."));
+            return err;
         }
 
         lock.lock();
@@ -1074,15 +1109,19 @@ public class RaftNode {
         CompletableFuture<Long> future;
         try {
             if (state != RaftState.LEADER) {
-                throw new IOException("NOT_LEADER:" +
-                    (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
+                CompletableFuture<Map<String, Long>> err = new CompletableFuture<>();
+                err.completeExceptionally(new IOException("NOT_LEADER:" +
+                    (leaderId != null ? getLeaderAddress() : "UNKNOWN")));
+                return err;
             }
 
             proposalTerm = currentTerm;
             index = raftLog.getLastIndex() + 1;
 
             if (pendingProposals.size() >= MAX_PENDING_PROPOSALS) {
-                throw new IOException("Too many pending proposals");
+                CompletableFuture<Map<String, Long>> err = new CompletableFuture<>();
+                err.completeExceptionally(new IOException("Too many pending proposals"));
+                return err;
             }
 
             AtomicBatchRequest payload = AtomicBatchRequest.newBuilder()
@@ -1103,26 +1142,47 @@ public class RaftNode {
             future = new CompletableFuture<>();
             pendingProposals.put(index, new ProposalState(proposalTerm, future));
 
+        } catch (Exception e) {
+            CompletableFuture<Map<String, Long>> err = new CompletableFuture<>();
+            err.completeExceptionally(e);
+            return err;
         } finally {
             lock.unlock();
         }
         sendHeartbeats();
+        
+        return future.orTimeout(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .thenApply(commitIndex -> {
+                    Map<String, Long> offsets = new java.util.LinkedHashMap<>();
+                    for (com.drmq.protocol.DRMQProtocol.AtomicBatchTopicSlice s : slices) {
+                        offsets.put(s.getTopic(),
+                            messageStore.getHeadOffset(s.getTopic()) - s.getEntriesCount() + 1);
+                    }
+                    return offsets;
+                })
+                .exceptionally(e -> {
+                    if (e instanceof java.util.concurrent.TimeoutException) {
+                        throw new java.util.concurrent.CompletionException(new IOException("Atomic batch proposal timed out"));
+                    }
+                    if (e.getCause() instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
+                        throw new java.util.concurrent.CompletionException(new IOException("Interrupted"));
+                    }
+                    throw new java.util.concurrent.CompletionException(new IOException("Atomic batch proposal failed: " + e.getMessage(), e));
+                });
+    }
+
+    public Map<String, Long> proposeAtomicBatch(List<AtomicBatchTopicSlice> slices) throws IOException {
         try {
-            future.get(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            // After commit, fetch offsets from the message store
-            Map<String, Long> offsets = new java.util.LinkedHashMap<>();
-            for (com.drmq.protocol.DRMQProtocol.AtomicBatchTopicSlice s : slices) {
-                offsets.put(s.getTopic(),
-                    messageStore.getHeadOffset(s.getTopic()) - s.getEntriesCount() + 1);
+            return proposeAtomicBatchAsync(slices).join();
+        } catch (java.util.concurrent.CompletionException e) {
+            if (e.getCause() instanceof IOException) {
+                throw (IOException) e.getCause();
             }
-            return offsets;
-        } catch (TimeoutException e) {
-            throw new IOException("Atomic batch proposal timed out");
-        } catch (ExecutionException e) {
-            throw new IOException("Atomic batch proposal failed: " + e.getCause().getMessage());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Interrupted");
+            if (e.getCause() instanceof RuntimeException) {
+                throw (RuntimeException) e.getCause();
+            }
+            throw new IOException(e.getCause());
         }
     }
     /**
@@ -1135,22 +1195,26 @@ public class RaftNode {
      * @return the committed Raft log index
      * @throws IOException if not leader, or commitment fails
      */
-    public long proposeOffsetCommit(String consumerGroup, String topic, long offset) throws IOException {
+    public CompletableFuture<Long> proposeOffsetCommitAsync(String consumerGroup, String topic, long offset) {
         lock.lock();
         long index;
         long proposalTerm;
         CompletableFuture<Long> future;
         try {
             if (state != RaftState.LEADER) {
-                throw new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
+                CompletableFuture<Long> err = new CompletableFuture<>();
+                err.completeExceptionally(new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN")));
+                return err;
             }
 
             proposalTerm = currentTerm;
             index = raftLog.getLastIndex() + 1;
 
             if (pendingProposals.size() >= MAX_PENDING_PROPOSALS) {
-                throw new IOException("Too many pending proposals (" + pendingProposals.size()
-                        + "/" + MAX_PENDING_PROPOSALS + ")");
+                CompletableFuture<Long> err = new CompletableFuture<>();
+                err.completeExceptionally(new IOException("Too many pending proposals (" + pendingProposals.size()
+                        + "/" + MAX_PENDING_PROPOSALS + ")"));
+                return err;
             }
 
             RaftEntry entry = RaftEntry.newBuilder()
@@ -1167,29 +1231,41 @@ public class RaftNode {
             future = new CompletableFuture<>();
             pendingProposals.put(index, new ProposalState(proposalTerm, future));
 
+        } catch (Exception e) {
+            CompletableFuture<Long> err = new CompletableFuture<>();
+            err.completeExceptionally(e);
+            return err;
         } finally {
             lock.unlock();
         }
 
         sendHeartbeats();
+        final long finalIndex = index;
+        return future.orTimeout(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .exceptionally(e -> {
+                    if (e instanceof java.util.concurrent.TimeoutException) {
+                        ProposalState ps = pendingProposals.get(finalIndex);
+                        if (ps != null) {
+                            ps.timedOut = true;
+                            if (pendingProposals.size() > MAX_PENDING_PROPOSALS / 2) {
+                                logger.warn("[{}] High number of pending proposals: {} (threshold: {})",
+                                        nodeId, pendingProposals.size(), MAX_PENDING_PROPOSALS);
+                            }
+                        }
+                        throw new java.util.concurrent.CompletionException(new IOException("Raft offset commit timed out (index=" + finalIndex + "); entry may still commit"));
+                    }
+                    throw new java.util.concurrent.CompletionException(new IOException("Raft offset commit failed: " + e.getMessage(), e));
+                });
+    }
 
+    public long proposeOffsetCommit(String consumerGroup, String topic, long offset) throws IOException {
         try {
-            return future.get(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        } catch (TimeoutException e) {
-            ProposalState ps = pendingProposals.get(index);
-            if (ps != null) {
-                ps.timedOut = true;
-                if (pendingProposals.size() > MAX_PENDING_PROPOSALS / 2) {
-                    logger.warn("[{}] High number of pending proposals: {} (threshold: {})",
-                            nodeId, pendingProposals.size(), MAX_PENDING_PROPOSALS);
-                }
+            return proposeOffsetCommitAsync(consumerGroup, topic, offset).join();
+        } catch (java.util.concurrent.CompletionException e) {
+            if (e.getCause() instanceof IOException) {
+                throw (IOException) e.getCause();
             }
-            throw new IOException("Raft offset commit timed out (index=" + index + "); entry may still commit");
-        } catch (ExecutionException e) {
-            throw new IOException("Raft offset commit failed: " + e.getCause().getMessage());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Raft offset commit interrupted");
+            throw new IOException(e.getCause());
         }
     }
 
