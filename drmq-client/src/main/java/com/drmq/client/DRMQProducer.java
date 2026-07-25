@@ -40,6 +40,8 @@ public class DRMQProducer implements AutoCloseable {
     private static final int MAX_ACCUMULATOR_MESSAGES = 10000;
     private final LinkedBlockingQueue<PendingMessage> accumulator = new LinkedBlockingQueue<>(MAX_ACCUMULATOR_MESSAGES);
     private final Thread senderThread;
+    private final java.util.concurrent.LinkedBlockingQueue<PendingAtomicMessage> atomicAccumulator = new java.util.concurrent.LinkedBlockingQueue<>(MAX_ACCUMULATOR_MESSAGES);
+    private final Thread atomicSenderThread;
 
     public DRMQProducer(String host, int port) {
         List<String[]> parsed = host != null && host.contains(",") ? parseBootstrapServers(host) : List.of();
@@ -56,6 +58,8 @@ public class DRMQProducer implements AutoCloseable {
         }
         senderThread = new Thread(this::senderLoop, "drmq-producer-sender");
         senderThread.start();
+        atomicSenderThread = new Thread(this::atomicSenderLoop, "drmq-producer-atomic-sender");
+        atomicSenderThread.start();
     }
 
     public DRMQProducer(String bootstrapServersStr) {
@@ -68,6 +72,8 @@ public class DRMQProducer implements AutoCloseable {
         this.port = Integer.parseInt(bootstrapServers.get(currentServerIndex)[1]);
         senderThread = new Thread(this::senderLoop, "drmq-producer-sender");
         senderThread.start();
+        atomicSenderThread = new Thread(this::atomicSenderLoop, "drmq-producer-atomic-sender");
+        atomicSenderThread.start();
     }
 
     private static List<String[]> parseBootstrapServers(String bootstrapServersStr) {
@@ -329,40 +335,106 @@ public class DRMQProducer implements AutoCloseable {
     }
 
     /**
+
+    /**
      * Atomically sends messages to multiple topics in a single Raft entry.
-     * Either all writes are committed, or none.
-     *
-     * @param topicMessages map of topic -> payload
-     * @return CompletableFuture<Map<String, Long>> of topic -> base offset
+     * Uses client-side batching to combine multiple atomic requests.
      */
     public CompletableFuture<java.util.Map<String, Long>> sendAtomic(java.util.Map<String, byte[]> topicMessages) {
         CompletableFuture<java.util.Map<String, Long>> future = new CompletableFuture<>();
-
         if (topicMessages.size() < 2) {
             future.completeExceptionally(new IllegalArgumentException("sendAtomic() requires at least 2 topics"));
             return future;
         }
-
-        com.drmq.protocol.DRMQProtocol.AtomicProduceRequest.Builder reqBuilder = com.drmq.protocol.DRMQProtocol.AtomicProduceRequest.newBuilder();
-        for (java.util.Map.Entry<String, byte[]> e : topicMessages.entrySet()) {
-            reqBuilder.addSlices(com.drmq.protocol.DRMQProtocol.AtomicBatchTopicSlice.newBuilder()
-                .setTopic(e.getKey())
-                .addEntries(com.drmq.protocol.DRMQProtocol.ProduceBatchRequest.BatchEntry.newBuilder()
-                    .setPayload(com.google.protobuf.ByteString.copyFrom(e.getValue()))
-                    .setClientTimestamp(System.currentTimeMillis())
-                    .build())
-                .build());
+        if (!atomicAccumulator.offer(new PendingAtomicMessage(topicMessages, future))) {
+            future.completeExceptionally(new IllegalStateException("Atomic accumulator is full. Apply backpressure."));
         }
-
-        AtomicProduceRequest request = reqBuilder.build();
-        CompletableFuture.runAsync(() -> sendAtomicWithRetry(request, future));
         return future;
     }
 
-    private void sendAtomicWithRetry(AtomicProduceRequest request, CompletableFuture<Map<String, Long>> future) {
+    private void atomicSenderLoop() {
+        while (running || !atomicAccumulator.isEmpty()) {
+            try {
+                PendingAtomicMessage firstMsg = atomicAccumulator.poll(500, java.util.concurrent.TimeUnit.MILLISECONDS);
+                if (firstMsg == null) {
+                    continue;
+                }
+
+                List<PendingAtomicMessage> currentBatch = new ArrayList<>();
+                currentBatch.add(firstMsg);
+                int currentBytes = 0;
+                for (byte[] payload : firstMsg.topicMessages.values()) {
+                    currentBytes += payload.length;
+                }
+                long firstMsgTime = System.currentTimeMillis();
+
+                while (currentBytes < batchSizeBytes) {
+                    PendingAtomicMessage peeked = atomicAccumulator.peek();
+                    if (peeked != null) {
+                        PendingAtomicMessage msg = atomicAccumulator.poll();
+                        currentBatch.add(msg);
+                        for (byte[] payload : msg.topicMessages.values()) {
+                            currentBytes += payload.length;
+                        }
+                    } else {
+                        if (System.currentTimeMillis() - firstMsgTime >= lingerMs) {
+                            break;
+                        }
+                        Thread.sleep(1); 
+                    }
+                }
+
+                if (!currentBatch.isEmpty()) {
+                    sendAtomicBatchWithRetry(currentBatch);
+                }
+
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception e) {
+                logger.error("Error in atomic sender loop", e);
+            }
+        }
+    }
+
+    private void sendAtomicBatchWithRetry(List<PendingAtomicMessage> batch) {
+        com.drmq.protocol.DRMQProtocol.AtomicProduceRequest.Builder reqBuilder = com.drmq.protocol.DRMQProtocol.AtomicProduceRequest.newBuilder();
+        
+        java.util.Map<String, com.drmq.protocol.DRMQProtocol.AtomicBatchTopicSlice.Builder> sliceBuilders = new java.util.HashMap<>();
+        
+        // Track the relative index for each message in the batch for each topic
+        // Map of RequestIndex -> Map of Topic -> RelativeIndex
+        java.util.Map<Integer, java.util.Map<String, Integer>> relativeIndices = new java.util.HashMap<>();
+
+        for (int i = 0; i < batch.size(); i++) {
+            PendingAtomicMessage pm = batch.get(i);
+            java.util.Map<String, Integer> requestIndices = new java.util.HashMap<>();
+            relativeIndices.put(i, requestIndices);
+
+            for (java.util.Map.Entry<String, byte[]> entry : pm.topicMessages.entrySet()) {
+                String topic = entry.getKey();
+                byte[] payload = entry.getValue();
+
+                com.drmq.protocol.DRMQProtocol.AtomicBatchTopicSlice.Builder sliceBuilder = sliceBuilders.computeIfAbsent(topic, 
+                        k -> com.drmq.protocol.DRMQProtocol.AtomicBatchTopicSlice.newBuilder().setTopic(k));
+                
+                int currentIndex = sliceBuilder.getEntriesCount();
+                requestIndices.put(topic, currentIndex);
+
+                sliceBuilder.addEntries(com.drmq.protocol.DRMQProtocol.ProduceBatchRequest.BatchEntry.newBuilder()
+                        .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
+                        .setClientTimestamp(pm.timestamp)
+                        .build());
+            }
+        }
+
+        for (com.drmq.protocol.DRMQProtocol.AtomicBatchTopicSlice.Builder sb : sliceBuilders.values()) {
+            reqBuilder.addSlices(sb.build());
+        }
+
         MessageEnvelope envelope = MessageEnvelope.newBuilder()
                 .setType(MessageType.ATOMIC_PRODUCE_REQUEST)
-                .setPayload(request.toByteString())
+                .setPayload(reqBuilder.build().toByteString())
                 .build();
 
         IOException lastException = null;
@@ -396,8 +468,22 @@ public class DRMQProducer implements AutoCloseable {
                     com.drmq.protocol.DRMQProtocol.AtomicProduceResponse response = com.drmq.protocol.DRMQProtocol.AtomicProduceResponse.parseFrom(responseEnvelope.getPayload());
 
                     if (response.getSuccess()) {
-                        future.complete(response.getBaseOffsetsMap());
-                        return; // Success
+                        java.util.Map<String, Long> baseOffsets = response.getBaseOffsetsMap();
+                        
+                        for (int i = 0; i < batch.size(); i++) {
+                            PendingAtomicMessage pm = batch.get(i);
+                            java.util.Map<String, Integer> reqIndices = relativeIndices.get(i);
+                            java.util.Map<String, Long> finalOffsets = new java.util.HashMap<>();
+                            
+                            for (String topic : pm.topicMessages.keySet()) {
+                                long base = baseOffsets.getOrDefault(topic, -1L);
+                                if (base != -1L) {
+                                    finalOffsets.put(topic, base + reqIndices.get(topic));
+                                }
+                            }
+                            pm.future.complete(finalOffsets);
+                        }
+                        return;
                     } else {
                         com.drmq.protocol.DRMQProtocol.ErrorCode errorCode = response.getErrorCode();
                         String errorMsg = response.getErrorMessage();
@@ -409,7 +495,7 @@ public class DRMQProducer implements AutoCloseable {
                             if (!leaderAddr.equals("UNKNOWN")) {
                                 try {
                                     redirectToLeader(leaderAddr);
-                                    continue; // Try again immediately on new leader
+                                    continue;
                                 } catch (IOException e) {
                                     lastException = e;
                                     closeConnection();
@@ -429,7 +515,9 @@ public class DRMQProducer implements AutoCloseable {
                             closeConnection();
                             rotateToNextServer();
                         } else {
-                            future.completeExceptionally(new IOException("Failed to send atomic batch: " + errorMsg));
+                            for (PendingAtomicMessage pm : batch) {
+                                pm.future.completeExceptionally(new IOException("Failed to send atomic batch: " + errorMsg));
+                            }
                             return;
                         }
                     }
@@ -440,7 +528,6 @@ public class DRMQProducer implements AutoCloseable {
                 rotateToNextServer();
             }
 
-            // Exponential backoff before retrying
             try { 
                 Thread.sleep(currentBackoffMs); 
             } catch (InterruptedException ignored) {
@@ -449,9 +536,10 @@ public class DRMQProducer implements AutoCloseable {
             currentBackoffMs = Math.min(2000, currentBackoffMs * 2);
         }
 
-        // Complete exceptionally if we exhausted retries
-        future.completeExceptionally(new IOException("Failed to send atomic batch: " + 
-            (lastException != null ? lastException.getMessage() : "unknown error")));
+        for (PendingAtomicMessage pm : batch) {
+            pm.future.completeExceptionally(new IOException("Failed to send atomic batch: " + 
+                (lastException != null ? lastException.getMessage() : "unknown error")));
+        }
     }
 
     private void rotateToNextServer() {
@@ -507,6 +595,16 @@ public class DRMQProducer implements AutoCloseable {
     @Override
     public void close() {
         running = false;
+        if (atomicSenderThread != null && atomicSenderThread.isAlive()) {
+            try {
+                atomicSenderThread.join(5000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            if (atomicSenderThread.isAlive()) {
+                atomicSenderThread.interrupt();
+            }
+        }
         if (senderThread != null && senderThread.isAlive()) {
             try {
                 senderThread.join(5000); // Wait up to 5 seconds to flush accumulator
@@ -536,6 +634,18 @@ public class DRMQProducer implements AutoCloseable {
             this.key = key;
             this.timestamp = System.currentTimeMillis();
             this.future = future;
+        }
+    }
+
+    private static class PendingAtomicMessage {
+        final java.util.Map<String, byte[]> topicMessages;
+        final java.util.concurrent.CompletableFuture<java.util.Map<String, Long>> future;
+        final long timestamp;
+
+        PendingAtomicMessage(java.util.Map<String, byte[]> topicMessages, java.util.concurrent.CompletableFuture<java.util.Map<String, Long>> future) {
+            this.topicMessages = topicMessages;
+            this.future = future;
+            this.timestamp = System.currentTimeMillis();
         }
     }
 

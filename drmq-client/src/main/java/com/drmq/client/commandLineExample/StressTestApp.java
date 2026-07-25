@@ -24,7 +24,7 @@ public class StressTestApp {
         int msgSize;
         try {
             concurrency = args.length > 1 ? Integer.parseInt(args[1]) : 4;
-            msgSize = args.length > 3 ? Integer.parseInt(args[3]) : 512;
+            msgSize = args.length > 3 ? Integer.parseInt(args[3]) : 16;
             if (concurrency < 1 || msgSize < 1) {
                 throw new NumberFormatException("Concurrency and msgSize must be positive integers");
             }
@@ -43,12 +43,11 @@ public class StressTestApp {
         System.out.println("  Topic        : " + topic);
         System.out.println("  Payload Size : " + msgSize + " bytes\n");
 
-        // Generate a fixed random payload for speed
-        StringBuilder sb = new StringBuilder(msgSize);
+        // Generate a fixed byte array payload for speed (no string allocations in tight loop)
+        final byte[] payloadBytes = new byte[msgSize];
         for (int i = 0; i < msgSize; i++) {
-            sb.append((char) ('a' + (Math.random() * 26)));
+            payloadBytes[i] = (byte) ('a' + (i % 26));
         }
-        final String basePayload = sb.toString();
 
         AtomicLong messagesSent = new AtomicLong(0);
         AtomicLong errors = new AtomicLong(0);
@@ -76,36 +75,42 @@ public class StressTestApp {
         });
         reporter.start();
 
+        java.util.concurrent.Semaphore inFlight = new java.util.concurrent.Semaphore(8000);
+
+        DRMQProducer[] producers = new DRMQProducer[concurrency];
+        for (int i = 0; i < concurrency; i++) {
+            producers[i] = new DRMQProducer(bootstrapServers);
+            producers[i].setBatchSizeBytes(1 * 1024 * 1024);
+            producers[i].setLingerMs(10);
+            try {
+                producers[i].connect();
+            } catch (Exception e) {
+                System.err.println("Failed to connect producer " + i + ": " + e.getMessage());
+                System.exit(1);
+            }
+        }
+
         // Start producer threads
         for (int i = 0; i < concurrency; i++) {
             final int threadId = i;
             executor.submit(() -> {
-                try (DRMQProducer producer = new DRMQProducer(bootstrapServers)) {
-                    producer.setBatchSizeBytes(2 * 1024 * 1024);
-                    producer.setLingerMs(10);
-                    producer.connect();
+                try {
                     long count = 0;
+                    DRMQProducer myProducer = producers[threadId];
                     while (!Thread.currentThread().isInterrupted()) {
-                        java.util.List<java.util.concurrent.CompletableFuture<DRMQProducer.SendResult>> futures = new java.util.ArrayList<>(4000);
-                        for (int k = 0; k < 4000; k++) {
-                            String payload = "T" + threadId + "_" + count + "_" + basePayload;
-                            futures.add(producer.send(topic, payload));
-                            count++;
-                        }
-
-                        for (var f : futures) {
-                            try {
-                                DRMQProducer.SendResult result = f.join();
-                                if (result.isSuccess()) {
-                                    messagesSent.incrementAndGet();
-                                } else {
-                                    errors.incrementAndGet();
-                                }
-                            } catch (Exception e) {
+                        inFlight.acquire();
+                        myProducer.send(topic, payloadBytes).whenComplete((result, ex) -> {
+                            inFlight.release();
+                            if (ex == null && result.isSuccess()) {
+                                messagesSent.incrementAndGet();
+                            } else {
                                 errors.incrementAndGet();
                             }
-                        }
+                        });
+                        count++;
                     }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
                 } catch (Exception e) {
                      errors.incrementAndGet();
                      System.err.println("[P" + threadId + "] Producer failed: " + e.getMessage());
@@ -113,9 +118,11 @@ public class StressTestApp {
             });
         }
 
-        // Keep main thread alive until killed and print final stats
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.out.println("\n🛑 Shutting down stress test...");
+            for (DRMQProducer p : producers) {
+                if (p != null) p.close();
+            }
             executor.shutdownNow();
             reporter.interrupt();
             long totalTimeMs = System.currentTimeMillis() - startTime;

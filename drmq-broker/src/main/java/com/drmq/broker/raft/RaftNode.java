@@ -585,9 +585,9 @@ public class RaftNode {
                         replicating.set(false);
                     }
                 }, raftExecutor);
-            } else {
-                // If replication is blocked (e.g., generating a massive snapshot),
-                // send a lightweight heartbeat so the follower's election timer doesn't fire.
+            } else if (snapshotInProgress.getOrDefault(peer.id(), false)) {
+                // If replication is blocked generating a massive snapshot, the peer lock is free.
+                // Send a lightweight heartbeat so the follower's election timer doesn't fire.
                 CompletableFuture.runAsync(() -> {
                     sendLightweightHeartbeat(peer);
                 });
@@ -929,7 +929,7 @@ public class RaftNode {
         if (applied) {
             stateSaveNeeded = true;
 
-            long retentionLimit = lastApplied - (raftCompactThreshold * 100);
+            long retentionLimit = lastApplied - (raftCompactThreshold * 2);
             long safeCompactIndex;
 
             if (isLeader()) {
@@ -939,7 +939,7 @@ public class RaftNode {
                 }
                 safeCompactIndex = Math.max(retentionLimit, minMatchIndex);
             } else {
-                safeCompactIndex = retentionLimit;
+                safeCompactIndex = lastApplied;
             }
 
             long finalCompactIndex = Math.min(safeCompactIndex, lastApplied - raftCompactThreshold);

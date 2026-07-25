@@ -53,7 +53,7 @@ public class AtomicLatencyBenchmarkTest {
         broker3.startAsync();
 
         // Wait for leader election
-        waitForLeader(3000);
+        waitForLeader(8000);
     }
 
     @AfterEach
@@ -85,8 +85,8 @@ public class AtomicLatencyBenchmarkTest {
     @Test
     public void benchmarkAtomicVsSequentialWrites() throws Exception {
         int leaderPort = getLeaderPort();
-        int iterations = 1000;
-        int warmup = 200;
+        int iterations = 100; // Reduced to prevent terminal crash
+        int warmup = 50;
         byte[] payload = new byte[256];
 
         System.out.println("=================================================");

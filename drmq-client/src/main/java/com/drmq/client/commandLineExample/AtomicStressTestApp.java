@@ -59,23 +59,37 @@ public class AtomicStressTestApp {
         final byte[] payloadA = "ATOMIC_PAYLOAD_A".getBytes(StandardCharsets.UTF_8);
         final byte[] payloadB = "ATOMIC_PAYLOAD_B".getBytes(StandardCharsets.UTF_8);
 
+        DRMQProducer sharedProducer = new DRMQProducer(bootstrapServers);
+        try {
+            sharedProducer.connect();
+        } catch (java.io.IOException e) {
+            System.err.println("Failed to connect to broker: " + e.getMessage());
+            System.exit(1);
+        }
+
+        java.util.concurrent.Semaphore inFlight = new java.util.concurrent.Semaphore(5000);
+
         for (int i = 0; i < concurrency; i++) {
             final int threadId = i;
             executor.submit(() -> {
-                try (DRMQProducer producer = new DRMQProducer(bootstrapServers)) {
-                    producer.connect();
+                try {
                     while (!Thread.currentThread().isInterrupted()) {
+                        inFlight.acquire();
                         Map<String, byte[]> atomicBatch = new HashMap<>();
                         atomicBatch.put("Topic-A", payloadA);
                         atomicBatch.put("Topic-B", payloadB);
 
-                        try {
-                            producer.sendAtomic(atomicBatch).join();
-                            transactionsSent.incrementAndGet();
-                        } catch (Exception e) {
-                            errors.incrementAndGet();
-                        }
+                        sharedProducer.sendAtomic(atomicBatch).whenComplete((res, ex) -> {
+                            inFlight.release();
+                            if (ex == null) {
+                                transactionsSent.incrementAndGet();
+                            } else {
+                                errors.incrementAndGet();
+                            }
+                        });
                     }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
                 } catch (Exception e) {
                     errors.incrementAndGet();
                     System.err.println("[P" + threadId + "] Producer failed: " + e.getMessage());
@@ -85,6 +99,7 @@ public class AtomicStressTestApp {
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.out.println("\n🛑 Shutting down stress test...");
+            sharedProducer.close();
             executor.shutdownNow();
             reporter.interrupt();
             long totalTimeMs = System.currentTimeMillis() - startTime;
