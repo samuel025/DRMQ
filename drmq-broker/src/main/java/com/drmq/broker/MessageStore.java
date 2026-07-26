@@ -639,6 +639,48 @@ public class MessageStore implements Closeable {
         return topicMessageCounts.size();
     }
 
+    /**
+     * Get the highest offset for each topic.
+     * Used for Tier 2 Incremental Sync to report follower state to the leader.
+     * @return Map of topic name to its max offset
+     */
+    public Map<String, Long> getTopicMaxOffsets() {
+        Map<String, Long> maxOffsets = new java.util.HashMap<>();
+        for (Map.Entry<String, AtomicLong> entry : topicHeadOffsets.entrySet()) {
+            maxOffsets.put(entry.getKey(), entry.getValue().get());
+        }
+        return maxOffsets;
+    }
+
+    /**
+     * Get paths of segments that contain offsets greater than the provided offset.
+     * Used for Tier 2 Incremental Sync.
+     */
+    public List<Path> getSegmentsForSync(String topic, long followerOffset) {
+        ConcurrentSkipListMap<Long, LogSegment> segments = logManager.getAllSegments().get(topic);
+        if (segments == null) return Collections.emptyList();
+
+        List<Path> paths = new ArrayList<>();
+        // We need any segment where the next segment's baseOffset > followerOffset,
+        // or the current segment's baseOffset > followerOffset.
+        // A simpler approach: Include the segment that contains followerOffset,
+        // and all segments after it.
+        Map.Entry<Long, LogSegment> floorEntry = segments.floorEntry(followerOffset);
+        if (floorEntry != null) {
+            paths.add(floorEntry.getValue().getFilePath());
+            for (LogSegment seg : segments.tailMap(floorEntry.getKey(), false).values()) {
+                paths.add(seg.getFilePath());
+            }
+        } else {
+            // followerOffset is before the oldest segment we have, so send all
+            for (LogSegment seg : segments.values()) {
+                paths.add(seg.getFilePath());
+            }
+        }
+        return paths;
+    }
+
+
     public long getCachedMessageCount() {
         long total = 0;
         for (BoundedMessageCache cache : messageCache.values()) {

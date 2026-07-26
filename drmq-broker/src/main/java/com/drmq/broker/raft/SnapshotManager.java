@@ -33,154 +33,91 @@ public class SnapshotManager {
     }
 
     /**
-     * Zips up the current state of the node into a snapshot file.
-     * Blocks appends to the MessageStore while creating the snapshot to ensure consistency.
-     *
-     * @param lastIncludedIndex The last Raft index applied to the state machine before this snapshot.
-     * @return Path to the generated zip file.
+     * Streams the incremental segments directly to the follower instead of zipping the entire MessageStore.
      */
-    public Path createSnapshot(long lastIncludedIndex) throws IOException {
-        if (offsetManager != null) {
-            offsetManager.forcePersist();
-        }
+    public void streamIncrementalSegments(
+            java.util.Map<String, Long> followerOffsets,
+            long snapshotIndex,
+            long snapshotTerm,
+            String nodeId,
+            com.drmq.broker.BrokerConfig.PeerAddress peer,
+            java.util.function.Function<com.drmq.protocol.DRMQProtocol.IncrementalSnapshotChunk, com.drmq.protocol.DRMQProtocol.IncrementalSnapshotChunkResponse> chunkHandler,
+            java.util.function.Function<com.drmq.protocol.DRMQProtocol.IncrementalSnapshotDoneRequest, com.drmq.protocol.DRMQProtocol.IncrementalSnapshotDoneResponse> doneHandler) {
 
-        Path snapshotsDir = dataDir.resolve("raft/snapshots");
-        Files.createDirectories(snapshotsDir);
-        Path zipFile = snapshotsDir.resolve("snapshot_" + lastIncludedIndex + ".zip");
+        logger.info("[{}] Starting Tier 2 Incremental Sync for peer {} at Raft index {}", nodeId, peer.id(), snapshotIndex);
 
-        if (Files.exists(zipFile)) {
-            logger.debug("Snapshot for index {} already exists, skipping generation.", lastIncludedIndex);
-            return zipFile;
-        }
+        try {
+            for (String topic : messageStore.getTopics()) {
+                long followerOffset = followerOffsets.getOrDefault(topic, -1L);
+                java.util.List<Path> segmentsToStream = messageStore.getSegmentsForSync(topic, followerOffset);
 
-        logger.info("Starting snapshot generation for index {}...", lastIncludedIndex);
-        long startMs = System.currentTimeMillis();
-
-        messageStore.lockForSnapshot(() -> {
-            try (OutputStream fos = Files.newOutputStream(zipFile, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-                 ZipOutputStream zos = new ZipOutputStream(fos)) {
-                // 3a. Zip all topic directories
-                for (String topic : messageStore.getTopics()) {
-                    Path topicDir = dataDir.resolve(topic);
-                    zipDirectory(topicDir, topic, zos);
+                for (Path segmentPath : segmentsToStream) {
+                    streamFile(segmentPath, topic, snapshotTerm, nodeId, chunkHandler);
                 }
-
-                // 3b. Zip the consumer offsets directory
-                Path offsetsDir = dataDir.resolve("__consumer_offsets");
-                zipDirectory(offsetsDir, "__consumer_offsets", zos);
-
-            } catch (IOException e) {
-                throw new UncheckedIOException(e);
             }
-        });
 
-        logger.info("Created snapshot {} (size: {} bytes, took: {} ms)", 
-                zipFile.getFileName(), Files.size(zipFile), System.currentTimeMillis() - startMs);
-        ClusterEventBuffer.emitSnapshot(String.format("Snapshot created at index %d", lastIncludedIndex), null);
+            // After all topic files are streamed, send the Done request
+            com.drmq.protocol.DRMQProtocol.IncrementalSnapshotDoneRequest doneReq = com.drmq.protocol.DRMQProtocol.IncrementalSnapshotDoneRequest.newBuilder()
+                    .setTerm(snapshotTerm)
+                    .setLeaderId(nodeId)
+                    .setLastIncludedIndex(snapshotIndex)
+                    .setLastIncludedTerm(snapshotTerm)
+                    .build();
 
-        cleanupOldSnapshots(snapshotsDir, zipFile);
+            com.drmq.protocol.DRMQProtocol.IncrementalSnapshotDoneResponse doneResp = doneHandler.apply(doneReq);
+            if (doneResp == null || !doneResp.getSuccess()) {
+                throw new IOException("Follower " + peer.id() + " rejected IncrementalSnapshotDoneRequest");
+            }
+            logger.info("[{}] Tier 2 Incremental Sync completed successfully for peer {}", nodeId, peer.id());
+
+        } catch (Exception e) {
+            logger.error("[{}] Tier 2 Incremental Sync failed for peer {}", nodeId, peer.id(), e);
+            throw new RuntimeException(e);
+        }
+    }
+
+    private void streamFile(Path filePath, String topic, long term, String leaderId,
+                            java.util.function.Function<com.drmq.protocol.DRMQProtocol.IncrementalSnapshotChunk, com.drmq.protocol.DRMQProtocol.IncrementalSnapshotChunkResponse> chunkHandler) throws IOException {
         
-        return zipFile;
-    }
+        if (!Files.exists(filePath)) return;
+        
+        String fileName = filePath.getFileName().toString();
+        try (java.nio.channels.FileChannel channel = java.nio.channels.FileChannel.open(filePath, StandardOpenOption.READ)) {
+            long totalBytes = channel.size();
+            long offset = 0;
+            long chunkSize = 2 * 1024 * 1024; // 2MB
 
-    /**
-     * Recursively zips all files in a source directory, maintaining relative paths.
-     */
-    private void zipDirectory(Path sourceDir, String baseName, ZipOutputStream zos) throws IOException {
-        if (!Files.exists(sourceDir) || !Files.isDirectory(sourceDir)) {
-            return;
-        }
+            while (offset < totalBytes || totalBytes == 0) {
+                long remaining = totalBytes - offset;
+                long payloadSize = Math.min(chunkSize, remaining);
+                boolean isDone = (offset + payloadSize >= totalBytes);
 
-        try (Stream<Path> paths = Files.walk(sourceDir)) {
-            paths.filter(path -> !Files.isDirectory(path))
-                 .forEach(path -> {
-                     try {
-                         String relative = sourceDir.relativize(path).toString().replace('\\', '/');
-                         String zipEntryName = baseName + "/" + relative;
-                         
-                         zos.putNextEntry(new ZipEntry(zipEntryName));
-                         Files.copy(path, zos);
-                         zos.closeEntry();
-                     } catch (IOException e) {
-                         throw new UncheckedIOException("Failed to zip file: " + path, e);
-                     }
-                 });
-        }
-    }
-
-    /**
-     * Keeps only the 2 most recent snapshots, deleting older ones to save disk space.
-     */
-    private void cleanupOldSnapshots(Path snapshotsDir, Path keepFile) {
-        try (Stream<Path> stream = Files.list(snapshotsDir)) {
-            stream.filter(p -> p.toString().endsWith(".zip"))
-                  .filter(p -> !p.equals(keepFile))
-                  .sorted((p1, p2) -> {
-                      try {
-                          return Files.getLastModifiedTime(p2).compareTo(Files.getLastModifiedTime(p1));
-                      } catch (IOException e) {
-                          return 0;
-                      }
-                  })
-                  .skip(1) // Keep the most recent older one, just in case
-                  .forEach(p -> {
-                      try {
-                          Files.deleteIfExists(p);
-                          logger.debug("Deleted old snapshot: {}", p.getFileName());
-                      } catch (IOException e) {
-                          logger.warn("Failed to delete old snapshot: {}", p.getFileName());
-                      }
-                  });
-        } catch (IOException e) {
-            logger.warn("Failed to cleanup old snapshots", e);
-        }
-    }
-
-    /**
-     * Unzips the snapshot into the data directory, replacing the current state.
-     */
-    public void restoreSnapshot(Path zipFile) throws IOException {
-        logger.info("Restoring state from snapshot zip: {}", zipFile);
-
-        // Delete existing directories first
-        for (String topic : messageStore.getTopics()) {
-            deleteDirectory(dataDir.resolve(topic));
-        }
-        Path offsetsDir = dataDir.resolve("__consumer_offsets");
-        deleteDirectory(offsetsDir);
-
-        // Unzip
-        try (java.io.InputStream is = Files.newInputStream(zipFile);
-             ZipInputStream zis = new ZipInputStream(is)) {
-            
-            ZipEntry entry;
-            while ((entry = zis.getNextEntry()) != null) {
-                Path targetDirAbs = dataDir.toAbsolutePath().normalize();
-                Path resolvedPath = dataDir.resolve(entry.getName()).toAbsolutePath().normalize();
-                
-                // Security check to prevent ZipSlip
-                if (!resolvedPath.startsWith(targetDirAbs)) {
-                    throw new IOException("Zip entry is outside of target dir: " + entry.getName());
-                }
-
-                if (entry.isDirectory()) {
-                    Files.createDirectories(resolvedPath);
+                com.google.protobuf.ByteString data;
+                if (payloadSize > 0) {
+                    java.nio.MappedByteBuffer mappedBuffer = channel.map(java.nio.channels.FileChannel.MapMode.READ_ONLY, offset, payloadSize);
+                    data = com.google.protobuf.ByteString.copyFrom(mappedBuffer);
                 } else {
-                    Files.createDirectories(resolvedPath.getParent());
-                    Files.copy(zis, resolvedPath, StandardCopyOption.REPLACE_EXISTING);
+                    data = com.google.protobuf.ByteString.EMPTY;
                 }
-                zis.closeEntry();
-            }
-        }
-    }
 
-    private void deleteDirectory(Path path) throws IOException {
-        if (!Files.exists(path)) return;
-        try (Stream<Path> walk = Files.walk(path)) {
-            walk.sorted(java.util.Comparator.reverseOrder())
-                .forEach(p -> {
-                    try { Files.delete(p); } catch (IOException ignored) {}
-                });
+                com.drmq.protocol.DRMQProtocol.IncrementalSnapshotChunk chunkReq = com.drmq.protocol.DRMQProtocol.IncrementalSnapshotChunk.newBuilder()
+                        .setTerm(term)
+                        .setLeaderId(leaderId)
+                        .setTopic(topic)
+                        .setFileName(fileName)
+                        .setFileOffset(offset)
+                        .setData(data)
+                        .setIsLastChunkForFile(isDone)
+                        .build();
+
+                com.drmq.protocol.DRMQProtocol.IncrementalSnapshotChunkResponse chunkResp = chunkHandler.apply(chunkReq);
+                if (chunkResp == null || !chunkResp.getSuccess()) {
+                    throw new IOException("Follower rejected file chunk for " + fileName);
+                }
+
+                if (isDone) break;
+                offset += payloadSize;
+            }
         }
     }
 }

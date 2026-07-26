@@ -97,7 +97,9 @@ public class BrokerServer {
                 raftNode.registerVoteHandler(peer.id(), raftPeer::sendRequestVote);
                 raftNode.registerAppendHandler(peer.id(), raftPeer::sendAppendEntries);
                 raftNode.registerPreVoteHandler(peer.id(), raftPeer::sendPreVote);
-                raftNode.registerInstallSnapshotHandler(peer.id(), raftPeer::sendInstallSnapshot);
+                raftNode.registerRequestTopicOffsetsHandler(peer.id(), raftPeer::sendRequestTopicOffsets);
+                raftNode.registerIncrementalSnapshotChunkHandler(peer.id(), raftPeer::sendIncrementalSnapshotChunk);
+                raftNode.registerIncrementalSnapshotDoneHandler(peer.id(), raftPeer::sendIncrementalSnapshotDone);
             }
 
             logger.info("Cluster mode: nodeId={}, peers={}", config.getNodeId(), config.getPeers());

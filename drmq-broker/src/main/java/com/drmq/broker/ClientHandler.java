@@ -103,10 +103,12 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
             case COMMIT_OFFSET_REQUEST -> handleCommitOffsetRequest(envelope);
             case FETCH_OFFSET_REQUEST -> java.util.concurrent.CompletableFuture.completedFuture(handleFetchOffsetRequest(envelope));
             case NACK_REQUEST -> java.util.concurrent.CompletableFuture.completedFuture(handleNackRequest(envelope));
-            case REQUEST_VOTE_REQUEST -> java.util.concurrent.CompletableFuture.completedFuture(handleRequestVoteRequest(envelope));
-            case PRE_VOTE_REQUEST -> java.util.concurrent.CompletableFuture.completedFuture(handlePreVoteRequest(envelope));
-            case APPEND_ENTRIES_REQUEST -> java.util.concurrent.CompletableFuture.completedFuture(handleAppendEntriesRequest(envelope));
-            case INSTALL_SNAPSHOT_REQUEST -> java.util.concurrent.CompletableFuture.completedFuture(handleInstallSnapshotRequest(envelope));
+            case REQUEST_VOTE_REQUEST -> handleRequestVoteRequest(envelope);
+            case PRE_VOTE_REQUEST -> handlePreVoteRequest(envelope);
+            case APPEND_ENTRIES_REQUEST -> handleAppendEntriesRequest(envelope);
+            case REQUEST_TOPIC_OFFSETS_REQUEST -> handleRequestTopicOffsetsRequest(envelope);
+            case INCREMENTAL_SNAPSHOT_CHUNK -> handleIncrementalSnapshotChunk(envelope);
+            case INCREMENTAL_SNAPSHOT_DONE_REQUEST -> handleIncrementalSnapshotDoneRequest(envelope);
             case SEARCH_OFFSET_BY_TIME_REQUEST -> java.util.concurrent.CompletableFuture.completedFuture(handleSearchOffsetByTimeRequest(envelope));
             case ATOMIC_PRODUCE_REQUEST -> handleAtomicProduceRequest(envelope);
             default -> java.util.concurrent.CompletableFuture.completedFuture(createErrorResponse("Unknown message type: " + envelope.getType()));
@@ -655,7 +657,6 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
             case REQUEST_VOTE_RESPONSE -> createRequestVoteErrorResponse();
             case PRE_VOTE_RESPONSE -> createPreVoteErrorResponse();
             case APPEND_ENTRIES_RESPONSE -> createAppendEntriesErrorResponse();
-            case INSTALL_SNAPSHOT_RESPONSE -> createInstallSnapshotErrorResponse();
             case PRODUCE_RESPONSE -> createProduceErrorResponse(errorMessage, ErrorCode.UNKNOWN_ERROR);
             case CONSUME_RESPONSE -> createConsumeErrorResponse(errorMessage);
             case COMMIT_OFFSET_RESPONSE -> createCommitOffsetErrorResponse(errorMessage);
@@ -691,16 +692,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
                 .build();
     }
 
-    private MessageEnvelope createInstallSnapshotErrorResponse() {
-        InstallSnapshotResponse response = InstallSnapshotResponse.newBuilder()
-                .setTerm(0)
-                .build();
 
-        return MessageEnvelope.newBuilder()
-                .setType(MessageType.INSTALL_SNAPSHOT_RESPONSE)
-                .setPayload(response.toByteString())
-                .build();
-    }
 
     private MessageEnvelope createPreVoteErrorResponse() {
         PreVoteResponse response = PreVoteResponse.newBuilder()
@@ -714,192 +706,159 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
                 .build();
     }
 
-    private MessageEnvelope handleRequestVoteRequest(MessageEnvelope envelope) throws IOException {
+    private java.util.concurrent.CompletableFuture<MessageEnvelope> handleRequestVoteRequest(MessageEnvelope envelope) {
         long startNanos = System.nanoTime();
         if (raftNode == null) {
             BrokerMetrics.get().recordRaftRpc("request_vote", false,
                     System.nanoTime() - startNanos);
-            return createRequestVoteErrorResponse();
+            return java.util.concurrent.CompletableFuture.completedFuture(createRequestVoteErrorResponse());
         }
-        RequestVoteRequest request = RequestVoteRequest.parseFrom(envelope.getPayload());
+        
+        return java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+            try {
+                RequestVoteRequest request = RequestVoteRequest.parseFrom(envelope.getPayload());
+                RequestVoteResponse response = raftNode.handleRequestVote(request);
 
-        Future<RequestVoteResponse> future = null;
-        try {
-            future = rpcExecutor.submit(() -> raftNode.handleRequestVote(request));
-            RequestVoteResponse response = future.get(10, TimeUnit.SECONDS);
+                BrokerMetrics.get().recordRaftRpc("request_vote", true,
+                        System.nanoTime() - startNanos);
 
-            BrokerMetrics.get().recordRaftRpc("request_vote", true,
-                    System.nanoTime() - startNanos);
-
-            return MessageEnvelope.newBuilder()
-                    .setType(MessageType.REQUEST_VOTE_RESPONSE)
-                    .setPayload(response.toByteString())
-                    .build();
-        } catch (TimeoutException e) {
-            logger.error("RequestVote handler timed out");
-            BrokerMetrics.get().recordRaftRpc("request_vote", false,
-                    System.nanoTime() - startNanos);
-            if (future != null) {
-                future.cancel(true);
+                return MessageEnvelope.newBuilder()
+                        .setType(MessageType.REQUEST_VOTE_RESPONSE)
+                        .setPayload(response.toByteString())
+                        .build();
+            } catch (Exception e) {
+                logger.error("RequestVote handler failed: {}", e.getMessage());
+                BrokerMetrics.get().recordRaftRpc("request_vote", false,
+                        System.nanoTime() - startNanos);
+                return createRequestVoteErrorResponse();
             }
-            return createRequestVoteErrorResponse();
-        } catch (RejectedExecutionException e) {
-            logger.error("RequestVote handler rejected: {}", e.getMessage());
-            BrokerMetrics.get().recordRaftRpc("request_vote", false,
-                    System.nanoTime() - startNanos);
-            return createRequestVoteErrorResponse();
-        } catch (Exception e) {
-            logger.error("RequestVote handler failed: {}", e.getMessage());
-            BrokerMetrics.get().recordRaftRpc("request_vote", false,
-                    System.nanoTime() - startNanos);
-            if (future != null) {
-                future.cancel(true);
-            }
-            return createRequestVoteErrorResponse();
-        }
+        }, rpcExecutor);
     }
 
-    private MessageEnvelope handlePreVoteRequest(MessageEnvelope envelope) throws IOException {
+    private java.util.concurrent.CompletableFuture<MessageEnvelope> handlePreVoteRequest(MessageEnvelope envelope) {
         long startNanos = System.nanoTime();
         if (raftNode == null) {
             BrokerMetrics.get().recordRaftRpc("pre_vote", false,
                     System.nanoTime() - startNanos);
-            return createPreVoteErrorResponse();
+            return java.util.concurrent.CompletableFuture.completedFuture(createPreVoteErrorResponse());
         }
-        PreVoteRequest request = PreVoteRequest.parseFrom(envelope.getPayload());
+        
+        return java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+            try {
+                PreVoteRequest request = PreVoteRequest.parseFrom(envelope.getPayload());
+                PreVoteResponse response = raftNode.handlePreVote(request);
 
-        Future<PreVoteResponse> future = null;
-        try {
-            future = rpcExecutor.submit(() -> raftNode.handlePreVote(request));
-            PreVoteResponse response = future.get(10, TimeUnit.SECONDS);
+                BrokerMetrics.get().recordRaftRpc("pre_vote", true,
+                        System.nanoTime() - startNanos);
 
-            BrokerMetrics.get().recordRaftRpc("pre_vote", true,
-                    System.nanoTime() - startNanos);
-
-            return MessageEnvelope.newBuilder()
-                    .setType(MessageType.PRE_VOTE_RESPONSE)
-                    .setPayload(response.toByteString())
-                    .build();
-        } catch (TimeoutException e) {
-            logger.error("PreVote handler timed out");
-            BrokerMetrics.get().recordRaftRpc("pre_vote", false,
-                    System.nanoTime() - startNanos);
-            if (future != null) {
-                future.cancel(true);
+                return MessageEnvelope.newBuilder()
+                        .setType(MessageType.PRE_VOTE_RESPONSE)
+                        .setPayload(response.toByteString())
+                        .build();
+            } catch (Exception e) {
+                logger.error("PreVote handler failed: {}", e.getMessage());
+                BrokerMetrics.get().recordRaftRpc("pre_vote", false,
+                        System.nanoTime() - startNanos);
+                return createPreVoteErrorResponse();
             }
-            return createPreVoteErrorResponse();
-        } catch (RejectedExecutionException e) {
-            logger.error("PreVote handler rejected: {}", e.getMessage());
-            BrokerMetrics.get().recordRaftRpc("pre_vote", false,
-                    System.nanoTime() - startNanos);
-            return createPreVoteErrorResponse();
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            logger.error("PreVote handler interrupted: {}", ie.getMessage());
-            BrokerMetrics.get().recordRaftRpc("pre_vote", false, System.nanoTime() - startNanos);
-            if (future != null) {
-                future.cancel(true);
-            }
-            return createPreVoteErrorResponse();
-        } catch (Exception e) {
-            logger.error("PreVote handler failed: {}", e.getMessage());
-            BrokerMetrics.get().recordRaftRpc("pre_vote", false,
-                    System.nanoTime() - startNanos);
-            if (future != null) {
-                future.cancel(true);
-            }
-            return createPreVoteErrorResponse();
-        }
+        }, rpcExecutor);
     }
 
-    private MessageEnvelope handleAppendEntriesRequest(MessageEnvelope envelope) throws IOException {
+    private java.util.concurrent.CompletableFuture<MessageEnvelope> handleAppendEntriesRequest(MessageEnvelope envelope) {
         long startNanos = System.nanoTime();
         if (raftNode == null) {
             BrokerMetrics.get().recordRaftRpc("append_entries", false,
                     System.nanoTime() - startNanos);
-            return createAppendEntriesErrorResponse();
+            return java.util.concurrent.CompletableFuture.completedFuture(createAppendEntriesErrorResponse());
         }
 
-        AppendEntriesRequest request = AppendEntriesRequest.parseFrom(envelope.getPayload());
-        Future<AppendEntriesResponse> future = null;
-        try {
-            future = rpcExecutor.submit(() -> raftNode.handleAppendEntries(request));
-            AppendEntriesResponse response = future.get(10, TimeUnit.SECONDS);
+        return java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+            try {
+                AppendEntriesRequest request = AppendEntriesRequest.parseFrom(envelope.getPayload());
+                AppendEntriesResponse response = raftNode.handleAppendEntries(request);
 
-            BrokerMetrics.get().recordRaftRpc("append_entries", response.getSuccess(),
-                    System.nanoTime() - startNanos);
+                BrokerMetrics.get().recordRaftRpc("append_entries", response.getSuccess(),
+                        System.nanoTime() - startNanos);
 
-            return MessageEnvelope.newBuilder()
-                    .setType(MessageType.APPEND_ENTRIES_RESPONSE)
-                    .setPayload(response.toByteString())
-                    .build();
-        } catch (TimeoutException e) {
-            logger.error("AppendEntries handler timed out");
-            BrokerMetrics.get().recordRaftRpc("append_entries", false,
-                    System.nanoTime() - startNanos);
-            if (future != null) {
-                future.cancel(true);
+                return MessageEnvelope.newBuilder()
+                        .setType(MessageType.APPEND_ENTRIES_RESPONSE)
+                        .setPayload(response.toByteString())
+                        .build();
+            } catch (Exception e) {
+                logger.error("AppendEntries handler failed: {}", e.getMessage());
+                BrokerMetrics.get().recordRaftRpc("append_entries", false,
+                        System.nanoTime() - startNanos);
+                return createAppendEntriesErrorResponse();
             }
-            return createAppendEntriesErrorResponse();
-        } catch (RejectedExecutionException e) {
-            logger.error("AppendEntries handler rejected: {}", e.getMessage());
-            BrokerMetrics.get().recordRaftRpc("append_entries", false,
-                    System.nanoTime() - startNanos);
-            return createAppendEntriesErrorResponse();
-        } catch (Exception e) {
-            logger.error("AppendEntries handler failed: {}", e.getMessage());
-            BrokerMetrics.get().recordRaftRpc("append_entries", false,
-                    System.nanoTime() - startNanos);
-            if (future != null) {
-                future.cancel(true);
-            }
-            return createAppendEntriesErrorResponse();
-        }
+        }, rpcExecutor);
     }
 
-    private MessageEnvelope handleInstallSnapshotRequest(MessageEnvelope envelope) throws IOException {
-        long startNanos = System.nanoTime();
-        if (raftNode == null) {
-            BrokerMetrics.get().recordRaftRpc("install_snapshot", false,
-                    System.nanoTime() - startNanos);
-            return createInstallSnapshotErrorResponse();
-        }
+    private java.util.concurrent.CompletableFuture<MessageEnvelope> handleRequestTopicOffsetsRequest(MessageEnvelope envelope) {
+        return java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+            try {
+                RequestTopicOffsetsRequest request = RequestTopicOffsetsRequest.parseFrom(envelope.getPayload());
+                java.util.Map<String, Long> offsets = messageStore.getTopicMaxOffsets();
+                
+                RequestTopicOffsetsResponse response = RequestTopicOffsetsResponse.newBuilder()
+                        .setTerm(raftNode != null ? raftNode.getCurrentTerm() : 0)
+                        .putAllTopicOffsets(offsets)
+                        .build();
+                        
+                return MessageEnvelope.newBuilder()
+                        .setType(MessageType.REQUEST_TOPIC_OFFSETS_RESPONSE)
+                        .setPayload(response.toByteString())
+                        .build();
+            } catch (Exception e) {
+                logger.error("Error handling request topic offsets", e);
+                return createErrorResponse(e.getMessage());
+            }
+        }, rpcExecutor);
+    }
 
-        InstallSnapshotRequest request = InstallSnapshotRequest.parseFrom(envelope.getPayload());
-        Future<InstallSnapshotResponse> future = null;
-        try {
-            future = rpcExecutor.submit(() -> raftNode.handleInstallSnapshot(request));
-            InstallSnapshotResponse response = future.get(10, TimeUnit.SECONDS);
-
-            BrokerMetrics.get().recordRaftRpc("install_snapshot", true,
-                    System.nanoTime() - startNanos);
-
+    private java.util.concurrent.CompletableFuture<MessageEnvelope> handleIncrementalSnapshotChunk(MessageEnvelope envelope) {
+        return java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+            boolean success = false;
+            try {
+                IncrementalSnapshotChunk request = IncrementalSnapshotChunk.parseFrom(envelope.getPayload());
+                if (raftNode != null) {
+                    success = raftNode.handleIncrementalSnapshotChunk(request).getSuccess();
+                }
+            } catch (Exception e) {
+                logger.error("Error handling chunk", e);
+            }
+            IncrementalSnapshotChunkResponse response = IncrementalSnapshotChunkResponse.newBuilder()
+                    .setTerm(raftNode != null ? raftNode.getCurrentTerm() : 0)
+                    .setSuccess(success)
+                    .build();
+                    
             return MessageEnvelope.newBuilder()
-                    .setType(MessageType.INSTALL_SNAPSHOT_RESPONSE)
+                    .setType(MessageType.INCREMENTAL_SNAPSHOT_CHUNK_RESPONSE)
                     .setPayload(response.toByteString())
                     .build();
-        } catch (TimeoutException e) {
-            logger.error("InstallSnapshot handler timed out");
-            BrokerMetrics.get().recordRaftRpc("install_snapshot", false,
-                    System.nanoTime() - startNanos);
-            if (future != null) {
-                future.cancel(true);
+        }, rpcExecutor);
+    }
+
+    private java.util.concurrent.CompletableFuture<MessageEnvelope> handleIncrementalSnapshotDoneRequest(MessageEnvelope envelope) {
+        return java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+            boolean success = false;
+            try {
+                IncrementalSnapshotDoneRequest request = IncrementalSnapshotDoneRequest.parseFrom(envelope.getPayload());
+                if (raftNode != null) {
+                    success = raftNode.handleIncrementalSnapshotDone(request).getSuccess();
+                }
+            } catch (Exception e) {
+                logger.error("Error handling snapshot done", e);
             }
-            return createInstallSnapshotErrorResponse();
-        } catch (RejectedExecutionException e) {
-            logger.error("InstallSnapshot handler rejected: {}", e.getMessage());
-            BrokerMetrics.get().recordRaftRpc("install_snapshot", false,
-                    System.nanoTime() - startNanos);
-            return createInstallSnapshotErrorResponse();
-        } catch (Exception e) {
-            logger.error("InstallSnapshot handler failed: {}", e.getMessage());
-            BrokerMetrics.get().recordRaftRpc("install_snapshot", false,
-                    System.nanoTime() - startNanos);
-            if (future != null) {
-                future.cancel(true);
-            }
-            return createInstallSnapshotErrorResponse();
-        }
+            IncrementalSnapshotDoneResponse response = IncrementalSnapshotDoneResponse.newBuilder()
+                    .setTerm(raftNode != null ? raftNode.getCurrentTerm() : 0)
+                    .setSuccess(success)
+                    .build();
+                    
+            return MessageEnvelope.newBuilder()
+                    .setType(MessageType.INCREMENTAL_SNAPSHOT_DONE_RESPONSE)
+                    .setPayload(response.toByteString())
+                    .build();
+        }, rpcExecutor);
     }
 
     private static long estimatePayloadBytes(java.util.List<StoredMessage> messages) {

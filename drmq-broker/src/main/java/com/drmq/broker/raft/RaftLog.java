@@ -272,8 +272,11 @@ public class RaftLog {
 
     public synchronized long getTermAt(long index) {
         if (index == 0) return 0;
-        RaftEntry entry = getEntry(index);
-        return entry != null ? entry.getTerm() : 0;
+        if (index < startIndex || index > getLastIndex()) {
+            return 0;
+        }
+        int listIndex = (int) (index - startIndex);
+        return entries.get(listIndex).getTerm();
     }
 
     public synchronized int size() {
@@ -356,64 +359,77 @@ public class RaftLog {
             tempChannel.truncate(newLogicalFileSize);
         }
         
-        synchronized(this) {
-            if (entries.size() < initialSize) {
-                tempFile.delete();
-                return;
-            }
-            
-            int addedCount = entries.size() - initialSize;
-            if (addedCount > 0) {
-                try (FileChannel tempChannel = FileChannel.open(tempFile.toPath(), StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
-                    long mapSize = Math.max(newLogicalFileSize + (logicalFileSize - filePositions.get(initialSize)), INITIAL_MAPPED_SIZE);
-                    MappedByteBuffer tempMapped = tempChannel.map(FileChannel.MapMode.READ_WRITE, 0, mapSize);
-                    tempMapped.position((int) newLogicalFileSize);
-                    
-                    int originalPos = mappedBuffer.position();
-                    mappedBuffer.position((int) (long) filePositions.get(initialSize));
-                    
-                    for (int i = initialSize; i < entries.size(); i++) {
-                        newPositions.add((long) tempMapped.position());
-                        int length = mappedBuffer.getInt();
-                        byte[] data = new byte[length];
-                        mappedBuffer.get(data);
-                        
-                        tempMapped.putInt(length);
-                        tempMapped.put(data);
+        while (true) {
+            int currentSize;
+            int addedCount;
+            byte[] addedData = null;
+
+            synchronized(this) {
+                if (entries.size() < initialSize) {
+                    tempFile.delete();
+                    return;
+                }
+                currentSize = entries.size();
+                addedCount = currentSize - initialSize;
+
+                if (addedCount == 0) {
+                    fileChannel.close();
+                    try {
+                        java.nio.file.Files.move(tempFile.toPath(), logPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+                    } catch (Exception e) {
+                        try {
+                            openChannelAndMap();
+                        } catch (Exception ignore) {
+                        }
+                        throw e;
                     }
-                    mappedBuffer.position(originalPos);
-                    
-                    newLogicalFileSize = tempMapped.position();
-                    if (fsyncEnabled) tempMapped.force();
-                    tempChannel.truncate(newLogicalFileSize);
+
+                    try {
+                        openChannelAndMap();
+                        logicalFileSize = newLogicalFileSize;
+                        mappedBuffer.position((int) logicalFileSize);
+                    } catch (IOException e) {
+                        throw new IOException("Failed to reopen compacted log: " + logPath, e);
+                    }
+
+                    entries.subList(0, removeCount).clear();
+                    filePositions.clear();
+                    filePositions.addAll(newPositions);
+                    startIndex = upToIndex + 1;
+
+                    logger.debug("Compacted Raft log on disk up to index {}", upToIndex);
+                    return;
                 }
+
+                int dataLengthToRead = (int) (logicalFileSize - filePositions.get(initialSize));
+                addedData = new byte[dataLengthToRead];
+                int originalPos = mappedBuffer.position();
+                mappedBuffer.position((int) (long) filePositions.get(initialSize));
+                mappedBuffer.get(addedData);
+                mappedBuffer.position(originalPos);
             }
 
-            fileChannel.close();
-            try {
-                java.nio.file.Files.move(tempFile.toPath(), logPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
-            } catch (Exception e) {
-                try {
-                    openChannelAndMap();
-                } catch (Exception ignore) {
-                }
-                throw e;
-            }
+            try (FileChannel tempChannel = FileChannel.open(tempFile.toPath(), StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+                long mapSize = Math.max(newLogicalFileSize + addedData.length, INITIAL_MAPPED_SIZE);
+                MappedByteBuffer tempMapped = tempChannel.map(FileChannel.MapMode.READ_WRITE, 0, mapSize);
+                tempMapped.position((int) newLogicalFileSize);
 
-            try {
-                openChannelAndMap();
-                logicalFileSize = newLogicalFileSize;
-                mappedBuffer.position((int) logicalFileSize);
-            } catch (IOException e) {
-                throw new IOException("Failed to reopen compacted log: " + logPath, e);
+                java.nio.ByteBuffer addedBuf = java.nio.ByteBuffer.wrap(addedData);
+                for (int i = 0; i < addedCount; i++) {
+                    newPositions.add((long) tempMapped.position());
+                    int length = addedBuf.getInt();
+                    tempMapped.putInt(length);
+
+                    byte[] data = new byte[length];
+                    addedBuf.get(data);
+                    tempMapped.put(data);
+                }
+
+                newLogicalFileSize = tempMapped.position();
+                if (fsyncEnabled) tempMapped.force();
+                tempChannel.truncate(newLogicalFileSize);
             }
-            
-            entries.subList(0, removeCount).clear();
-            filePositions.clear();
-            filePositions.addAll(newPositions);
-            startIndex = upToIndex + 1;
-            
-            logger.debug("Compacted Raft log on disk up to index {}", upToIndex);
+            initialSize = currentSize;
         }
     }
 

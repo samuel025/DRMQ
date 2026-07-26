@@ -110,86 +110,67 @@ class RaftNodeTest {
     }
 
     // ===========================
-    //  InstallSnapshot Tests
+    //  Incremental Sync Tests
     // ===========================
 
     @Test
-    void handlesInstallSnapshotFromValidLeader() {
+    void handlesIncrementalSnapshotChunkFromValidLeader() {
         // Assume node has some initial state
         raftNode.handleAppendEntries(AppendEntriesRequest.newBuilder()
                 .setTerm(1).setLeaderId("node2").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0).build());
 
-        // Create a real in-memory ZIP file
-        java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
-        try (java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(baos)) {
-            zos.putNextEntry(new java.util.zip.ZipEntry("state.properties"));
-            zos.write("currentTerm=2\nlastApplied=50\nlastAppliedTerm=2\nvotedFor=\n".getBytes());
-            zos.closeEntry();
-        } catch (java.io.IOException e) {
-            throw new RuntimeException(e);
-        }
-        byte[] zipBytes = baos.toByteArray();
-        int splitPoint = zipBytes.length / 2;
-        com.google.protobuf.ByteString zipPart1 = com.google.protobuf.ByteString.copyFrom(zipBytes, 0, splitPoint);
-        com.google.protobuf.ByteString zipPart2 = com.google.protobuf.ByteString.copyFrom(zipBytes, splitPoint, zipBytes.length - splitPoint);
-
-        // Send install snapshot (first chunk)
-        InstallSnapshotRequest chunk1 = InstallSnapshotRequest.newBuilder()
+        // Send a chunk
+        IncrementalSnapshotChunk chunk = IncrementalSnapshotChunk.newBuilder()
                 .setTerm(2)
                 .setLeaderId("node3")
-                .setLastIncludedIndex(50)
-                .setLastIncludedTerm(2)
-                .setOffset(0)
-                .setData(zipPart1)
-                .setDone(false)
+                .setTopic("test-topic")
+                .setFileName("000000.log")
+                .setFileOffset(0)
+                .setData(com.google.protobuf.ByteString.copyFromUtf8("hello"))
+                .setIsLastChunkForFile(false)
                 .build();
 
-        InstallSnapshotResponse response1 = raftNode.handleInstallSnapshot(chunk1);
-        assertEquals(2, response1.getTerm());
+        IncrementalSnapshotChunkResponse response = raftNode.handleIncrementalSnapshotChunk(chunk);
+        assertEquals(2, response.getTerm());
         assertEquals(2, raftNode.getCurrentTerm());
         assertEquals("node3", raftNode.getLeaderId());
         assertEquals(RaftState.FOLLOWER, raftNode.getState());
+        assertTrue(response.getSuccess());
 
-        // Send final chunk
-        InstallSnapshotRequest chunk2 = InstallSnapshotRequest.newBuilder()
+        // And the Done request
+        IncrementalSnapshotDoneRequest doneReq = IncrementalSnapshotDoneRequest.newBuilder()
                 .setTerm(2)
                 .setLeaderId("node3")
                 .setLastIncludedIndex(50)
                 .setLastIncludedTerm(2)
-                .setOffset(splitPoint)
-                .setData(zipPart2)
-                .setDone(true)
                 .build();
-                
-        // Note: the test will fail during restoreSnapshot if we don't mock it or if it's not a real zip,
-        // but since we handle exceptions gracefully in handleInstallSnapshot, we can just verify term state.
-        // Actually, handleInstallSnapshot catches Exception and returns term=2.
-        InstallSnapshotResponse response2 = raftNode.handleInstallSnapshot(chunk2);
-
-        assertEquals(2, response2.getTerm());
-        assertEquals(2, raftNode.getCurrentTerm());
+        
+        IncrementalSnapshotDoneResponse doneResponse = raftNode.handleIncrementalSnapshotDone(doneReq);
+        assertEquals(2, doneResponse.getTerm());
+        assertTrue(doneResponse.getSuccess());
     }
 
     @Test
-    void rejectsInstallSnapshotFromOlderTerm() {
+    void rejectsIncrementalSnapshotChunkFromOlderTerm() {
         // Set node term to 3
         raftNode.handleAppendEntries(AppendEntriesRequest.newBuilder()
                 .setTerm(3).setLeaderId("node3").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0).build());
 
-        InstallSnapshotRequest request = InstallSnapshotRequest.newBuilder()
+        IncrementalSnapshotChunk chunk = IncrementalSnapshotChunk.newBuilder()
                 .setTerm(2)
                 .setLeaderId("node2")
-                .setLastIncludedIndex(50)
-                .setLastIncludedTerm(2)
-                .setOffset(0)
-                .setDone(true)
+                .setTopic("test-topic")
+                .setFileName("000000.log")
+                .setFileOffset(0)
+                .setData(com.google.protobuf.ByteString.copyFromUtf8("hello"))
                 .build();
 
-        InstallSnapshotResponse response = raftNode.handleInstallSnapshot(request);
+        IncrementalSnapshotChunkResponse response = raftNode.handleIncrementalSnapshotChunk(chunk);
 
         assertEquals(3, response.getTerm());
         assertEquals(3, raftNode.getCurrentTerm());
         assertEquals("node3", raftNode.getLeaderId(), "Leader should not change on older term request");
+        assertFalse(response.getSuccess());
     }
 
     // ===========================
