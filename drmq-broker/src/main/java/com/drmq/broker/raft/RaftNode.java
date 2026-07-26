@@ -82,6 +82,7 @@ public class RaftNode {
     private final ReentrantLock lock = new ReentrantLock();
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
     private final ExecutorService raftExecutor;
+    private final ExecutorService snapshotExecutor;
     private ScheduledFuture<?> electionTimer;
     private ScheduledFuture<?> heartbeatTimer;    
     private ScheduledFuture<?> proposalCleanupTimer;
@@ -140,6 +141,12 @@ public class RaftNode {
                 Math.max(4, peers.size() + 2),
                 r -> {
                     Thread t = new Thread(r, "raft-rpc-" + nodeId);
+                    t.setDaemon(true);
+                    return t;
+                });
+        this.snapshotExecutor = Executors.newCachedThreadPool(
+                r -> {
+                    Thread t = new Thread(r, "raft-snapshot-" + nodeId);
                     t.setDaemon(true);
                     return t;
                 });
@@ -583,16 +590,7 @@ public class RaftNode {
         if (state != RaftState.LEADER || !running) return;
 
         for (PeerAddress peer : peers) {
-            AtomicBoolean replicating = isReplicating.computeIfAbsent(peer.id(), k -> new AtomicBoolean(false));
-            if (replicating.compareAndSet(false, true)) {
-                CompletableFuture.runAsync(() -> {
-                    try {
-                        replicateTo(peer);
-                    } finally {
-                        replicating.set(false);
-                    }
-                }, raftExecutor);
-            } else if (snapshotInProgress.getOrDefault(peer.id(), false)) {
+            if (snapshotInProgress.getOrDefault(peer.id(), false)) {
                 // If replication is blocked generating a massive snapshot, the peer lock is free.
                 // Send a lightweight heartbeat so the follower's election timer doesn't fire.
                 AtomicBoolean heartbeatInFlight = isHeartbeatInFlight.computeIfAbsent(peer.id(), k -> new AtomicBoolean(false));
@@ -602,6 +600,17 @@ public class RaftNode {
                             sendLightweightHeartbeat(peer);
                         } finally {
                             heartbeatInFlight.set(false);
+                        }
+                    }, raftExecutor);
+                }
+            } else {
+                AtomicBoolean replicating = isReplicating.computeIfAbsent(peer.id(), k -> new AtomicBoolean(false));
+                if (replicating.compareAndSet(false, true)) {
+                    CompletableFuture.runAsync(() -> {
+                        try {
+                            replicateTo(peer);
+                        } finally {
+                            replicating.set(false);
                         }
                     }, raftExecutor);
                 }
@@ -644,7 +653,10 @@ public class RaftNode {
         java.util.function.Function<AppendEntriesRequest, AppendEntriesResponse> handler = appendRpcHandlers.get(peer.id());
         if (handler != null) {
             try {
-                handler.apply(request);
+                AppendEntriesResponse response = handler.apply(request);
+                if (response != null) {
+                    lastContactTime.put(peer.id(), System.currentTimeMillis());
+                }
             } catch (Exception ignored) {
             }
         }
@@ -665,11 +677,16 @@ public class RaftNode {
         try {
             if (state != RaftState.LEADER) return;
 
+            if (snapshotInProgress.getOrDefault(peer.id(), false)) {
+                return;
+            }
+
             peerNextIndex = nextIndex.getOrDefault(peer.id(), raftLog.getLastIndex() + 1);
             prevLogIndex = peerNextIndex - 1;
             
             if (peerNextIndex < raftLog.getStartIndex()) {
                 needsSnapshot = true;
+                snapshotInProgress.put(peer.id(), true);
                 return;
             }
 
@@ -679,7 +696,9 @@ public class RaftNode {
         } finally {
             lock.unlock();
             if (needsSnapshot) {
-                syncFollowerTier2(peer);
+                CompletableFuture.runAsync(() -> {
+                    syncFollowerTier2(peer);
+                }, snapshotExecutor);
             }
         }
 
