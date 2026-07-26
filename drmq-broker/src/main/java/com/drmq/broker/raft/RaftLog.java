@@ -223,7 +223,7 @@ public class RaftLog {
         
         List<RaftEntry> result = new ArrayList<>();
         long currentBytes = 0;
-        int maxBytes = 2 * 1024 * 1024; // 2 MB limit per RPC
+        int maxBytes = 8 * 1024 * 1024; // 8 MB limit per RPC (~7 entries)
         
         try {
             int originalPos = mappedBuffer.position();
@@ -434,7 +434,7 @@ public class RaftLog {
     }
 
     public synchronized void close() throws IOException {
-        if (fileChannel != null) {
+        if (fileChannel != null && fileChannel.isOpen()) {
             fileChannel.truncate(logicalFileSize);
             fileChannel.close();
         }

@@ -208,10 +208,10 @@ public class BrokerServer {
         }
     }
 
-    private volatile boolean isShutdownComplete = false;
+    private final java.util.concurrent.atomic.AtomicBoolean shutdownStarted = new java.util.concurrent.atomic.AtomicBoolean(false);
 
     public void shutdown() {
-        if (isShutdownComplete) return;
+        if (!shutdownStarted.compareAndSet(false, true)) return;
         logger.info("Shutting down Netty broker...");
         if (raftNode != null) {
             raftNode.stop();
@@ -282,7 +282,6 @@ public class BrokerServer {
             metrics.close();
         }
         running = false;
-        isShutdownComplete = true;
     }
 
     public boolean isRunning() { return running; }
