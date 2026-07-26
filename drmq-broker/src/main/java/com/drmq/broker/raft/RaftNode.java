@@ -83,6 +83,7 @@ public class RaftNode {
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
     private final ExecutorService raftExecutor;
     private final ExecutorService snapshotExecutor;
+    private final ExecutorService applyExecutor;
     private ScheduledFuture<?> electionTimer;
     private ScheduledFuture<?> heartbeatTimer;    
     private ScheduledFuture<?> proposalCleanupTimer;
@@ -147,6 +148,12 @@ public class RaftNode {
         this.snapshotExecutor = Executors.newCachedThreadPool(
                 r -> {
                     Thread t = new Thread(r, "raft-snapshot-" + nodeId);
+                    t.setDaemon(true);
+                    return t;
+                });
+        this.applyExecutor = Executors.newSingleThreadExecutor(
+                r -> {
+                    Thread t = new Thread(r, "raft-apply-" + nodeId);
                     t.setDaemon(true);
                     return t;
                 });
@@ -243,6 +250,7 @@ public class RaftNode {
         if (quorumCheckTimer != null) quorumCheckTimer.cancel(false);
         scheduler.shutdownNow();
         raftExecutor.shutdownNow();
+        applyExecutor.shutdownNow();
 
         pendingProposals.values().forEach(ps -> ps.future.completeExceptionally(
                 new IOException("Raft node shutting down")));
@@ -859,128 +867,131 @@ public class RaftNode {
      * unblocks the client thread that is waiting for Raft commitment.
      */
     private void applyCommitted() {
-        boolean applied = false;
+        applyExecutor.execute(() -> {
+            boolean applied = false;
+            
+            while (lastApplied < commitIndex) {
+                lastApplied++;
+                applied = true;
+                RaftEntry entry = raftLog.getEntry(lastApplied);
+                if (entry == null) {
+                    logger.error("[{}] Missing raft entry at index {} during apply", nodeId, lastApplied);
+                    break;
+                }
+                lastAppliedTerm = entry.getTerm();
 
-        while (lastApplied < commitIndex) {
-            lastApplied++;
-            applied = true;
-            RaftEntry entry = raftLog.getEntry(lastApplied);
-            if (entry == null) {
-                logger.error("[{}] Missing raft entry at index {} during apply", nodeId, lastApplied);
-                break;
-            }
-            lastAppliedTerm = entry.getTerm();
+                long completionValue = lastApplied;
+                boolean applySucceeded = true;
+                Exception applyException = null;
 
-            long completionValue = lastApplied;
-            boolean applySucceeded = true;
-            Exception applyException = null;
-
-            try {
-                switch (entry.getCommandType()) {
-                    case OFFSET_COMMIT -> {
-                        if (offsetManager != null && entry.hasConsumerGroup() && entry.hasOffsetValue()) {
-                            offsetManager.commit(
-                                    entry.getConsumerGroup(),
+                try {
+                    switch (entry.getCommandType()) {
+                        case OFFSET_COMMIT -> {
+                            if (offsetManager != null && entry.hasConsumerGroup() && entry.hasOffsetValue()) {
+                                offsetManager.commit(
+                                        entry.getConsumerGroup(),
+                                        entry.getTopic(),
+                                        entry.getOffsetValue()
+                                );
+                                logger.debug("[{}] Applied offset commit: group={}, topic={}, offset={}",
+                                        nodeId, entry.getConsumerGroup(), entry.getTopic(), entry.getOffsetValue());
+                            }
+                        }
+                        case BATCH_MESSAGE -> {
+                            ProduceBatchRequest batchRequest = ProduceBatchRequest.parseFrom(entry.getPayload());
+                            long baseOffset = messageStore.appendBatch(entry.getTopic(), batchRequest.getEntriesList());
+                            completionValue = baseOffset;
+                            logger.debug("[{}] Applied raft batch entry {} to MessageStore (topic={}, count={})",
+                                    nodeId, lastApplied, entry.getTopic(), batchRequest.getEntriesCount());
+                        }
+                        case ATOMIC_BATCH -> {
+                            com.drmq.protocol.DRMQProtocol.AtomicBatchRequest req = com.drmq.protocol.DRMQProtocol.AtomicBatchRequest.parseFrom(entry.getPayload());
+                            Map<String, Long> baseOffsets = messageStore.appendAtomicBatch(req.getSlicesList());
+                            completionValue = lastApplied;
+                            logger.debug("[{}] Applied ATOMIC_BATCH entry {} to {} topics: {}",
+                                    nodeId, lastApplied, req.getSlicesCount(),
+                                    baseOffsets.keySet());
+                        }
+                        default -> {
+                            long msgOffset = messageStore.append(
                                     entry.getTopic(),
-                                    entry.getOffsetValue()
+                                    entry.getPayload().toByteArray(),
+                                    entry.hasKey() ? entry.getKey() : null,
+                                    entry.getTimestamp()
                             );
-                            logger.debug("[{}] Applied offset commit: group={}, topic={}, offset={}",
-                                    nodeId, entry.getConsumerGroup(), entry.getTopic(), entry.getOffsetValue());
+                            completionValue = msgOffset;
+                            logger.debug("[{}] Applied raft entry {} to MessageStore (topic={})",
+                                    nodeId, lastApplied, entry.getTopic());
                         }
                     }
-                    case BATCH_MESSAGE -> {
-                        ProduceBatchRequest batchRequest = ProduceBatchRequest.parseFrom(entry.getPayload());
-                        long baseOffset = messageStore.appendBatch(entry.getTopic(), batchRequest.getEntriesList());
-                        completionValue = baseOffset;
-                        logger.debug("[{}] Applied raft batch entry {} to MessageStore (topic={}, count={})",
-                                nodeId, lastApplied, entry.getTopic(), batchRequest.getEntriesCount());
-                    }
-                    case ATOMIC_BATCH -> {
-                        com.drmq.protocol.DRMQProtocol.AtomicBatchRequest req = com.drmq.protocol.DRMQProtocol.AtomicBatchRequest.parseFrom(entry.getPayload());
-                        Map<String, Long> baseOffsets = messageStore.appendAtomicBatch(req.getSlicesList());
-                        completionValue = lastApplied;
-                        logger.debug("[{}] Applied ATOMIC_BATCH entry {} to {} topics: {}",
-                                nodeId, lastApplied, req.getSlicesCount(),
-                                baseOffsets.keySet());
-                    }
-                    default -> {
-                        long msgOffset = messageStore.append(
-                                entry.getTopic(),
-                                entry.getPayload().toByteArray(),
-                                entry.hasKey() ? entry.getKey() : null,
-                                entry.getTimestamp()
-                        );
-                        completionValue = msgOffset;
-                        logger.debug("[{}] Applied raft entry {} to MessageStore (topic={})",
-                                nodeId, lastApplied, entry.getTopic());
-                    }
+                } catch (Exception e) {
+                    applySucceeded = false;
+                    applyException = e;
+                    logger.error("FATAL: [{}] Failed to apply entry {} (type={}) to MessageStore. Panicking to avoid becoming a zombie node!",
+                            nodeId, lastApplied, entry.getCommandType(), e);
+                    System.exit(1);
                 }
-            } catch (Exception e) {
-                applySucceeded = false;
-                applyException = e;
-                logger.error("[{}] Failed to apply entry {} (type={})",
-                        nodeId, lastApplied, entry.getCommandType(), e);
+
+                ProposalState ps = pendingProposals.get(lastApplied);
+                if (ps != null && ps.term == currentTerm) {
+                    pendingProposals.remove(lastApplied);
+                    if (applySucceeded) {
+                        ps.future.complete(completionValue);
+                        logger.debug("[{}] Completed proposal for entry index {} (term={})",
+                                nodeId, lastApplied, ps.term);
+                    } else {
+                        ps.future.completeExceptionally(applyException != null
+                                ? applyException
+                                : new IOException("Failed to apply entry " + lastApplied));
+                    }
+                } else if (ps != null) {
+                    pendingProposals.remove(lastApplied);
+                    logger.warn("[{}] Discarding future for entry {} (was term {}, now term {})",
+                            nodeId, lastApplied, ps.term, currentTerm);
+                }
             }
 
-            ProposalState ps = pendingProposals.get(lastApplied);
-            if (ps != null && ps.term == currentTerm) {
-                pendingProposals.remove(lastApplied);
-                if (applySucceeded) {
-                    ps.future.complete(completionValue);
-                    logger.debug("[{}] Completed proposal for entry index {} (term={})",
-                            nodeId, lastApplied, ps.term);
+            if (applied) {
+                stateSaveNeeded = true;
+
+                long retentionLimit = lastApplied - (raftCompactThreshold * 2);
+                long safeCompactIndex;
+
+                if (isLeader()) {
+                    long minMatchIndex = lastApplied;
+                    for (long idx : matchIndex.values()) {
+                        minMatchIndex = Math.min(minMatchIndex, idx);
+                    }
+                    safeCompactIndex = Math.max(retentionLimit, minMatchIndex);
                 } else {
-                    ps.future.completeExceptionally(applyException != null
-                            ? applyException
-                            : new IOException("Failed to apply entry " + lastApplied));
+                    safeCompactIndex = lastApplied;
                 }
-            } else if (ps != null) {
-                pendingProposals.remove(lastApplied);
-                logger.warn("[{}] Discarding future for entry {} (was term {}, now term {})",
-                        nodeId, lastApplied, ps.term, currentTerm);
-            }
-        }
 
-        if (applied) {
-            stateSaveNeeded = true;
+                long finalCompactIndex = Math.min(safeCompactIndex, lastApplied - raftCompactThreshold);
+      
+                long currentLogStart = raftLog.getStartIndex();
+                boolean compactionDue = finalCompactIndex > 0
+                        && (finalCompactIndex - currentLogStart) >= raftCompactThreshold;
 
-            long retentionLimit = lastApplied - (raftCompactThreshold * 2);
-            long safeCompactIndex;
-
-            if (isLeader()) {
-                long minMatchIndex = lastApplied;
-                for (long idx : matchIndex.values()) {
-                    minMatchIndex = Math.min(minMatchIndex, idx);
-                }
-                safeCompactIndex = Math.max(retentionLimit, minMatchIndex);
-            } else {
-                safeCompactIndex = lastApplied;
-            }
-
-            long finalCompactIndex = Math.min(safeCompactIndex, lastApplied - raftCompactThreshold);
-  
-            long currentLogStart = raftLog.getStartIndex();
-            boolean compactionDue = finalCompactIndex > 0
-                    && (finalCompactIndex - currentLogStart) >= raftCompactThreshold;
-
-            if (compactionDue) {
-                if (isCompacting.compareAndSet(false, true)) {
-                    raftExecutor.execute(() -> {
-                        try {
-                            if (messageStore != null) messageStore.forceFlush();
-                            if (offsetManager != null) offsetManager.forceFlush();
-                            raftLog.compact(finalCompactIndex);
-                            logger.debug("[{}] Chunked compaction complete: log now starts at {}",
-                                    nodeId, finalCompactIndex + 1);
-                        } catch (IOException e) {
-                            logger.error("Failed to compact Raft log", e);
-                        } finally {
-                            isCompacting.set(false);
-                        }
-                    });
+                if (compactionDue) {
+                    if (isCompacting.compareAndSet(false, true)) {
+                        raftExecutor.execute(() -> {
+                            try {
+                                if (messageStore != null) messageStore.forceFlush();
+                                if (offsetManager != null) offsetManager.forceFlush();
+                                raftLog.compact(finalCompactIndex);
+                                logger.debug("[{}] Chunked compaction complete: log now starts at {}",
+                                        nodeId, finalCompactIndex + 1);
+                            } catch (IOException e) {
+                                logger.error("Failed to compact Raft log", e);
+                            } finally {
+                                isCompacting.set(false);
+                            }
+                        });
+                    }
                 }
             }
-        }
+        });
     }
 
 
@@ -1536,6 +1547,10 @@ public class RaftNode {
             Path topicDir = dataDir.resolve(topic);
             Files.createDirectories(topicDir);
             Path filePath = topicDir.resolve(fileName);
+            
+            if (request.getFileOffset() == 0) {
+                 logger.info("[{}] Receiving Tier 2 Sync chunk for topic: {}, file: {}", nodeId, topic, fileName);
+            }
 
             try (java.nio.channels.FileChannel channel = java.nio.channels.FileChannel.open(filePath, 
                     java.nio.file.StandardOpenOption.CREATE, 
@@ -1590,11 +1605,6 @@ public class RaftNode {
             if (snapshotIndex > lastApplied) {
                 logger.info("[{}] Received IncrementalSnapshotDone. Advancing state up to index {}", nodeId, snapshotIndex);
                 
-                messageStore.reload();
-                if (offsetManager != null) {
-                    offsetManager.reload();
-                }
-
                 if (raftLog.getLastIndex() > 0) {
                     try {
                         long compactUpTo = Math.min(snapshotIndex, raftLog.getLastIndex());
@@ -1607,8 +1617,20 @@ public class RaftNode {
                 lastApplied = snapshotIndex;
                 lastAppliedTerm = request.getLastIncludedTerm();
                 commitIndex = Math.max(commitIndex, snapshotIndex);
-                logger.info("[{}] Successfully applied Tier 2 sync. lastApplied={}, commitIndex={}",
-                        nodeId, lastApplied, commitIndex);
+                
+                applyExecutor.execute(() -> {
+                    try {
+                        messageStore.reload();
+                        if (offsetManager != null) {
+                            offsetManager.reload();
+                        }
+                        logger.info("[{}] Successfully applied Tier 2 sync. lastApplied={}, commitIndex={}",
+                                nodeId, snapshotIndex, commitIndex);
+                    } catch (IOException e) {
+                        logger.error("FATAL: Failed to reload MessageStore after Tier 2 Sync. Panicking!", e);
+                        System.exit(1);
+                    }
+                });
             }
 
             return IncrementalSnapshotDoneResponse.newBuilder()

@@ -799,6 +799,8 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
                 RequestTopicOffsetsRequest request = RequestTopicOffsetsRequest.parseFrom(envelope.getPayload());
                 java.util.Map<String, Long> offsets = messageStore.getTopicMaxOffsets();
                 
+                logger.info("Follower generating topic offsets for Tier 2 Incremental Sync ({} topics found)", offsets.size());
+                
                 RequestTopicOffsetsResponse response = RequestTopicOffsetsResponse.newBuilder()
                         .setTerm(raftNode != null ? raftNode.getCurrentTerm() : 0)
                         .putAllTopicOffsets(offsets)
