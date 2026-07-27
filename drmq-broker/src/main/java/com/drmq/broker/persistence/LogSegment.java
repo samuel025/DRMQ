@@ -1,7 +1,7 @@
 package com.drmq.broker.persistence;
 
 import com.drmq.broker.BrokerMetrics;
-import com.drmq.protocol.DRMQProtocol.StoredMessage;
+import com.drmq.protocol.StoredMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 

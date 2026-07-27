@@ -2,8 +2,7 @@ package com.drmq.broker;
 
 import com.drmq.broker.raft.RaftNode;
 import com.drmq.broker.ClusterEventBuffer;
-import com.drmq.protocol.DRMQProtocol.*;
-import com.drmq.protocol.DRMQProtocol.ErrorCode;
+import com.drmq.protocol.*;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.group.ChannelGroup;
@@ -255,7 +254,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
         long payloadBytes = 0;
         int count = 0;
         try {
-            com.drmq.protocol.DRMQProtocol.AtomicProduceRequest request = com.drmq.protocol.DRMQProtocol.AtomicProduceRequest.parseFrom(envelope.getPayload());
+            com.drmq.protocol.AtomicProduceRequest request = com.drmq.protocol.AtomicProduceRequest.parseFrom(envelope.getPayload());
 
             for (var slice : request.getSlicesList()) {
                 count += slice.getEntriesCount();
@@ -288,7 +287,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
             return offsetsFuture.thenApply(offsets -> {
                 logger.debug("Produced atomic batch: topics={}, count={}", offsets.keySet(), finalBatchCount);
 
-                com.drmq.protocol.DRMQProtocol.AtomicProduceResponse response = com.drmq.protocol.DRMQProtocol.AtomicProduceResponse.newBuilder()
+                com.drmq.protocol.AtomicProduceResponse response = com.drmq.protocol.AtomicProduceResponse.newBuilder()
                         .setSuccess(true)
                         .putAllBaseOffsets(offsets)
                         .build();
@@ -316,7 +315,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
     }
 
     private MessageEnvelope createAtomicProduceErrorResponse(String errorMessage, ErrorCode errorCode) {
-        com.drmq.protocol.DRMQProtocol.AtomicProduceResponse response = com.drmq.protocol.DRMQProtocol.AtomicProduceResponse.newBuilder()
+        com.drmq.protocol.AtomicProduceResponse response = com.drmq.protocol.AtomicProduceResponse.newBuilder()
                 .setSuccess(false)
                 .setErrorMessage(errorMessage != null ? errorMessage : "Unknown error")
                 .setErrorCode(errorCode)

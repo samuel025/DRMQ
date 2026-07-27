@@ -2,9 +2,7 @@ package com.drmq.broker;
 
 import com.drmq.broker.persistence.LogManager;
 import com.drmq.broker.persistence.LogSegment;
-import com.drmq.protocol.DRMQProtocol.AtomicBatchTopicSlice;
-import com.drmq.protocol.DRMQProtocol.ProduceBatchRequest;
-import com.drmq.protocol.DRMQProtocol.StoredMessage;
+import com.drmq.protocol.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -869,4 +867,3 @@ public class MessageStore implements Closeable {
     }
 
 }
-

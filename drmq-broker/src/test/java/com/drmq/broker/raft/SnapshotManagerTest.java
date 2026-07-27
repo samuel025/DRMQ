@@ -8,7 +8,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-
+import com.drmq.protocol.*;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -59,17 +59,17 @@ class SnapshotManagerTest {
         java.util.concurrent.atomic.AtomicInteger chunkCount = new java.util.concurrent.atomic.AtomicInteger(0);
         java.util.concurrent.atomic.AtomicBoolean doneCalled = new java.util.concurrent.atomic.AtomicBoolean(false);
 
-        java.util.function.Function<com.drmq.protocol.DRMQProtocol.IncrementalSnapshotChunk, com.drmq.protocol.DRMQProtocol.IncrementalSnapshotChunkResponse> chunkHandler = req -> {
+        java.util.function.Function<IncrementalSnapshotChunk, IncrementalSnapshotChunkResponse> chunkHandler = req -> {
             chunkCount.incrementAndGet();
             assertEquals("test-topic", req.getTopic());
             assertTrue(req.getData().size() > 0);
-            return com.drmq.protocol.DRMQProtocol.IncrementalSnapshotChunkResponse.newBuilder().setSuccess(true).build();
+            return IncrementalSnapshotChunkResponse.newBuilder().setSuccess(true).build();
         };
 
-        java.util.function.Function<com.drmq.protocol.DRMQProtocol.IncrementalSnapshotDoneRequest, com.drmq.protocol.DRMQProtocol.IncrementalSnapshotDoneResponse> doneHandler = req -> {
+        java.util.function.Function<IncrementalSnapshotDoneRequest, IncrementalSnapshotDoneResponse> doneHandler = req -> {
             doneCalled.set(true);
             assertEquals(42L, req.getLastIncludedIndex());
-            return com.drmq.protocol.DRMQProtocol.IncrementalSnapshotDoneResponse.newBuilder().setSuccess(true).build();
+            return IncrementalSnapshotDoneResponse.newBuilder().setSuccess(true).build();
         };
 
         // Stream the segments

@@ -1,14 +1,11 @@
 package com.drmq.broker;
 
 import com.drmq.broker.persistence.LogManager;
-import com.drmq.protocol.DRMQProtocol.AtomicBatchTopicSlice;
-import com.drmq.protocol.DRMQProtocol.ProduceBatchRequest;
-
+import com.drmq.protocol.*;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -116,7 +113,7 @@ class MessageStoreTest {
             store.append("test", "msg".getBytes(), null, System.currentTimeMillis());
 
             @SuppressWarnings("unchecked")
-            var messages = (java.util.List<com.drmq.protocol.DRMQProtocol.StoredMessage>) future.get(2, TimeUnit.SECONDS);
+            var messages = (java.util.List<StoredMessage>) future.get(2, TimeUnit.SECONDS);
 
             assertEquals(1, messages.size());
             assertEquals(0, messages.get(0).getOffset());

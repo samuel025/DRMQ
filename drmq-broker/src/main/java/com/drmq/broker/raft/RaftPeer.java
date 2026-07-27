@@ -2,7 +2,7 @@ package com.drmq.broker.raft;
 
 import com.drmq.broker.BrokerConfig.PeerAddress;
 import com.drmq.broker.BrokerMetrics;
-import com.drmq.protocol.DRMQProtocol.*;
+import com.drmq.protocol.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -311,6 +311,5 @@ public class RaftPeer {
 
     public PeerAddress getAddress() { return address; }
 }
-
 
 

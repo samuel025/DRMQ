@@ -348,16 +348,16 @@ public class TelemetryWebSocketServer extends WebSocketServer {
                         // Calculate exact message lag by inspecting uncommitted Raft entries
                         long msgLag = 0;
                         for (long idx = peerApplied + 1; idx <= commitIndex; idx++) {
-                            com.drmq.protocol.DRMQProtocol.RaftEntry entry = raftNode.getRaftLog().getEntry(idx);
-                            if (entry != null && entry.getCommandType() == com.drmq.protocol.DRMQProtocol.RaftCommandType.BATCH_MESSAGE) {
+                            com.drmq.protocol.RaftEntry entry = raftNode.getRaftLog().getEntry(idx);
+                            if (entry != null && entry.getCommandType() == com.drmq.protocol.RaftCommandType.BATCH_MESSAGE) {
                                 try {
-                                    com.drmq.protocol.DRMQProtocol.ProduceBatchRequest batch = 
-                                        com.drmq.protocol.DRMQProtocol.ProduceBatchRequest.parseFrom(entry.getPayload());
+                                    com.drmq.protocol.ProduceBatchRequest batch =
+                                        com.drmq.protocol.ProduceBatchRequest.parseFrom(entry.getPayload());
                                     msgLag += batch.getEntriesCount();
                                 } catch (Exception e) {
                                     msgLag += 1; // Fallback
                                 }
-                            } else if (entry != null && entry.getCommandType() == com.drmq.protocol.DRMQProtocol.RaftCommandType.MESSAGE) {
+                            } else if (entry != null && entry.getCommandType() == com.drmq.protocol.RaftCommandType.MESSAGE) {
                                 msgLag += 1;
                             }
                         }

@@ -4,7 +4,7 @@ package com.drmq.protocol;
 
 option java_package = "com.drmq.protocol";
 option java_outer_classname = "DRMQProtocol";
-option java_multiple_files = false;
+option java_multiple_files = true;
 
 message ProduceRequest {
     string topic = 1;

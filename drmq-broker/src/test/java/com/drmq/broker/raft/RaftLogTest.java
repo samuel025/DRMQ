@@ -1,6 +1,6 @@
 package com.drmq.broker.raft;
 
-import com.drmq.protocol.DRMQProtocol.RaftEntry;
+import com.drmq.protocol.*;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;

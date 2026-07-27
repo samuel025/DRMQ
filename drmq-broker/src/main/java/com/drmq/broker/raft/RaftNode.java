@@ -5,7 +5,7 @@ import com.drmq.broker.BrokerMetrics;
 import com.drmq.broker.MessageStore;
 import com.drmq.broker.OffsetManager;
 import com.drmq.broker.ClusterEventBuffer;
-import com.drmq.protocol.DRMQProtocol.*;
+import com.drmq.protocol.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -47,7 +47,7 @@ public class RaftNode {
 
     // Batch coalescing constants
     private static final int MAX_AGGREGATION_DRAIN = 512;  // Max proposals per aggregation cycle
-    private static final long AGGREGATOR_LINGER_MS = 2;    // Max wait before draining queue
+    private static final long AGGREGATOR_LINGER_MS = 2;   // Max wait before draining queue (match client lingerMs)
 
     //  Persistent state (survives restart) 
     private volatile long currentTerm;
@@ -1096,7 +1096,7 @@ public class RaftNode {
                                     nodeId, lastApplied, entry.getTopic(), batchRequest.getEntriesCount());
                         }
                         case ATOMIC_BATCH -> {
-                            com.drmq.protocol.DRMQProtocol.AtomicBatchRequest req = com.drmq.protocol.DRMQProtocol.AtomicBatchRequest.parseFrom(entry.getPayload());
+                            com.drmq.protocol.AtomicBatchRequest req = com.drmq.protocol.AtomicBatchRequest.parseFrom(entry.getPayload());
                             Map<String, Long> baseOffsets = messageStore.appendAtomicBatch(req.getSlicesList());
                             completionValue = lastApplied;
                             logger.debug("[{}] Applied ATOMIC_BATCH entry {} to {} topics: {}",
@@ -1377,7 +1377,7 @@ public class RaftNode {
         return future.orTimeout(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
                 .thenApply(commitIndex -> {
                     Map<String, Long> offsets = new java.util.LinkedHashMap<>();
-                    for (com.drmq.protocol.DRMQProtocol.AtomicBatchTopicSlice s : slices) {
+                    for (com.drmq.protocol.AtomicBatchTopicSlice s : slices) {
                         offsets.put(s.getTopic(),
                             messageStore.getHeadOffset(s.getTopic()) - s.getEntriesCount() + 1);
                     }

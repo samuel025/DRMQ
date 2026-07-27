@@ -167,10 +167,10 @@ public class AdminHttpServer {
                 }
             }
 
-            List<com.drmq.protocol.DRMQProtocol.StoredMessage> messages = messageStore.getMessages(topic, offset, limit);
+            List<com.drmq.protocol.StoredMessage> messages = messageStore.getMessages(topic, offset, limit);
             JsonArray msgsArray = new JsonArray();
 
-            for (com.drmq.protocol.DRMQProtocol.StoredMessage msg : messages) {
+            for (com.drmq.protocol.StoredMessage msg : messages) {
                 JsonObject obj = new JsonObject();
                 obj.addProperty("offset", msg.getOffset());
                 obj.addProperty("timestamp", msg.getTimestamp());

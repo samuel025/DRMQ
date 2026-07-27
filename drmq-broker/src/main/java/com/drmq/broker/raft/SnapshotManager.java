@@ -5,6 +5,7 @@ import com.drmq.broker.OffsetManager;
 import com.drmq.broker.ClusterEventBuffer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import com.drmq.protocol.*;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -41,8 +42,8 @@ public class SnapshotManager {
             long snapshotTerm,
             String nodeId,
             com.drmq.broker.BrokerConfig.PeerAddress peer,
-            java.util.function.Function<com.drmq.protocol.DRMQProtocol.IncrementalSnapshotChunk, com.drmq.protocol.DRMQProtocol.IncrementalSnapshotChunkResponse> chunkHandler,
-            java.util.function.Function<com.drmq.protocol.DRMQProtocol.IncrementalSnapshotDoneRequest, com.drmq.protocol.DRMQProtocol.IncrementalSnapshotDoneResponse> doneHandler) {
+            java.util.function.Function<IncrementalSnapshotChunk,IncrementalSnapshotChunkResponse> chunkHandler,
+            java.util.function.Function<IncrementalSnapshotDoneRequest, IncrementalSnapshotDoneResponse> doneHandler) {
 
         logger.info("[{}] Starting Tier 2 Incremental Sync for peer {} at Raft index {}", nodeId, peer.id(), snapshotIndex);
 
@@ -57,14 +58,14 @@ public class SnapshotManager {
             }
 
             // After all topic files are streamed, send the Done request
-            com.drmq.protocol.DRMQProtocol.IncrementalSnapshotDoneRequest doneReq = com.drmq.protocol.DRMQProtocol.IncrementalSnapshotDoneRequest.newBuilder()
+            com.drmq.protocol.IncrementalSnapshotDoneRequest doneReq = com.drmq.protocol.IncrementalSnapshotDoneRequest.newBuilder()
                     .setTerm(snapshotTerm)
                     .setLeaderId(nodeId)
                     .setLastIncludedIndex(snapshotIndex)
                     .setLastIncludedTerm(snapshotTerm)
                     .build();
 
-            com.drmq.protocol.DRMQProtocol.IncrementalSnapshotDoneResponse doneResp = doneHandler.apply(doneReq);
+            com.drmq.protocol.IncrementalSnapshotDoneResponse doneResp = doneHandler.apply(doneReq);
             if (doneResp == null || !doneResp.getSuccess()) {
                 throw new IOException("Follower " + peer.id() + " rejected IncrementalSnapshotDoneRequest");
             }
@@ -77,7 +78,7 @@ public class SnapshotManager {
     }
 
     private void streamFile(Path filePath, String topic, long term, String leaderId,
-                            java.util.function.Function<com.drmq.protocol.DRMQProtocol.IncrementalSnapshotChunk, com.drmq.protocol.DRMQProtocol.IncrementalSnapshotChunkResponse> chunkHandler) throws IOException {
+                            java.util.function.Function<com.drmq.protocol.IncrementalSnapshotChunk, com.drmq.protocol.IncrementalSnapshotChunkResponse> chunkHandler) throws IOException {
         
         if (!Files.exists(filePath)) return;
         
@@ -100,7 +101,7 @@ public class SnapshotManager {
                     data = com.google.protobuf.ByteString.EMPTY;
                 }
 
-                com.drmq.protocol.DRMQProtocol.IncrementalSnapshotChunk chunkReq = com.drmq.protocol.DRMQProtocol.IncrementalSnapshotChunk.newBuilder()
+                com.drmq.protocol.IncrementalSnapshotChunk chunkReq = com.drmq.protocol.IncrementalSnapshotChunk.newBuilder()
                         .setTerm(term)
                         .setLeaderId(leaderId)
                         .setTopic(topic)
@@ -110,7 +111,7 @@ public class SnapshotManager {
                         .setIsLastChunkForFile(isDone)
                         .build();
 
-                com.drmq.protocol.DRMQProtocol.IncrementalSnapshotChunkResponse chunkResp = chunkHandler.apply(chunkReq);
+                com.drmq.protocol.IncrementalSnapshotChunkResponse chunkResp = chunkHandler.apply(chunkReq);
                 if (chunkResp == null || !chunkResp.getSuccess()) {
                     throw new IOException("Follower rejected file chunk for " + fileName);
                 }

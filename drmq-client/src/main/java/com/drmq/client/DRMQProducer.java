@@ -1,6 +1,6 @@
 package com.drmq.client;
 
-import com.drmq.protocol.DRMQProtocol.*;
+import com.drmq.protocol.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -276,9 +276,9 @@ public class DRMQProducer implements AutoCloseable {
                         }
                         return; // Success
                     } else {
-                        com.drmq.protocol.DRMQProtocol.ErrorCode errorCode = response.getErrorCode();
+                        ErrorCode errorCode = response.getErrorCode();
                         String errorMsg = response.getErrorMessage();
-                        if (errorCode == com.drmq.protocol.DRMQProtocol.ErrorCode.NOT_LEADER) {
+                        if (errorCode == ErrorCode.NOT_LEADER) {
                             String leaderAddr = errorMsg != null && errorMsg.startsWith("NOT_LEADER:") 
                                                 ? errorMsg.substring("NOT_LEADER:".length()) 
                                                 : "UNKNOWN";
@@ -398,9 +398,9 @@ public class DRMQProducer implements AutoCloseable {
     }
 
     private void sendAtomicBatchWithRetry(List<PendingAtomicMessage> batch) {
-        com.drmq.protocol.DRMQProtocol.AtomicProduceRequest.Builder reqBuilder = com.drmq.protocol.DRMQProtocol.AtomicProduceRequest.newBuilder();
+        com.drmq.protocol.AtomicProduceRequest.Builder reqBuilder = com.drmq.protocol.AtomicProduceRequest.newBuilder();
         
-        java.util.Map<String, com.drmq.protocol.DRMQProtocol.AtomicBatchTopicSlice.Builder> sliceBuilders = new java.util.HashMap<>();
+        java.util.Map<String, com.drmq.protocol.AtomicBatchTopicSlice.Builder> sliceBuilders = new java.util.HashMap<>();
         
         // Track the relative index for each message in the batch for each topic
         // Map of RequestIndex -> Map of Topic -> RelativeIndex
@@ -415,20 +415,20 @@ public class DRMQProducer implements AutoCloseable {
                 String topic = entry.getKey();
                 byte[] payload = entry.getValue();
 
-                com.drmq.protocol.DRMQProtocol.AtomicBatchTopicSlice.Builder sliceBuilder = sliceBuilders.computeIfAbsent(topic, 
-                        k -> com.drmq.protocol.DRMQProtocol.AtomicBatchTopicSlice.newBuilder().setTopic(k));
+                com.drmq.protocol.AtomicBatchTopicSlice.Builder sliceBuilder = sliceBuilders.computeIfAbsent(topic, 
+                        k -> com.drmq.protocol.AtomicBatchTopicSlice.newBuilder().setTopic(k));
                 
                 int currentIndex = sliceBuilder.getEntriesCount();
                 requestIndices.put(topic, currentIndex);
 
-                sliceBuilder.addEntries(com.drmq.protocol.DRMQProtocol.ProduceBatchRequest.BatchEntry.newBuilder()
+                sliceBuilder.addEntries(com.drmq.protocol.ProduceBatchRequest.BatchEntry.newBuilder()
                         .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
                         .setClientTimestamp(pm.timestamp)
                         .build());
             }
         }
 
-        for (com.drmq.protocol.DRMQProtocol.AtomicBatchTopicSlice.Builder sb : sliceBuilders.values()) {
+        for (com.drmq.protocol.AtomicBatchTopicSlice.Builder sb : sliceBuilders.values()) {
             reqBuilder.addSlices(sb.build());
         }
 
@@ -465,7 +465,7 @@ public class DRMQProducer implements AutoCloseable {
                     in.readFully(responseBytes);
 
                     MessageEnvelope responseEnvelope = MessageEnvelope.parseFrom(responseBytes);
-                    com.drmq.protocol.DRMQProtocol.AtomicProduceResponse response = com.drmq.protocol.DRMQProtocol.AtomicProduceResponse.parseFrom(responseEnvelope.getPayload());
+                    com.drmq.protocol.AtomicProduceResponse response = com.drmq.protocol.AtomicProduceResponse.parseFrom(responseEnvelope.getPayload());
 
                     if (response.getSuccess()) {
                         java.util.Map<String, Long> baseOffsets = response.getBaseOffsetsMap();
@@ -485,9 +485,9 @@ public class DRMQProducer implements AutoCloseable {
                         }
                         return;
                     } else {
-                        com.drmq.protocol.DRMQProtocol.ErrorCode errorCode = response.getErrorCode();
+                        ErrorCode errorCode = response.getErrorCode();
                         String errorMsg = response.getErrorMessage();
-                        if (errorCode == com.drmq.protocol.DRMQProtocol.ErrorCode.NOT_LEADER || 
+                        if (errorCode == ErrorCode.NOT_LEADER ||
                                 (errorMsg != null && errorMsg.startsWith("NOT_LEADER"))) {
                             String leaderAddr = errorMsg != null && errorMsg.startsWith("NOT_LEADER:") 
                                                 ? errorMsg.substring("NOT_LEADER:".length()) 

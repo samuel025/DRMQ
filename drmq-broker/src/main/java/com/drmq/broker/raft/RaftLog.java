@@ -1,6 +1,6 @@
 package com.drmq.broker.raft;
 
-import com.drmq.protocol.DRMQProtocol.RaftEntry;
+import com.drmq.protocol.RaftEntry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
