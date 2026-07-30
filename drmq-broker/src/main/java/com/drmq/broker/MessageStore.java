@@ -190,17 +190,21 @@ public class MessageStore implements Closeable {
                 .add(message);
     }
 
+    public long append(String topic, byte[] payload, String key, long clientTimestamp) {
+        return append(topic, com.google.protobuf.ByteString.copyFrom(payload), key, clientTimestamp);
+    }
+
     /**
      * Append a message to the specified topic.
      */
-    public long append(String topic, byte[] payload, String key, long clientTimestamp) {
+    public long append(String topic, com.google.protobuf.ByteString payload, String key, long clientTimestamp) {
         long offset = globalOffset.getAndIncrement();
         long storedAt = System.currentTimeMillis();
 
         StoredMessage.Builder builder = StoredMessage.newBuilder()
                 .setOffset(offset)
                 .setTopic(topic)
-                .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
+                .setPayload(payload)
                 .setTimestamp(clientTimestamp)
                 .setStoredAt(storedAt);
 

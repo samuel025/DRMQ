@@ -1314,7 +1314,7 @@ public class RaftNode {
                         default -> {
                             long msgOffset = messageStore.append(
                                     entry.getTopic(),
-                                    entry.getPayload().toByteArray(),
+                                    entry.getPayload(),
                                     entry.hasKey() ? entry.getKey() : null,
                                     entry.getTimestamp()
                             );
@@ -1453,6 +1453,10 @@ public class RaftNode {
      * Routes through the aggregation queue for batch coalescing.
      */
     public CompletableFuture<Long> proposeAsync(String topic, byte[] payload, String key, long timestamp) {
+        return proposeAsync(topic, com.google.protobuf.ByteString.copyFrom(payload), key, timestamp);
+    }
+
+    public CompletableFuture<Long> proposeAsync(String topic, com.google.protobuf.ByteString payload, String key, long timestamp) {
         // Quick guard: must be leader (volatile read, no lock)
         if (state != RaftState.LEADER) {
             CompletableFuture<Long> err = new CompletableFuture<>();
@@ -1462,7 +1466,7 @@ public class RaftNode {
 
         // Wrap single message as a 1-entry batch and route through aggregation
         ProduceBatchRequest.BatchEntry.Builder batchEntry = ProduceBatchRequest.BatchEntry.newBuilder()
-                .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
+                .setPayload(payload)
                 .setClientTimestamp(timestamp);
         if (key != null && !key.isEmpty()) {
             batchEntry.setKey(key);
@@ -1489,6 +1493,10 @@ public class RaftNode {
     }
 
     public long propose(String topic, byte[] payload, String key, long timestamp) throws IOException {
+        return propose(topic, com.google.protobuf.ByteString.copyFrom(payload), key, timestamp);
+    }
+
+    public long propose(String topic, com.google.protobuf.ByteString payload, String key, long timestamp) throws IOException {
         try {
             return proposeAsync(topic, payload, key, timestamp).join();
         } catch (java.util.concurrent.CompletionException e) {

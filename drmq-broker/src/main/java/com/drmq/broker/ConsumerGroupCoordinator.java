@@ -364,7 +364,7 @@ public class ConsumerGroupCoordinator implements Closeable {
                 List<StoredMessage> messages = messageStore.getMessages(topic, badOffset, 1);
                 if (!messages.isEmpty()) {
                     StoredMessage original = messages.get(0);
-                    byte[] payload = original.getPayload().toByteArray();
+                    com.google.protobuf.ByteString payload = original.getPayload();
                     String key = original.hasKey() ? original.getKey() : null;
 
                     if (raftNode != null && raftNode.isLeader()) {

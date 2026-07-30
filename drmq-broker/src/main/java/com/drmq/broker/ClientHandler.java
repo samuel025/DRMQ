@@ -120,8 +120,8 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
             ProduceRequest request = ProduceRequest.parseFrom(envelope.getPayload());
 
             String topic = request.getTopic();
-            byte[] payload = request.getPayload().toByteArray();
-            long finalPayloadBytes = payload.length;
+            com.google.protobuf.ByteString payload = request.getPayload();
+            long finalPayloadBytes = payload.size();
             String key = request.hasKey() ? request.getKey() : null;
             long timestamp = request.getTimestamp();
 
