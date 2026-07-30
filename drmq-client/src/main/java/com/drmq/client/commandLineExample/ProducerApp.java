@@ -28,12 +28,14 @@ public class ProducerApp {
             producer.connect();
             System.out.println("✓ Connected to broker (servers: " + bootstrapServers + ")\n");
             System.out.println("Commands:");
-            System.out.println("  send <topic> <message>  - Send a message to a topic");
-            System.out.println("  exit                    - Quit the application");
-            System.out.println("  help                    - Show this help\n");
+            System.out.println("  send <topic> <message>                       - Send a message to a topic");
+            System.out.println("  atomic <topic1>=<msg1> | <topic2>=<msg2> ... - Atomically send messages to multiple topics");
+            System.out.println("  exit                                         - Quit the application");
+            System.out.println("  help                                         - Show this help\n");
             System.out.println("Examples:");
             System.out.println("  send orders Book Order #101");
             System.out.println("  send payments Payment of ₦25.50");
+            System.out.println("  atomic orders=Order #102 | alerts=New order received");
             System.out.println("  send alerts System is ONLINE\n");
             System.out.println("─────────────────────────────────────────\n");
 
@@ -57,9 +59,10 @@ public class ProducerApp {
                     
                     case "help" -> {
                         System.out.println("\nCommands:");
-                        System.out.println("  send <topic> <message>  - Send a message");
-                        System.out.println("  exit                    - Quit");
-                        System.out.println("  help                    - Show help\n");
+                        System.out.println("  send <topic> <message>                       - Send a message");
+                        System.out.println("  atomic <topic1>=<msg1> | <topic2>=<msg2> ... - Atomically send messages to multiple topics");
+                        System.out.println("  exit                                         - Quit");
+                        System.out.println("  help                                         - Show help\n");
                     }
                     
                     case "send" -> {
@@ -80,6 +83,36 @@ public class ProducerApp {
                             } else {
                                 System.out.printf("❌ Failed: %s\n\n", result.getErrorMessage());
                             }
+                        } catch (Exception e) {
+                            System.out.printf("❌ Error: %s\n\n", e.getMessage());
+                        }
+                    }
+                    
+                    case "atomic" -> {
+                        String payloadStr = input.substring(command.length()).trim();
+                        if (payloadStr.isEmpty() || !payloadStr.contains("=")) {
+                            System.out.println("❌ Usage: atomic <topic1>=<msg1> | <topic2>=<msg2> ...");
+                            System.out.println("   Example: atomic orders=Book #102 | alerts=New order\n");
+                            continue;
+                        }
+                        
+                        String[] pairs = payloadStr.split("\\|");
+                        java.util.Map<String, byte[]> batch = new java.util.LinkedHashMap<>();
+                        for (String pair : pairs) {
+                            String[] kv = pair.split("=", 2);
+                            if (kv.length == 2) {
+                                batch.put(kv[0].trim(), kv[1].trim().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                            }
+                        }
+                        
+                        if (batch.size() < 2) {
+                            System.out.println("❌ atomic requires at least 2 topics.");
+                            continue;
+                        }
+                        
+                        try {
+                            java.util.Map<String, Long> result = producer.sendAtomic(batch).join();
+                            System.out.printf("✓ Atomic commit successful! Base offsets: %s\n\n", result);
                         } catch (Exception e) {
                             System.out.printf("❌ Error: %s\n\n", e.getMessage());
                         }

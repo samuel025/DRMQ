@@ -1,6 +1,9 @@
 package com.drmq.broker;
 
 import com.drmq.broker.persistence.LogManager;
+import com.drmq.protocol.DRMQProtocol.AtomicBatchTopicSlice;
+import com.drmq.protocol.DRMQProtocol.ProduceBatchRequest;
+
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -8,6 +11,9 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -249,6 +255,52 @@ class MessageStoreTest {
             assertTrue(segmentsAfter.size() < numSegmentsBefore, "Old segments should be deleted");
             assertEquals(1, segmentsAfter.size(), "Only the active segment should remain");
         }
+    }
+
+    @Test
+    void appendAtomicBatchStoresMessagesAcrossTopics() {
+        AtomicBatchTopicSlice slice1 = AtomicBatchTopicSlice.newBuilder()
+                .setTopic("topic-a")
+                .addEntries(ProduceBatchRequest.BatchEntry.newBuilder()
+                        .setPayload(com.google.protobuf.ByteString.copyFromUtf8("msgA1"))
+                        .setClientTimestamp(100L).build())
+                .addEntries(ProduceBatchRequest.BatchEntry.newBuilder()
+                        .setPayload(com.google.protobuf.ByteString.copyFromUtf8("msgA2"))
+                        .setClientTimestamp(200L).build())
+                .build();
+
+        AtomicBatchTopicSlice slice2 = AtomicBatchTopicSlice.newBuilder()
+                .setTopic("topic-b")
+                .addEntries(ProduceBatchRequest.BatchEntry.newBuilder()
+                        .setPayload(com.google.protobuf.ByteString.copyFromUtf8("msgB1"))
+                        .setClientTimestamp(300L).build())
+                .build();
+
+        Map<String, Long> baseOffsets = store.appendAtomicBatch(Arrays.asList(slice1, slice2));
+
+        assertEquals(2, baseOffsets.size());
+        assertEquals(0L, baseOffsets.get("topic-a"));
+        assertEquals(2L, baseOffsets.get("topic-b"));
+
+        assertEquals(3L, store.getCurrentOffset());
+        assertEquals(2L, store.getMessageCount("topic-a"));
+        assertEquals(1L, store.getMessageCount("topic-b"));
+
+        var msgA1 = store.getMessage("topic-a", 0);
+        assertEquals("msgA1", msgA1.getPayload().toStringUtf8());
+        
+        var msgA2 = store.getMessage("topic-a", 1);
+        assertEquals("msgA2", msgA2.getPayload().toStringUtf8());
+
+        var msgB1 = store.getMessage("topic-b", 2);
+        assertEquals("msgB1", msgB1.getPayload().toStringUtf8());
+    }
+
+    @Test
+    void appendAtomicBatchWithEmptyListReturnsEmptyMap() {
+        Map<String, Long> offsets = store.appendAtomicBatch(Collections.emptyList());
+        assertTrue(offsets.isEmpty());
+        assertEquals(0, store.getCurrentOffset());
     }
 }
 

@@ -2,6 +2,7 @@ package com.drmq.broker;
 
 import com.drmq.broker.persistence.LogManager;
 import com.drmq.broker.persistence.LogSegment;
+import com.drmq.protocol.DRMQProtocol.AtomicBatchTopicSlice;
 import com.drmq.protocol.DRMQProtocol.ProduceBatchRequest;
 import com.drmq.protocol.DRMQProtocol.StoredMessage;
 import org.slf4j.Logger;
@@ -335,6 +336,94 @@ public class MessageStore implements Closeable {
     }
 
     /**
+     * Atomically appends messages to multiple topics in a single operation.
+     * Either all topic writes succeed, or none are visible.
+     * Returns a map of topic -> base offset for each slice.
+     */
+    public Map<String, Long> appendAtomicBatch(List<AtomicBatchTopicSlice> slices) {
+        if (slices.isEmpty()) {
+            return Collections.emptyMap();
+        }
+
+        int totalMessages = slices.stream().mapToInt(AtomicBatchTopicSlice::getEntriesCount).sum();
+        if (totalMessages == 0) {
+            return Collections.emptyMap();
+        }
+
+        long baseOffset = globalOffset.getAndAdd(totalMessages);
+        long storedAt = System.currentTimeMillis();
+
+        Map<String, Long> topicBaseOffsets = new LinkedHashMap<>();
+        Map<String, List<StoredMessage>> topicMessages = new LinkedHashMap<>();
+
+        long currentOffset = baseOffset;
+        for (var slice : slices) {
+            String topic = slice.getTopic();
+            long topicBase = currentOffset;
+            topicBaseOffsets.put(topic, topicBase);
+
+            List<StoredMessage> messages = new ArrayList<>(slice.getEntriesCount());
+            for (var entry : slice.getEntriesList()) {
+                StoredMessage.Builder builder = StoredMessage.newBuilder()
+                        .setOffset(currentOffset++)
+                        .setTopic(topic)
+                        .setPayload(entry.getPayload())
+                        .setTimestamp(entry.getClientTimestamp())
+                        .setStoredAt(storedAt);
+
+                if (entry.hasKey()) {
+                    builder.setKey(entry.getKey());
+                }
+                messages.add(builder.build());
+            }
+            topicMessages.put(topic, messages);
+        }
+
+        globalLock.writeLock().lock();
+        try {
+            for (var entry : topicMessages.entrySet()) {
+                String topic = entry.getKey();
+                List<StoredMessage> messages = entry.getValue();
+                
+                Object topicLock = topicWriteLocks.computeIfAbsent(topic, k -> new Object());
+                List<Long> positions;
+                synchronized (topicLock) {
+                    LogSegment segment = logManager.getOrCreateActiveSegment(topic);
+                    if (segment.getSize() >= config.getLogSegmentBytes()) {
+                        segment = logManager.rollNewSegment(topic, topicBaseOffsets.get(topic));
+                    }
+                    positions = segment.appendBatch(messages);
+                }
+
+                AtomicLong counter = topicMessageCounts.computeIfAbsent(topic, k -> new AtomicLong());
+                AtomicLong head = topicHeadOffsets.computeIfAbsent(topic, k -> new AtomicLong(-1));
+                for (int i = 0; i < messages.size(); i++) {
+                    StoredMessage msg = messages.get(i);
+                    indexMessage(topic, msg.getOffset(), positions.get(i));
+                    addToCache(topic, msg);
+                    counter.incrementAndGet();
+                    if (msg.getOffset() > head.get()) {
+                        head.set(msg.getOffset());
+                    }
+                }
+                logger.debug("Atomic batch slice persisted: topic={}, baseOffset={}, count={}", topic, topicBaseOffsets.get(topic), messages.size());
+            }
+        } catch (IOException e) {
+            logger.error("Failed to persist atomic batch", e);
+            throw new RuntimeException("Failed to persist atomic batch", e);
+        } finally {
+            globalLock.writeLock().unlock();
+        }
+
+        synchronized (messageMonitor) {
+            messageSignal.incrementAndGet();
+            messageMonitor.notifyAll();
+        }
+
+        return topicBaseOffsets;
+    }
+
+    /**
      * Lock the store exclusively to safely take a snapshot of the log segments.
      */
     public void lockForSnapshot(Runnable task) {
@@ -429,18 +518,14 @@ public class MessageStore implements Closeable {
             LogSegment segment = logManager.getSegmentForOffset(topic, currentOffset);
             
             if (segment != null && segment == lastSegment) {
-                // The local segment floorEntry returned is the same one we just exhausted.
-                // This means the segment containing currentOffset is missing locally (archived).
                 segment = null;
             }
             
             if (segment == null) {
-                // Not found locally? Ask the InfinityLog!
                 if (infinityLogResolver != null) {
                     segment = infinityLogResolver.resolveMissingSegment(topic, currentOffset);
                 }
                 
-                // If still null (not in S3 or no S3), try to jump to the next available local segment
                 if (segment == null) {
                     ConcurrentSkipListMap<Long, LogSegment> allTopicSegments = logManager.getAllSegments().get(topic);
                     if (allTopicSegments != null) {

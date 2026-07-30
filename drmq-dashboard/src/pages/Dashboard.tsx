@@ -103,8 +103,8 @@ export default function Dashboard({
     }
   }, [telemetryState?.metrics?.produceLatencyMs, telemetryState?.metrics?.consumeLatencyMs, telemetryState?.latencies?.raftRpcMs, paused, telemetryState]);
 
-  /* ── Error state ───────────────────────────────────────────────── */
-  if (telemetryError) {
+  /* ── Error state (only block rendering when we have NO data at all) ── */
+  if (telemetryError && !telemetryState) {
     return (
       <div className="flex h-full items-center justify-center" style={{ background: '#000' }}>
         <div className="flex flex-col items-center gap-4">

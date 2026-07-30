@@ -161,7 +161,21 @@ public class RaftLog {
             return Collections.emptyList();
         }
         int from = (int) (fromIndex - startIndex);
-        int to   = Math.min(from + maxEntries, entries.size());
+        
+        int to = from;
+        long currentBytes = 0;
+        int maxBytes = 2 * 1024 * 1024; // 2 MB limit per RPC
+        
+        while (to < entries.size() && to - from < maxEntries) {
+            RaftEntry entry = entries.get(to);
+            long entrySize = entry.getSerializedSize();
+            if (to > from && currentBytes + entrySize > maxBytes) {
+                break; // ensure at least one entry is sent if the single entry is > 2MB
+            }
+            currentBytes += entrySize;
+            to++;
+        }
+        
         return new ArrayList<>(entries.subList(from, to));
     }
 

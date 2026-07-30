@@ -90,6 +90,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
             case APPEND_ENTRIES_REQUEST -> handleAppendEntriesRequest(envelope);
             case INSTALL_SNAPSHOT_REQUEST -> handleInstallSnapshotRequest(envelope);
             case SEARCH_OFFSET_BY_TIME_REQUEST -> handleSearchOffsetByTimeRequest(envelope);
+            case ATOMIC_PRODUCE_REQUEST -> handleAtomicProduceRequest(envelope);
             default -> createErrorResponse("Unknown message type: " + envelope.getType());
         };
     }
@@ -210,6 +211,74 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
                 .build();
         return MessageEnvelope.newBuilder()
                 .setType(MessageType.PRODUCE_BATCH_RESPONSE)
+                .setPayload(response.toByteString())
+                .build();
+    }
+
+    private MessageEnvelope handleAtomicProduceRequest(MessageEnvelope envelope) throws IOException {
+        long startNanos = System.nanoTime();
+        long totalPayloadBytes = 0;
+        int batchCount = 0;
+        try {
+            com.drmq.protocol.DRMQProtocol.AtomicProduceRequest request = com.drmq.protocol.DRMQProtocol.AtomicProduceRequest.parseFrom(envelope.getPayload());
+
+            for (var slice : request.getSlicesList()) {
+                batchCount += slice.getEntriesCount();
+                for (var entry : slice.getEntriesList()) {
+                    totalPayloadBytes += entry.getPayload().size();
+                }
+            }
+
+            if (batchCount == 0) {
+                return createAtomicProduceErrorResponse("Atomic batch must contain at least one message", ErrorCode.UNKNOWN_ERROR);
+            }
+            if (totalPayloadBytes > MAX_PAYLOAD_BYTES) {
+                return createAtomicProduceErrorResponse("Batch payload exceeds maximum size of " + MAX_PAYLOAD_BYTES + " bytes", ErrorCode.UNKNOWN_ERROR);
+            }
+
+            java.util.Map<String, Long> offsets;
+            if (raftNode != null) {
+                if (!raftNode.isLeader()) {
+                    String leaderAddr = raftNode.getLeaderAddress();
+                    return createAtomicProduceErrorResponse("NOT_LEADER:" +
+                            (leaderAddr != null ? leaderAddr : "UNKNOWN"), ErrorCode.NOT_LEADER);
+                }
+                offsets = raftNode.proposeAtomicBatch(request.getSlicesList());
+            } else {
+                offsets = messageStore.appendAtomicBatch(request.getSlicesList());
+            }
+
+            logger.debug("Produced atomic batch: topics={}, count={}", offsets.keySet(), batchCount);
+
+            com.drmq.protocol.DRMQProtocol.AtomicProduceResponse response = com.drmq.protocol.DRMQProtocol.AtomicProduceResponse.newBuilder()
+                    .setSuccess(true)
+                    .putAllBaseOffsets(offsets)
+                    .build();
+
+            BrokerMetrics.get().recordRequest("atomic_produce", true,
+                System.nanoTime() - startNanos, totalPayloadBytes, batchCount);
+
+            return MessageEnvelope.newBuilder()
+                    .setType(MessageType.ATOMIC_PRODUCE_RESPONSE)
+                    .setPayload(response.toByteString())
+                    .build();
+
+        } catch (Exception e) {
+            logger.error("Error processing atomic produce request", e);
+            BrokerMetrics.get().recordRequest("atomic_produce", false,
+                System.nanoTime() - startNanos, totalPayloadBytes, batchCount);
+            return createAtomicProduceErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR);
+        }
+    }
+
+    private MessageEnvelope createAtomicProduceErrorResponse(String errorMessage, ErrorCode errorCode) {
+        com.drmq.protocol.DRMQProtocol.AtomicProduceResponse response = com.drmq.protocol.DRMQProtocol.AtomicProduceResponse.newBuilder()
+                .setSuccess(false)
+                .setErrorMessage(errorMessage != null ? errorMessage : "Unknown error")
+                .setErrorCode(errorCode)
+                .build();
+        return MessageEnvelope.newBuilder()
+                .setType(MessageType.ATOMIC_PRODUCE_RESPONSE)
                 .setPayload(response.toByteString())
                 .build();
     }
@@ -532,6 +601,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<byte[]> {
             case COMMIT_OFFSET_RESPONSE -> createCommitOffsetErrorResponse(errorMessage);
             case FETCH_OFFSET_RESPONSE -> createFetchOffsetErrorResponse(errorMessage);
             case NACK_RESPONSE -> createNackErrorResponse(errorMessage);
+            case ATOMIC_PRODUCE_RESPONSE -> createAtomicProduceErrorResponse(errorMessage, ErrorCode.UNKNOWN_ERROR);
             default -> createProduceErrorResponse(errorMessage, ErrorCode.UNKNOWN_ERROR);
         };
     }

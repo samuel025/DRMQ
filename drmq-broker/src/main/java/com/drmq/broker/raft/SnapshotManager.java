@@ -48,6 +48,11 @@ public class SnapshotManager {
         Files.createDirectories(snapshotsDir);
         Path zipFile = snapshotsDir.resolve("snapshot_" + lastIncludedIndex + ".zip");
 
+        if (Files.exists(zipFile)) {
+            logger.debug("Snapshot for index {} already exists, skipping generation.", lastIncludedIndex);
+            return zipFile;
+        }
+
         logger.info("Starting snapshot generation for index {}...", lastIncludedIndex);
         long startMs = System.currentTimeMillis();
 
