@@ -51,9 +51,11 @@ class ConsumerGroupIntegrationTest {
         // Produce messages
         try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
             producer.connect();
+            List<CompletableFuture<?>> futures = new ArrayList<>();
             for (int i = 0; i < messageCount; i++) {
-                producer.send(topic, ("msg-" + i).getBytes());
+                futures.add(producer.send(topic, ("msg-" + i).getBytes()));
             }
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
         }
 
         // Two consumers in the same group poll concurrently
@@ -108,9 +110,11 @@ class ConsumerGroupIntegrationTest {
         // Produce messages
         try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
             producer.connect();
+            List<CompletableFuture<?>> futures = new ArrayList<>();
             for (int i = 0; i < messageCount; i++) {
-                producer.send(topic, ("fanout-" + i).getBytes());
+                futures.add(producer.send(topic, ("fanout-" + i).getBytes()));
             }
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
         }
 
         // Group A consumer
@@ -148,9 +152,11 @@ class ConsumerGroupIntegrationTest {
 
         try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
             producer.connect();
+            List<CompletableFuture<?>> futures = new ArrayList<>();
             for (int i = 0; i < messageCount; i++) {
-                producer.send(topic, ("solo-" + i).getBytes());
+                futures.add(producer.send(topic, ("solo-" + i).getBytes()));
             }
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
         }
 
         try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT, "solo-group")) {
@@ -177,8 +183,9 @@ class ConsumerGroupIntegrationTest {
         // Produce messages
         try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
             producer.connect();
-            producer.send(topic, "A".getBytes());
-            producer.send(topic, "B".getBytes());
+            CompletableFuture<?> f1 = producer.send(topic, "A".getBytes());
+            CompletableFuture<?> f2 = producer.send(topic, "B".getBytes());
+            CompletableFuture.allOf(f1, f2).join();
         }
 
         // First consumer reads and auto-commits

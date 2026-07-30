@@ -34,6 +34,7 @@ BATCH_SIZE=1048576          # 1 MiB batch             (matches Kafka benchmark)
 LINGER_MS=10                # 10 ms linger            (matches Kafka benchmark)
 CONCURRENCY=1              # 4 threads sharing 1 producer; keep accumulator full so
                              # batches reach 1 MiB before linger fires
+MODE="shared"              # "shared" (single producer) or "separate" (one per thread)
 # Network serialization (max.in.flight=1 equivalent) is enforced by DRMQProducer.senderLoop
 # ACKS = "all" is enforced by the Raft quorum — no extra flag needed
 BOOTSTRAP="localhost:9092,localhost:9093,localhost:9094"
@@ -44,22 +45,22 @@ BROKER_PORTS=(9092 9093 9094)
 BROKER_IDS=(node1 node2 node3)
 # Peer lists for each node  (id@host:raftPort; we use clientPort+10 as raft RPC port)
 BROKER_PEERS=(
-  "node2@localhost:9093,node3@localhost:9094"
-  "node1@localhost:9092,node3@localhost:9094"
-  "node1@localhost:9092,node2@localhost:9093"
+  "node2:localhost:9093,node3:localhost:9094"
+  "node1:localhost:9092,node3:localhost:9094"
+  "node1:localhost:9092,node2:localhost:9093"
 )
 
 BROKER_PIDS=()
 
 # ──────────────────── Locate the broker JAR / Maven ──────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BROKER_DIR="${SCRIPT_DIR}/drmq-broker"
-CLIENT_DIR="${SCRIPT_DIR}/drmq-client"
+BROKER_DIR="${SCRIPT_DIR}/../drmq-broker"
+CLIENT_DIR="${SCRIPT_DIR}/../drmq-client"
 
 # ──────────────────── Build both modules ─────────────────────────────────────
 build_modules() {
   echo "⏳ Building drmq-broker and drmq-client..."
-  (cd "${SCRIPT_DIR}" && mvn compile -pl drmq-broker,drmq-client -am -q 2>/dev/null)
+  (cd "${SCRIPT_DIR}/.." && mvn compile -pl drmq-broker,drmq-client -am -q 2>/dev/null)
   echo "✓  Build complete"
   echo ""
 }
@@ -83,7 +84,7 @@ peers=${peers}
 metrics.enabled=false
 log.segment.bytes=67108864
 log.retention.ms=3600000
-raft.compact.threshold=1000
+raft.compact.threshold=500
 raft.fsync.enabled=false
 EOF
 
@@ -149,11 +150,12 @@ wait_for_brokers() {
 run_producer_perf_test() {
   echo "────────────────────────────────────────────────────────────"
   echo " DRMQ Producer Performance Test"
-  echo "   Records      : $(printf '%,d' ${NUM_RECORDS})"
+  echo "   Records      : $(printf '%d' ${NUM_RECORDS})"
   echo "   Record size  : ${RECORD_SIZE} bytes  (1 KB)"
   echo "   Batch size   : ${BATCH_SIZE} bytes  (1 MiB)"
   echo "   Linger       : ${LINGER_MS} ms"
-  echo "   Concurrency  : ${CONCURRENCY} threads"
+  echo "   Concurrency  : ${CONCURRENCY} thread(s)"
+  echo "   Producer mode: ${MODE} ($([ "${MODE}" = "separate" ] && echo 'one per thread' || echo 'single shared producer'))"
   echo "   ACKs         : all (Raft quorum)"
   echo "   Bootstrap    : ${BOOTSTRAP}"
   echo "────────────────────────────────────────────────────────────"
@@ -162,7 +164,7 @@ run_producer_perf_test() {
   (cd "${CLIENT_DIR}" && \
     mvn exec:java \
       -Dexec.mainClass="com.drmq.client.commandLineExample.StressTestApp" \
-      -Dexec.args="${BOOTSTRAP} ${CONCURRENCY} ${TOPIC_NAME} ${RECORD_SIZE} ${NUM_RECORDS}")
+      -Dexec.args="${BOOTSTRAP} ${CONCURRENCY} ${TOPIC_NAME} ${RECORD_SIZE} ${NUM_RECORDS} ${MODE}")
 }
 
 # ──────────────────── Cleanup ─────────────────────────────────────────────────
@@ -177,6 +179,28 @@ cleanup() {
   echo "Done."
 }
 trap cleanup EXIT
+
+while getopts "b:c:n:s:m:h" opt; do
+  case $opt in
+    b) BOOTSTRAP="$OPTARG" ;;
+    c) CONCURRENCY="$OPTARG" ;;
+    n) NUM_RECORDS="$OPTARG" ;;
+    s) RECORD_SIZE="$OPTARG" ;;
+    m) MODE="$OPTARG" ;;
+    h) echo "Usage: ./stress_test.sh [-b brokers] [-c concurrency] [-n numRecords] [-s recordSize] [-m mode]"
+       echo ""
+       echo "  Modes:"
+       echo "    shared    (default) — single producer, threads fill accumulator"
+       echo "    separate           — one producer per thread"
+       echo ""
+       echo "  Examples:"
+       echo "    ./stress_test.sh                           → shared mode, 200K records"
+       echo "    ./stress_test.sh -c 4 -m separate           → 4 independent producers"
+       exit 0 ;;
+    *) echo "Usage: ./stress_test.sh [-b brokers] [-c concurrency] [-n numRecords] [-s recordSize] [-m mode]" >&2
+       exit 1 ;;
+  esac
+done
 
 # ──────────────────── Main flow ───────────────────────────────────────────────
 # Detect whether brokers are already running.

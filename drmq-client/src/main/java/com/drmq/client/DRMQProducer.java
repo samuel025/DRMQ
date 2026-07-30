@@ -176,12 +176,10 @@ public class DRMQProducer implements AutoCloseable {
     }
 
     private void senderLoop() {
-        while (running || !accumulator.isEmpty()) {
+        while (running || !accumulator.isEmpty()) { 
             try {
-                PendingMessage firstMsg = accumulator.poll(500, java.util.concurrent.TimeUnit.MILLISECONDS);
-                if (firstMsg == null) {
-                    continue;
-                }
+                PendingMessage firstMsg = accumulator.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS);
+                if (firstMsg == null) continue;
 
                 List<PendingMessage> currentBatch = new ArrayList<>();
                 currentBatch.add(firstMsg);
@@ -190,21 +188,16 @@ public class DRMQProducer implements AutoCloseable {
                 String currentTopic = firstMsg.topic;
 
                 while (currentBytes < batchSizeBytes) {
-                    PendingMessage peeked = accumulator.peek();
-                    if (peeked != null) {
-                        if (!currentTopic.equals(peeked.topic)) {
-                            break; 
-                        }
+                    long remaining = lingerMs - (System.currentTimeMillis() - firstMsgTime);
+                    if (remaining <= 0) break;
 
-                    PendingMessage msg = accumulator.poll();
+                    PendingMessage msg = accumulator.poll(remaining, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    if (msg == null) break;
+                    if (!currentTopic.equals(msg.topic)) {
+                        break;
+                    }
                     currentBatch.add(msg);
                     currentBytes += msg.payload.length;
-                    } else {
-                        if (System.currentTimeMillis() - firstMsgTime >= lingerMs) {
-                            break;
-                        }
-                        Thread.sleep(1); // Brief yield during linger window
-                    }
                 }
 
                 if (!currentBatch.isEmpty()) {
@@ -355,10 +348,8 @@ public class DRMQProducer implements AutoCloseable {
     private void atomicSenderLoop() {
         while (running || !atomicAccumulator.isEmpty()) {
             try {
-                PendingAtomicMessage firstMsg = atomicAccumulator.poll(500, java.util.concurrent.TimeUnit.MILLISECONDS);
-                if (firstMsg == null) {
-                    continue;
-                }
+                PendingAtomicMessage firstMsg = atomicAccumulator.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS);
+                if (firstMsg == null) continue;
 
                 List<PendingAtomicMessage> currentBatch = new ArrayList<>();
                 currentBatch.add(firstMsg);
@@ -369,18 +360,14 @@ public class DRMQProducer implements AutoCloseable {
                 long firstMsgTime = System.currentTimeMillis();
 
                 while (currentBytes < batchSizeBytes) {
-                    PendingAtomicMessage peeked = atomicAccumulator.peek();
-                    if (peeked != null) {
-                        PendingAtomicMessage msg = atomicAccumulator.poll();
-                        currentBatch.add(msg);
-                        for (byte[] payload : msg.topicMessages.values()) {
-                            currentBytes += payload.length;
-                        }
-                    } else {
-                        if (System.currentTimeMillis() - firstMsgTime >= lingerMs) {
-                            break;
-                        }
-                        Thread.sleep(1); 
+                    long remaining = lingerMs - (System.currentTimeMillis() - firstMsgTime);
+                    if (remaining <= 0) break;
+
+                    PendingAtomicMessage msg = atomicAccumulator.poll(remaining, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    if (msg == null) break;
+                    currentBatch.add(msg);
+                    for (byte[] payload : msg.topicMessages.values()) {
+                        currentBytes += payload.length;
                     }
                 }
 
@@ -594,15 +581,12 @@ public class DRMQProducer implements AutoCloseable {
 
     @Override
     public void close() {
-        running = false;
+        running = false; 
         if (atomicSenderThread != null && atomicSenderThread.isAlive()) {
             try {
                 atomicSenderThread.join(5000);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-            }
-            if (atomicSenderThread.isAlive()) {
-                atomicSenderThread.interrupt();
             }
         }
         if (senderThread != null && senderThread.isAlive()) {
@@ -610,9 +594,6 @@ public class DRMQProducer implements AutoCloseable {
                 senderThread.join(5000); // Wait up to 5 seconds to flush accumulator
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-            }
-            if (senderThread.isAlive()) {
-                senderThread.interrupt();
             }
         }
         synchronized (sendLock) {

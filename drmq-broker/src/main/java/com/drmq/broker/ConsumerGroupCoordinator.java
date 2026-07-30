@@ -154,13 +154,13 @@ public class ConsumerGroupCoordinator implements Closeable {
      * @param consumerId the consumer instance ID
      * @param offset     the next offset to read (last processed + 1)
      */
-    public void commitOffset(String group, String topic, String consumerId, long offset) {
+    public java.util.concurrent.CompletableFuture<Void> commitOffset(String group, String topic, String consumerId, long offset) {
         String key = groupKey(group, topic);
         GroupTopicState state = groupStates.get(key);
 
         if (state == null) {
             offsetManager.commit(group, topic, offset);
-            return;
+            return java.util.concurrent.CompletableFuture.completedFuture(null);
         }
 
         state.lock.lock();
@@ -177,7 +177,7 @@ public class ConsumerGroupCoordinator implements Closeable {
                         consumerId, offset, group, topic, lease.fromOffset, lease.toOffset);
             }
 
-            advanceCommittedOffset(state, group, topic);
+            return advanceCommittedOffset(state, group, topic);
 
         } finally {
             state.lock.unlock();
@@ -188,7 +188,7 @@ public class ConsumerGroupCoordinator implements Closeable {
      * Advance the group's committed offset by merging contiguous committed ranges.
      * Only commits to the OffsetManager when the offset actually advances.
      */
-    private void advanceCommittedOffset(GroupTopicState state, String group, String topic) {
+    private java.util.concurrent.CompletableFuture<Void> advanceCommittedOffset(GroupTopicState state, String group, String topic) {
         state.committedRanges.sort(Comparator.comparingLong(r -> r.fromOffset));
 
         long current = state.committedOffset;
@@ -209,17 +209,12 @@ public class ConsumerGroupCoordinator implements Closeable {
         if (current > state.committedOffset) {
             state.committedOffset = current;
             offsetManager.commit(group, topic, current);
-            if (raftNode != null && raftNode.isLeader()) {
-                try {
-                    raftNode.proposeOffsetCommit(group, topic, current);
-                } catch (Exception e) {
-                    logger.warn("Failed to replicate committed offset via Raft: group={}, topic={}, offset={}: {}",
-                            group, topic, current, e.getMessage());
-                }
-            }
-
             logger.debug("Advanced committed offset to {} for group={}, topic={}", current, group, topic);
+            if (raftNode != null && raftNode.isLeader()) {
+                return raftNode.proposeOffsetCommitAsync(group, topic, current).thenApply(idx -> null);
+            }
         }
+        return java.util.concurrent.CompletableFuture.completedFuture(null);
     }
 
     /**
@@ -252,6 +247,10 @@ public class ConsumerGroupCoordinator implements Closeable {
 
                         if (attempts >= maxDeliveries) {
                             routeToDlq(state, group, topic, badOffset);
+                            long rewindOffset = badOffset + 1;
+                            if (rewindOffset < state.dispatchOffset) {
+                                state.dispatchOffset = rewindOffset;
+                            }
                         } else {
                             if (lease.fromOffset < state.dispatchOffset) {
                                 state.dispatchOffset = lease.fromOffset;
@@ -329,6 +328,15 @@ public class ConsumerGroupCoordinator implements Closeable {
 
             if (attempts >= maxDeliveries) {
                 routeToDlq(state, group, topic, offset);
+                
+                long rewindOffset = (lease != null) ? lease.fromOffset : (offset + 1);
+                if (lease != null && lease.fromOffset == offset) {
+                    rewindOffset = offset + 1;
+                }
+                
+                if (rewindOffset < state.dispatchOffset) {
+                    state.dispatchOffset = rewindOffset;
+                }
                 return true;
             } else {
                 long rewindOffset = (lease != null) ? lease.fromOffset : offset;

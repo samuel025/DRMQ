@@ -10,10 +10,14 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * Multi-threaded Stress Test App
  * Spawns multiple threads within a single JVM to hammer the broker
- * with messages. Each thread shares the same producer pool.
+ * with messages.
+ *
+ * Two producer modes:
+ *   5th arg = "shared" (default)  — single producer, threads fill the accumulator
+ *   5th arg = "separate"         — one producer per thread
  *
  * Usage:
- *   StressTestApp [bootstrapServers] [concurrency] [topic] [msgSize] [numRecords]
+ *   StressTestApp [bootstrapServers] [concurrency] [topic] [msgSize] [numRecords] [mode]
  *
  * When numRecords > 0, the test runs in bounded mode: it sends exactly
  * numRecords messages, then prints a Kafka-style performance report
@@ -33,27 +37,35 @@ public class StressTestApp {
         int concurrency;
         int msgSize;
         long numRecords;
+        String producerMode;
         try {
             concurrency  = args.length > 1 ? Integer.parseInt(args[1]) : 4;
             msgSize      = args.length > 3 ? Integer.parseInt(args[3]) : 1024;
             numRecords   = args.length > 4 ? Long.parseLong(args[4])   : 0L;
+            producerMode = args.length > 5 ? args[5]                    : "shared";
             if (concurrency < 1 || msgSize < 1 || numRecords < 0) {
                 throw new NumberFormatException("Values must be positive");
             }
+            if (!producerMode.equals("shared") && !producerMode.equals("separate")) {
+                throw new NumberFormatException("mode must be 'shared' or 'separate'");
+            }
         } catch (NumberFormatException e) {
             System.err.println("Error: " + e.getMessage());
-            System.err.println("Usage: StressTestApp [bootstrapServers] [concurrency] [topic] [msgSize] [numRecords]");
+            System.err.println("Usage: StressTestApp [bootstrapServers] [concurrency] [topic] [msgSize] [numRecords] [mode]");
+            System.err.println("  mode: 'shared' (default, single producer) or 'separate' (one producer per thread)");
             System.exit(1);
             return;
         }
 
         String topic = args.length > 2 ? args[2] : "load-test-topic";
         boolean bounded = numRecords > 0;
+        boolean separateProducers = producerMode.equals("separate");
 
         // ── Configuration banner ──────────────────────────────────────────────
         System.out.println("Configuration:");
         System.out.println("  Brokers      : " + bootstrapServers);
-        System.out.println("  Concurrency  : " + concurrency + " threads");
+        System.out.println("  Concurrency  : " + concurrency + " thread(s)");
+        System.out.println("  Producer mode: " + (separateProducers ? "separate (one per thread)" : "shared (single producer)"));
         System.out.println("  Topic        : " + topic);
         System.out.println("  Payload Size : " + msgSize + " bytes");
         System.out.println("  Batch Size   : 1 MiB");
@@ -107,29 +119,45 @@ public class StressTestApp {
         reporter.setDaemon(true);
         reporter.start();
 
-        // ── In-flight semaphore ───────────────────────────────────────────────
-        // The senderLoop inside DRMQProducer already serializes network sends:
-        // it sends one batch at a time and waits for the ack (via sendLock)
-        // before sending the next — exactly like Kafka's max.in.flight=1 at the IO level.
-        //
-        // The semaphore here only limits how many messages are queued in the
-        // accumulator at once (backpressure). Keep it large so all concurrency
-        // threads can keep the accumulator full → batches reach 1 MiB before linger fires.
-        Semaphore inFlight = new Semaphore(8000);
+        // ── Build producer(s) ────────────────────────────────────────────────
+        // Two modes:
+        //   "shared"   — single DRMQProducer, all threads call send() on it.
+        //                The senderLoop batches across threads.
+        //   "separate" — each thread gets its own DRMQProducer (serial per producer).
+        final DRMQProducer[] producers;
+        if (separateProducers) {
+            producers = new DRMQProducer[concurrency];
+            for (int i = 0; i < concurrency; i++) {
+                producers[i] = new DRMQProducer(bootstrapServers);
+                producers[i].setBatchSizeBytes(1 * 1024 * 1024);
+                producers[i].setLingerMs(10);
+                try {
+                    producers[i].connect();
+                } catch (java.io.IOException e) {
+                    System.err.println("Failed to connect producer " + i + ": " + e.getMessage());
+                    System.exit(1);
+                }
+            }
+        } else {
+            producers = new DRMQProducer[1];
+            producers[0] = new DRMQProducer(bootstrapServers);
+            producers[0].setBatchSizeBytes(1 * 1024 * 1024);
+            producers[0].setLingerMs(10);
+            try {
+                producers[0].connect();
+            } catch (Exception e) {
+                System.err.println("Failed to connect producer: " + e.getMessage());
+                System.exit(1);
+            }
+        }
 
-        // ── ONE shared producer (mirrors Kafka: 1 producer client) ────────────
-        // All concurrency threads call .send() on the same instance.
-        // Its internal accumulator batches their messages together up to 1 MiB,
-        // and the senderLoop flushes one batch at a time — equivalent to
-        // Kafka's max.in.flight.requests.per.connection=1 at the network level.
-        DRMQProducer sharedProducer = new DRMQProducer(bootstrapServers);
-        sharedProducer.setBatchSizeBytes(1 * 1024 * 1024); // 1 MiB — matches Kafka benchmark
-        sharedProducer.setLingerMs(10);                    // 10 ms  — matches Kafka benchmark
-        try {
-            sharedProducer.connect();
-        } catch (Exception e) {
-            System.err.println("Failed to connect producer: " + e.getMessage());
-            System.exit(1);
+        // ── Per-thread backpressure semaphore ─────────────────────────────────
+        // Prevents accumulator overflow when threads call send() faster than the
+        // senderLoop can drain it. Each thread gets its own budget so they don't
+        // serialize each other (important in separate mode).
+        final Semaphore[] threadPermits = new Semaphore[concurrency];
+        for (int i = 0; i < concurrency; i++) {
+            threadPermits[i] = new Semaphore(separateProducers ? 2000 : 8000 / concurrency);
         }
 
         // ── Global message index counter for bounded mode ─────────────────────
@@ -137,9 +165,9 @@ public class StressTestApp {
         AtomicLong globalIndex = new AtomicLong(0);
 
         // ── Producer threads ──────────────────────────────────────────────────
-        // N threads share the one producer — they call send() concurrently,
-        // filling the accumulator so the senderLoop always has a full 1 MiB batch ready.
         for (int i = 0; i < concurrency; i++) {
+            final Semaphore myPermit = threadPermits[i];
+            final DRMQProducer prod = separateProducers ? producers[i] : producers[0];
             executor.submit(() -> {
                 try {
                     while (!Thread.currentThread().isInterrupted()) {
@@ -150,12 +178,12 @@ public class StressTestApp {
                             if (idx >= numRecords) break;
                         }
 
-                        inFlight.acquire();
+                        myPermit.acquire();
                         final long sendTs = System.currentTimeMillis();
                         final long capturedIdx = idx;
 
-                        sharedProducer.send(topic, payloadBytes).whenComplete((result, ex) -> {
-                            inFlight.release();
+                        prod.send(topic, payloadBytes).whenComplete((result, ex) -> {
+                            myPermit.release();
                             if (ex == null && result != null && result.isSuccess()) {
                                 long sentCount = messagesSent.incrementAndGet();
                                 if (bounded && latencies != null && capturedIdx >= 0) {
@@ -194,7 +222,9 @@ public class StressTestApp {
             long totalTimeMs = System.currentTimeMillis() - startTime;
             reporter.interrupt();
             executor.shutdownNow();
-            sharedProducer.close();
+            for (DRMQProducer p : producers) {
+                p.close();
+            }
 
             printReport(totalTimeMs, numRecords, msgSize, messagesSent.get(), errors.get(), latencies);
 
@@ -202,7 +232,9 @@ public class StressTestApp {
             // Unbounded: install shutdown hook and block forever
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 System.out.println("\n🛑 Shutting down stress test...");
-                sharedProducer.close();
+                for (DRMQProducer p : producers) {
+                    p.close();
+                }
                 executor.shutdownNow();
                 reporter.interrupt();
                 long totalTimeMs = System.currentTimeMillis() - startTime;

@@ -28,23 +28,34 @@ TOPIC_B="Topic-B"
 NUM_TRANSACTIONS=200000     # total atomic transactions
 CONCURRENCY=10             # threads feeding shared producer (enables atomic batching)
 IN_FLIGHT=5000             # Semaphore size — keeps accumulator full for max batching
+MODE="shared"              # "shared" (one producer) or "separate" (one per thread, mirrors Kafka)
 BROKERS="localhost:9092,localhost:9093,localhost:9094"
+TOPICS=2                   # number of topics per transaction
 # ─────────────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CLIENT_DIR="${SCRIPT_DIR}/drmq-client"
+CLIENT_DIR="${SCRIPT_DIR}/../drmq-client"
 
-while getopts "b:c:n:i:h" opt; do
+while getopts "b:c:n:i:m:t:h" opt; do
   case $opt in
     b) BROKERS="$OPTARG" ;;
     c) CONCURRENCY="$OPTARG" ;;
     n) NUM_TRANSACTIONS="$OPTARG" ;;
     i) IN_FLIGHT="$OPTARG" ;;
-    h) echo "Usage: ./atomic_stress_test.sh [-b brokers] [-c concurrency] [-n numTransactions] [-i inFlight]"
-       echo "  Natural mode  : ./atomic_stress_test.sh               (CONCURRENCY=10, IN_FLIGHT=5000)"
-       echo "  Serial mode   : ./atomic_stress_test.sh -c 1 -i 1    (matches Kafka 2PC)"
+    m) MODE="$OPTARG" ;;
+    t) TOPICS="$OPTARG" ;;
+    h) echo "Usage: ./atomic_stress_test.sh [-b brokers] [-c concurrency] [-n numTransactions] [-i inFlight] [-m mode] [-t topics]"
+       echo ""
+       echo "  Modes:"
+       echo "    shared    (default) — single producer, threads fill accumulator (DRMQ's advantage)"
+       echo "    separate           — one producer per thread (mirrors Kafka txn model)"
+       echo ""
+       echo "  Examples:"
+       echo "    ./atomic_stress_test.sh                     → batched mode (CONCURRENCY=10, IN_FLIGHT=5000)"
+       echo "    ./atomic_stress_test.sh -c 1 -i 1           → serial, shared producer"
+       echo "    ./atomic_stress_test.sh -c 4 -i 1 -m separate → 4 independent producers (Kafka comparable)"
        exit 0 ;;
-    *) echo "Usage: ./atomic_stress_test.sh [-b brokers] [-c concurrency] [-n numTransactions] [-i inFlight]" >&2
+    *) echo "Usage: ./atomic_stress_test.sh [-b brokers] [-c concurrency] [-n numTransactions] [-i inFlight] [-m mode] [-t topics]" >&2
        exit 1 ;;
   esac
 done
@@ -62,6 +73,7 @@ echo "   Transactions : ${NUM_TRANSACTIONS}"
 echo "   Topics       : ${TOPIC_A}  +  ${TOPIC_B}"
 echo "   Payload/topic: 1 KB  (2 KB total per transaction)"
 echo "   Concurrency  : ${CONCURRENCY} thread(s)"
+echo "   Producer mode: ${MODE} ($([ "${MODE}" = "separate" ] && echo 'one producer per thread, Kafka comparable' || echo 'single shared producer'))"
 echo "   In-flight    : ${IN_FLIGHT} (batching $([ "${IN_FLIGHT}" -gt 1 ] && echo 'ON' || echo 'OFF — serial mode'))"
 echo "   ACKs         : all (Raft quorum)"
 echo "   Bootstrap    : ${BROKERS}"
@@ -71,4 +83,4 @@ echo ""
 (cd "${CLIENT_DIR}" && \
   mvn exec:java \
     -Dexec.mainClass="com.drmq.client.commandLineExample.AtomicStressTestApp" \
-    -Dexec.args="${BROKERS} ${CONCURRENCY} ${NUM_TRANSACTIONS} ${IN_FLIGHT}")
+    -Dexec.args="${BROKERS} ${CONCURRENCY} ${NUM_TRANSACTIONS} ${IN_FLIGHT} ${MODE} ${TOPICS}")

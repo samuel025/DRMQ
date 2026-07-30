@@ -377,7 +377,7 @@ public class MessageStore implements Closeable {
             topicMessages.put(topic, messages);
         }
 
-        globalLock.writeLock().lock();
+        globalLock.readLock().lock();
         try {
             for (var entry : topicMessages.entrySet()) {
                 String topic = entry.getKey();
@@ -410,7 +410,7 @@ public class MessageStore implements Closeable {
             logger.error("Failed to persist atomic batch", e);
             throw new RuntimeException("Failed to persist atomic batch", e);
         } finally {
-            globalLock.writeLock().unlock();
+            globalLock.readLock().unlock();
         }
 
         synchronized (messageMonitor) {

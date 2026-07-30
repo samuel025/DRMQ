@@ -507,8 +507,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
             // Route through the coordinator if this group is actively coordinated
             if (groupCoordinator != null && groupCoordinator.isGroupActive(group, topic)) {
                 String consumerId = request.hasConsumerId() ? request.getConsumerId() : group;
-                groupCoordinator.commitOffset(group, topic, consumerId, offset);
-                commitFuture.complete(null);
+                commitFuture = groupCoordinator.commitOffset(group, topic, consumerId, offset);
             } else if (raftNode != null) {
                 if (!raftNode.isLeader()) {
                     String leaderAddr = raftNode.getLeaderAddress();

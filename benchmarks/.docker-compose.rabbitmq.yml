@@ -1,0 +1,48 @@
+services:
+  rabbit1:
+    image: rabbitmq:3.13-management
+    hostname: rabbit1
+    container_name: rabbitmq-bench-1
+    ports:
+      - "5672:5672"
+    environment:
+      RABBITMQ_ERLANG_COOKIE: "DRMQ-BENCHMARK-SECRET"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "status"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  rabbit2:
+    image: rabbitmq:3.13-management
+    hostname: rabbit2
+    container_name: rabbitmq-bench-2
+    ports:
+      - "5673:5672"
+    environment:
+      RABBITMQ_ERLANG_COOKIE: "DRMQ-BENCHMARK-SECRET"
+    depends_on:
+      rabbit1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "status"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  rabbit3:
+    image: rabbitmq:3.13-management
+    hostname: rabbit3
+    container_name: rabbitmq-bench-3
+    ports:
+      - "5674:5672"
+    environment:
+      RABBITMQ_ERLANG_COOKIE: "DRMQ-BENCHMARK-SECRET"
+    depends_on:
+      rabbit1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "status"]
+      interval: 5s
+      timeout: 10s
+      retries: 30

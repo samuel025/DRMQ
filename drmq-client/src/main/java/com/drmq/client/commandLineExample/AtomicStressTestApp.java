@@ -21,11 +21,17 @@ import java.util.concurrent.atomic.AtomicLong;
  *     at a time, so each becomes its own Raft proposal (no batching advantage)
  *   - Reports TPS + p50 / p95 / p99 / p999 / max latency
  *
- * Usage:
- *   AtomicStressTestApp [bootstrapServers] [concurrency] [numTransactions]
  *
- * When numTransactions > 0: bounded mode with full report.
- * When numTransactions = 0: unbounded (run until Ctrl+C), original behaviour.
+ * Two producer modes:
+ *   5th arg = "shared" (default)  — single producer, threads fill the accumulator
+ *   5th arg = "separate"         — one producer per thread (mirrors Kafka txn benchmark)
+ *
+ *   "shared"   mode: ./stress_test.sh   (DRMQ's natural batching advantage)
+ *   "separate" mode: ./atomic_stress_test.sh -c 4 -i 1 -m separate
+ *                    (each producer serial, like Kafka's begin→send→commit)
+ *
+ * Usage:
+ *   AtomicStressTestApp [bootstrapServers] [concurrency] [numTransactions] [inFlight] [mode]
  */
 public class AtomicStressTestApp {
 
@@ -39,25 +45,35 @@ public class AtomicStressTestApp {
         int    concurrency;
         long   numTransactions;
         int    inFlight;
+        String producerMode;
         try {
             concurrency      = args.length > 1 ? Integer.parseInt(args[1])  : 10;
             numTransactions  = args.length > 2 ? Long.parseLong(args[2])    : 0L;
             inFlight         = args.length > 3 ? Integer.parseInt(args[3])  : 5000;
+            producerMode     = args.length > 4 ? args[4]                    : "shared";
             if (concurrency < 1 || numTransactions < 0 || inFlight < 1) throw new NumberFormatException("must be positive");
+            if (!producerMode.equals("shared") && !producerMode.equals("separate")) {
+                throw new NumberFormatException("mode must be 'shared' or 'separate'");
+            }
         } catch (NumberFormatException e) {
-            System.err.println("Usage: AtomicStressTestApp [bootstrapServers] [concurrency] [numTransactions] [inFlight]");
+            System.err.println("Usage: AtomicStressTestApp [bootstrapServers] [concurrency] [numTransactions] [inFlight] [mode] [numTopics]");
+            System.err.println("  mode: 'shared' (default, one producer) or 'separate' (one producer per thread, mirrors Kafka)");
             System.exit(1);
             return;
         }
 
+        int numTopics = args.length > 5 ? Integer.parseInt(args[5]) : 2;
+
         boolean bounded = numTransactions > 0;
+        boolean separateProducers = producerMode.equals("separate");
 
         // ── Config banner ──────────────────────────────────────────────────────
         System.out.println("Configuration:");
         System.out.println("  Brokers        : " + bootstrapServers);
         System.out.printf ("  Concurrency    : %d thread(s)%n", concurrency);
-        System.out.println("  Topics         : Topic-A  +  Topic-B");
-        System.out.println("  Payload/topic  : 1 KB  (2 KB total per transaction)");
+        System.out.println("  Producer mode  : " + (separateProducers ? "separate (one per thread, Kafka-comparable)" : "shared (single producer)"));
+        System.out.println("  Topics         : " + numTopics + " topics per transaction");
+        System.out.println("  Payload/topic  : 1 KB  (" + numTopics + " KB total per transaction)");
         System.out.println("  ACKs           : all (Raft quorum)");
         System.out.printf ("  In-flight      : %d (%s)%n", inFlight,
                 inFlight > 1 ? "batching ON — multiple txns per Raft proposal" : "serial — 1 txn per Raft proposal");
@@ -80,23 +96,46 @@ public class AtomicStressTestApp {
         AtomicLong   txIndex          = new AtomicLong(0);
         CountDownLatch doneLatch      = bounded ? new CountDownLatch(1) : null;
 
-        // ── Connect shared producer ───────────────────────────────────────────
-        DRMQProducer sharedProducer = new DRMQProducer(bootstrapServers);
-        try {
-            sharedProducer.connect();
-        } catch (java.io.IOException e) {
-            System.err.println("Failed to connect: " + e.getMessage());
-            System.exit(1);
+        // ── Producer setup ───────────────────────────────────────────────────
+        // Two modes:
+        //   "shared"   — single DRMQProducer, all threads call sendAtomic() on it.
+        //                atomicSenderLoop batches across threads → DRMQ's advantage.
+        //   "separate" — each thread gets its own DRMQProducer (serial per producer).
+        //                Mirrors Kafka's beginTransaction→commit model.
+        final DRMQProducer[] producers;
+        if (separateProducers) {
+            producers = new DRMQProducer[concurrency];
+            for (int i = 0; i < concurrency; i++) {
+                producers[i] = new DRMQProducer(bootstrapServers);
+                try {
+                    producers[i].connect();
+                } catch (java.io.IOException e) {
+                    System.err.println("Failed to connect producer " + i + ": " + e.getMessage());
+                    System.exit(1);
+                }
+            }
+        } else {
+            producers = new DRMQProducer[1];
+            producers[0] = new DRMQProducer(bootstrapServers);
+            try {
+                producers[0].connect();
+            } catch (java.io.IOException e) {
+                System.err.println("Failed to connect: " + e.getMessage());
+                System.exit(1);
+            }
         }
 
         // ── Semaphore ─────────────────────────────────────────────────────────
-        // Controlled by the inFlight argument:
-        //   inFlight=5000 (default): keeps atomicAccumulator full → atomicSenderLoop
-        //     batches multiple sendAtomic() calls into ONE Raft proposal.
-        //     This is DRMQ's natural architectural advantage.
-        //   inFlight=1: serial mode — 1 txn at a time, 1 Raft proposal per txn,
-        //     equivalent to Kafka's beginTransaction→commitTransaction.
-        Semaphore inFlightSem = new Semaphore(inFlight);
+        // In shared mode: controls how many sendAtomic() calls pile up in the
+        //   atomicAccumulator before the atomicSenderLoop batches them.
+        // In separate mode: each producer has its own accumulator; each thread
+        //   gets its own semaphore so they don't serialize each other.
+        final Semaphore[] threadInFlight = separateProducers
+                ? java.util.stream.IntStream.range(0, concurrency)
+                        .mapToObj(i -> new Semaphore(inFlight))
+                        .toArray(Semaphore[]::new)
+                : null;
+        Semaphore inFlightSem = separateProducers ? null : new Semaphore(inFlight);
 
         // ── Reporter ──────────────────────────────────────────────────────────
         long startTime = System.currentTimeMillis();
@@ -130,6 +169,8 @@ public class AtomicStressTestApp {
         ExecutorService executor = Executors.newFixedThreadPool(concurrency);
         for (int i = 0; i < concurrency; i++) {
             final int tid = i;
+            final Semaphore mySem = separateProducers ? threadInFlight[tid] : inFlightSem;
+            final DRMQProducer prod = separateProducers ? producers[i] : producers[0];
             executor.submit(() -> {
                 try {
                     while (!Thread.currentThread().isInterrupted()) {
@@ -139,16 +180,17 @@ public class AtomicStressTestApp {
                             if (idx >= numTransactions) break;
                         }
 
-                        inFlightSem.acquire();
+                        mySem.acquire();
                         final long txStart      = System.currentTimeMillis();
                         final long capturedIdx  = idx;
 
                         Map<String, byte[]> atomicBatch = new HashMap<>();
-                        atomicBatch.put("Topic-A", payloadA);
-                        atomicBatch.put("Topic-B", payloadB);
+                        for (int t = 0; t < numTopics; t++) {
+                            atomicBatch.put("Topic-" + t, payloadA);
+                        }
 
-                        sharedProducer.sendAtomic(atomicBatch).whenComplete((res, ex) -> {
-                            inFlightSem.release();
+                        prod.sendAtomic(atomicBatch).whenComplete((res, ex) -> {
+                            mySem.release();
                             if (ex == null) {
                                 long done = txDone.incrementAndGet();
                                 if (bounded && latencies != null && capturedIdx >= 0) {
@@ -181,16 +223,20 @@ public class AtomicStressTestApp {
 
             reporter.interrupt();
             executor.shutdownNow();
-            sharedProducer.close();
+            for (DRMQProducer p : producers) {
+                p.close();
+            }
 
             if (!finished) System.out.println("\n⚠️  Timed out waiting for all acks.");
 
-            printReport(totalTimeMs, numTransactions, txDone.get(), errors.get(), latencies);
+            printReport(totalTimeMs, numTransactions, txDone.get(), errors.get(), latencies, numTopics);
 
         } else {
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 System.out.println("\n🛑 Shutting down...");
-                sharedProducer.close();
+                for (DRMQProducer p : producers) {
+                    p.close();
+                }
                 executor.shutdownNow();
                 reporter.interrupt();
                 long totalTimeMs = System.currentTimeMillis() - startTime;
@@ -201,17 +247,17 @@ public class AtomicStressTestApp {
                 System.out.printf("  Elapsed            : %.3f s%n", totalTimeMs / 1000.0);
                 System.out.printf("  Avg TPS            : %.2f%n", (done * 1000.0) / Math.max(1, totalTimeMs));
                 System.out.printf("  Throughput         : %.2f MB/s%n",
-                        (done * 2048L * 1000.0) / Math.max(1, totalTimeMs) / (1024.0 * 1024.0));
+                        (done * (1024L * numTopics) * 1000.0) / Math.max(1, totalTimeMs) / (1024.0 * 1024.0));
             }));
             executor.awaitTermination(Long.MAX_VALUE, TimeUnit.DAYS);
         }
     }
 
     // ── Kafka-style report ────────────────────────────────────────────────────
-    private static void printReport(long totalMs, long target, long done, long errs, long[] latencies) {
+    private static void printReport(long totalMs, long target, long done, long errs, long[] latencies, int numTopics) {
         double totalSec = totalMs / 1000.0;
         double tps      = done / totalSec;
-        double mbSec    = (done * 2048L) / totalSec / (1024.0 * 1024.0); // 2KB per txn
+        double mbSec    = (done * (1024L * numTopics)) / totalSec / (1024.0 * 1024.0); 
 
         System.out.println("\n" + "─".repeat(62));
         System.out.println("📊  DRMQ Atomic Transactions Performance Report");
@@ -241,7 +287,7 @@ public class AtomicStressTestApp {
         System.out.printf("  Elapsed       : %.3f s%n",    totalSec);
         System.out.printf("  Committed     : %,d / %,d%n", done, target);
         System.out.printf("  Errors        : %,d%n",       errs);
-        System.out.printf("  Payload/txn   : 2 × 1 KB (2 topics)%n");
+        System.out.printf("  Payload/txn   : %d × 1 KB (%d topics)%n", numTopics, numTopics);
         System.out.printf("  ACKs          : all (Raft quorum)%n");
         System.out.println("─".repeat(62));
     }
