@@ -1,6 +1,6 @@
 package com.drmq.broker.raft;
 
-import com.drmq.protocol.DRMQProtocol.RaftEntry;
+import com.drmq.protocol.*;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -20,7 +20,7 @@ class RaftLogTest {
 
     @BeforeEach
     void setUp() throws IOException {
-        raftLog = new RaftLog(tempDir);
+        raftLog = new RaftLog(tempDir, true);
     }
 
     @Test
@@ -82,6 +82,28 @@ class RaftLogTest {
         // Ensure we can append after truncation
         raftLog.append(RaftEntry.newBuilder().setTerm(2).setIndex(7).build());
         assertEquals(7, raftLog.getLastIndex());
+        assertEquals(2, raftLog.getLastTerm());
+    }
+
+    @Test
+    void testCompactAllEntries() throws IOException {
+        for (int i = 1; i <= 10; i++) {
+            raftLog.append(RaftEntry.newBuilder().setTerm(1).setIndex(i).build());
+        }
+
+        assertEquals(10, raftLog.getLastIndex());
+
+        // Compact up to index 10 (all entries)
+        raftLog.compact(10);
+
+        assertEquals(11, raftLog.getStartIndex());
+        assertEquals(10, raftLog.getLastIndex());
+        
+        assertNull(raftLog.getEntry(10));
+
+        // Ensure we can append after full compaction
+        raftLog.append(RaftEntry.newBuilder().setTerm(2).setIndex(11).build());
+        assertEquals(11, raftLog.getLastIndex());
         assertEquals(2, raftLog.getLastTerm());
     }
 }

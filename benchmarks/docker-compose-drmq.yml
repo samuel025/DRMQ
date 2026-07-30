@@ -1,0 +1,65 @@
+services:
+  drmq1:
+    build:
+      context: ..
+      dockerfile: benchmarks/Dockerfile.drmq
+    container_name: drmq1
+    ports:
+      - "9093:9092"
+    environment:
+      NODE_ID: "node1"
+      PORT: "9092"
+      DATA_DIR: "/data/node1"
+      PEERS: "node2:drmq2:9092,node3:drmq3:9092"
+      METRICS_ENABLED: "false"
+      RAFT_FSYNC_ENABLED: "false"
+      RAFT_COMPACT_THRESHOLD: "1000"
+    volumes:
+      - drmq-data-node1:/data/node1
+      - ..:/app:delegated
+      - ~/.m2:/root/.m2:delegated
+
+  drmq2:
+    build:
+      context: ..
+      dockerfile: benchmarks/Dockerfile.drmq
+    container_name: drmq2
+    ports:
+      - "9095:9092"
+    environment:
+      NODE_ID: "node2"
+      PORT: "9092"
+      DATA_DIR: "/data/node2"
+      PEERS: "node1:drmq1:9092,node3:drmq3:9092"
+      METRICS_ENABLED: "false"
+      RAFT_FSYNC_ENABLED: "false"
+      RAFT_COMPACT_THRESHOLD: "1000"
+    volumes:
+      - drmq-data-node2:/data/node2
+      - ..:/app:delegated
+      - ~/.m2:/root/.m2:delegated
+
+  drmq3:
+    build:
+      context: ..
+      dockerfile: benchmarks/Dockerfile.drmq
+    container_name: drmq3
+    ports:
+      - "9097:9092"
+    environment:
+      NODE_ID: "node3"
+      PORT: "9092"
+      DATA_DIR: "/data/node3"
+      PEERS: "node1:drmq1:9092,node2:drmq2:9092"
+      METRICS_ENABLED: "false"
+      RAFT_FSYNC_ENABLED: "false"
+      RAFT_COMPACT_THRESHOLD: "1000"
+    volumes:
+      - drmq-data-node3:/data/node3
+      - ..:/app:delegated
+      - ~/.m2:/root/.m2:delegated
+
+volumes:
+  drmq-data-node1:
+  drmq-data-node2:
+  drmq-data-node3:

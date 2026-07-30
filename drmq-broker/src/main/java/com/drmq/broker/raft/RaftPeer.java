@@ -2,7 +2,7 @@ package com.drmq.broker.raft;
 
 import com.drmq.broker.BrokerConfig.PeerAddress;
 import com.drmq.broker.BrokerMetrics;
-import com.drmq.protocol.DRMQProtocol.*;
+import com.drmq.protocol.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -77,10 +77,7 @@ public class RaftPeer {
                 }
                 BrokerMetrics.get().recordRaftRpc("request_vote", false,
                         System.nanoTime() - startNanos);
-                return RequestVoteResponse.newBuilder()
-                        .setTerm(0)
-                        .setVoteGranted(false)
-                        .build();
+                throw new RuntimeException("RequestVote RPC failed", e);
             }
         }
     }
@@ -117,10 +114,7 @@ public class RaftPeer {
                 }
                 BrokerMetrics.get().recordRaftRpc("pre_vote", false,
                         System.nanoTime() - startNanos);
-                return PreVoteResponse.newBuilder()
-                        .setTerm(0)
-                        .setVoteGranted(false)
-                        .build();
+                throw new RuntimeException("PreVote RPC failed", e);
             }
         }
     }
@@ -156,45 +150,113 @@ public class RaftPeer {
                 }
                 BrokerMetrics.get().recordRaftRpc("append_entries", false,
                         System.nanoTime() - startNanos);
-                return AppendEntriesResponse.newBuilder()
-                        .setTerm(0)
-                        .setSuccess(false)
-                        .setMatchIndex(0)
-                        .build();
+                throw new RuntimeException("AppendEntries RPC failed", e);
             }
         }
     }
 
     /**
-     * Send an InstallSnapshot RPC and wait for the response.
+     * Send a RequestTopicOffsets RPC and wait for the response.
      */
-    public InstallSnapshotResponse sendInstallSnapshot(InstallSnapshotRequest request) {
+    public RequestTopicOffsetsResponse sendRequestTopicOffsets(RequestTopicOffsetsRequest request) {
         synchronized (lock) {
             long startNanos = System.nanoTime();
             try {
                 ensureConnected();
+                socket.setSoTimeout(10000); // 10 seconds for offset resolution
 
                 MessageEnvelope envelope = MessageEnvelope.newBuilder()
-                        .setType(MessageType.INSTALL_SNAPSHOT_REQUEST)
+                        .setType(MessageType.REQUEST_TOPIC_OFFSETS_REQUEST)
                         .setPayload(request.toByteString())
                         .build();
 
                 sendEnvelope(envelope);
                 MessageEnvelope response = receiveEnvelope();
-                requireResponseType(response, MessageType.INSTALL_SNAPSHOT_RESPONSE, "InstallSnapshot");
-                InstallSnapshotResponse parsed = InstallSnapshotResponse.parseFrom(response.getPayload());
-                BrokerMetrics.get().recordRaftRpc("install_snapshot", true,
+                
+                socket.setSoTimeout(READ_TIMEOUT_MS);
+                requireResponseType(response, MessageType.REQUEST_TOPIC_OFFSETS_RESPONSE, "RequestTopicOffsets");
+                RequestTopicOffsetsResponse parsed = RequestTopicOffsetsResponse.parseFrom(response.getPayload());
+                BrokerMetrics.get().recordRaftRpc("request_topic_offsets", true,
                     System.nanoTime() - startNanos);
                 return parsed;
 
             } catch (Exception e) {
                 close();
-                logger.debug("InstallSnapshot to {} failed: {}", address, e.getMessage());
-                BrokerMetrics.get().recordRaftRpc("install_snapshot", false,
+                logger.debug("RequestTopicOffsets to {} failed: {}", address, e.getMessage());
+                BrokerMetrics.get().recordRaftRpc("request_topic_offsets", false,
                         System.nanoTime() - startNanos);
-                return InstallSnapshotResponse.newBuilder()
-                        .setTerm(0)
+                throw new RuntimeException("RequestTopicOffsets RPC failed", e);
+            }
+        }
+    }
+
+    /**
+     * Send an IncrementalSnapshotChunk RPC and wait for the response.
+     */
+    public IncrementalSnapshotChunkResponse sendIncrementalSnapshotChunk(IncrementalSnapshotChunk request) {
+        synchronized (lock) {
+            long startNanos = System.nanoTime();
+            try {
+                ensureConnected();
+                socket.setSoTimeout(30000); // 30 seconds to allow for chunk flush (mappedBuffer.force())
+
+                MessageEnvelope envelope = MessageEnvelope.newBuilder()
+                        .setType(MessageType.INCREMENTAL_SNAPSHOT_CHUNK)
+                        .setPayload(request.toByteString())
                         .build();
+
+                sendEnvelope(envelope);
+                MessageEnvelope response = receiveEnvelope();
+                
+                socket.setSoTimeout(READ_TIMEOUT_MS);
+                requireResponseType(response, MessageType.INCREMENTAL_SNAPSHOT_CHUNK_RESPONSE, "IncrementalSnapshotChunk");
+                IncrementalSnapshotChunkResponse parsed = IncrementalSnapshotChunkResponse.parseFrom(response.getPayload());
+                BrokerMetrics.get().recordRaftRpc("incremental_snapshot_chunk", true,
+                    System.nanoTime() - startNanos);
+                return parsed;
+
+            } catch (Exception e) {
+                close();
+                logger.debug("IncrementalSnapshotChunk to {} failed: {}", address, e.getMessage());
+                BrokerMetrics.get().recordRaftRpc("incremental_snapshot_chunk", false,
+                        System.nanoTime() - startNanos);
+                throw new RuntimeException("IncrementalSnapshotChunk RPC failed", e);
+            }
+        }
+    }
+
+    /**
+     * Send an IncrementalSnapshotDoneRequest RPC and wait for the response.
+     */
+    public IncrementalSnapshotDoneResponse sendIncrementalSnapshotDone(IncrementalSnapshotDoneRequest request) {
+        synchronized (lock) {
+            long startNanos = System.nanoTime();
+            try {
+                ensureConnected();
+                socket.setSoTimeout(300000); // 5 minutes to allow for large MessageStore reload
+
+                MessageEnvelope envelope = MessageEnvelope.newBuilder()
+                        .setType(MessageType.INCREMENTAL_SNAPSHOT_DONE_REQUEST)
+                        .setPayload(request.toByteString())
+                        .build();
+
+                sendEnvelope(envelope);
+                MessageEnvelope response = receiveEnvelope();
+                
+                socket.setSoTimeout(READ_TIMEOUT_MS);
+                
+                requireResponseType(response, MessageType.INCREMENTAL_SNAPSHOT_DONE_RESPONSE, "IncrementalSnapshotDoneRequest");
+                IncrementalSnapshotDoneResponse parsed = IncrementalSnapshotDoneResponse.parseFrom(response.getPayload());
+                BrokerMetrics.get().recordRaftRpc("incremental_snapshot_done", true,
+                    System.nanoTime() - startNanos);
+                return parsed;
+
+            } catch (Exception e) {
+                close();
+                logger.debug("IncrementalSnapshotDone to {} failed: {}", address, e.getMessage());
+                BrokerMetrics.get().recordRaftRpc("incremental_snapshot_done", false,
+                        System.nanoTime() - startNanos);
+                throw new RuntimeException("IncrementalSnapshotDone RPC failed", e);
             }
         }
     }
@@ -249,6 +311,5 @@ public class RaftPeer {
 
     public PeerAddress getAddress() { return address; }
 }
-
 
 

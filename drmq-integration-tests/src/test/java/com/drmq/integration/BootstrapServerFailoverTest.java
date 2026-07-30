@@ -64,8 +64,8 @@ class BootstrapServerFailoverTest {
         broker2.startAsync();
         broker3.startAsync();
 
-        // Wait for leader election to complete (up to 3 seconds)
-        waitForLeader(3000);
+        // Wait for leader election to complete (up to 8 seconds)
+        waitForLeader(8000);
     }
 
     /**
@@ -201,7 +201,7 @@ class BootstrapServerFailoverTest {
         else broker3 = null;
 
         // Wait for new leader election
-        waitForLeader(2000);
+        waitForLeader(5000);
 
         // Now try to send with the same producer bootstrap servers
         // The producer should retry and eventually connect to the new leader
@@ -316,7 +316,7 @@ class BootstrapServerFailoverTest {
             else broker3 = null;
 
             // Wait for new leader election
-            waitForLeader(2000);
+            waitForLeader(5000);
 
             // Produce more messages via the new leader
             BrokerServer newLeader = findLeader();

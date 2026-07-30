@@ -6,6 +6,11 @@ import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import com.drmq.protocol.StoredMessage;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -150,6 +155,119 @@ class ProducerBrokerIntegrationTest {
             var stored = broker.getMessageStore().getMessage("string-topic", result.getOffset());
             assertEquals("This is a string message", 
                     new String(stored.getPayload().toByteArray()));
+        }
+    }
+
+    @Test
+    void atomicSendToMultipleTopicsSucceeds() throws Exception {
+        try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
+            producer.connect();
+
+            Map<String, byte[]> batch = new HashMap<>();
+            batch.put("orders", "order-atomic-1".getBytes());
+            batch.put("payments", "payment-atomic-1".getBytes());
+
+            Map<String, Long> offsets = producer.sendAtomic(batch).join();
+
+            assertNotNull(offsets);
+            assertTrue(offsets.containsKey("orders"));
+            assertTrue(offsets.containsKey("payments"));
+            //
+            var sortedOffsets = offsets.values().stream().sorted().toList();
+            assertEquals(2, sortedOffsets.size());
+            assertEquals(0L, sortedOffsets.get(0).longValue());
+            assertEquals(1L, sortedOffsets.get(1).longValue());
+        }
+
+        assertEquals(1, broker.getMessageStore().getMessageCount("orders"));
+        assertEquals(1, broker.getMessageStore().getMessageCount("payments"));
+    }
+
+    @Test
+    void atomicSendOffsetsIncreaseByTotalMessagesPerBatch() throws Exception {
+        int batches = 100;
+        int topicsPerBatch = 3;
+        try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
+            producer.connect();
+
+            Map<String, byte[]> batch = new HashMap<>();
+            batch.put("off-a", "a".getBytes());
+            batch.put("off-b", "b".getBytes());
+            batch.put("off-c", "c".getBytes());
+
+            long prevBatchBase = -1;
+            // Without client batching, each sendAtomic becomes its own request.
+            // appendAtomicBatch sees 3 messages (1 per topic) → baseOffset += 3.
+            for (int i = 0; i < batches; i++) {
+                Map<String, Long> offsets = producer.sendAtomic(batch).join();
+                assertEquals(topicsPerBatch, offsets.size());
+
+                var sorted = offsets.values().stream().sorted().toList();
+                assertEquals(1L, sorted.get(1) - sorted.get(0)); // contiguous within batch
+                assertEquals(1L, sorted.get(2) - sorted.get(1));
+
+                if (i > 0) {
+                    // Each batch consumes topicsPerBatch global offsets
+                    assertEquals(topicsPerBatch, sorted.get(0) - prevBatchBase);
+                }
+                prevBatchBase = sorted.get(0);
+            }
+        }
+        assertEquals(batches, broker.getMessageStore().getMessageCount("off-a"));
+        assertEquals(batches, broker.getMessageStore().getMessageCount("off-b"));
+        assertEquals(batches, broker.getMessageStore().getMessageCount("off-c"));
+    }
+
+    @Test
+    void atomicSendWithClientBatchingProducesContiguousOffsets() throws Exception {
+        int numRequests = 50;
+        int topicsPerBatch = 2;
+        try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
+            producer.setLingerMs(50);
+            producer.connect();
+
+            List<java.util.concurrent.CompletableFuture<Map<String, Long>>> futures = new ArrayList<>();
+
+            for (int i = 0; i < numRequests; i++) {
+                Map<String, byte[]> batch = new HashMap<>();
+                batch.put("batched-a", ("a-" + i).getBytes());
+                batch.put("batched-b", ("b-" + i).getBytes());
+                futures.add(producer.sendAtomic(batch));
+            }
+
+            java.util.concurrent.CompletableFuture.allOf(
+                    futures.toArray(new java.util.concurrent.CompletableFuture[0])
+            ).get(5, java.util.concurrent.TimeUnit.SECONDS);
+
+            // Client-side batching merges all 50 requests into one AtomicProduceRequest.
+            // Topic slices are concatenated per-topic: all A entries then all B entries.
+            // appendAtomicBatch assigns offsets [0..49] to A, [50..99] to B.
+            // Each constituent i gets {A: i, B: numRequests + i}.
+            // The union of ALL offsets spans 0..99 with no gaps.
+            java.util.Set<Long> allOffsets = new java.util.HashSet<>();
+            for (int i = 0; i < numRequests; i++) {
+                Map<String, Long> offsets = futures.get(i).get();
+                assertEquals(topicsPerBatch, offsets.size());
+                allOffsets.addAll(offsets.values());
+            }
+            assertEquals(numRequests * topicsPerBatch, allOffsets.size());
+            for (long o = 0; o < numRequests * topicsPerBatch; o++) {
+                assertTrue(allOffsets.contains(o), "Missing offset " + o);
+            }
+        }
+        assertEquals(numRequests, broker.getMessageStore().getMessageCount("batched-a"));
+        assertEquals(numRequests, broker.getMessageStore().getMessageCount("batched-b"));
+    }
+
+    @Test
+    void atomicSendRequiresAtLeastTwoTopics() throws Exception {
+        try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
+            producer.connect();
+
+            Map<String, byte[]> single = new HashMap<>();
+            single.put("only-topic", "data".getBytes());
+
+            assertThrows(Exception.class, () -> producer.sendAtomic(single).join());
         }
     }
 }

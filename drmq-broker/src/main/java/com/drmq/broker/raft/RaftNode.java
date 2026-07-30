@@ -5,7 +5,7 @@ import com.drmq.broker.BrokerMetrics;
 import com.drmq.broker.MessageStore;
 import com.drmq.broker.OffsetManager;
 import com.drmq.broker.ClusterEventBuffer;
-import com.drmq.protocol.DRMQProtocol.*;
+import com.drmq.protocol.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -19,6 +19,7 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 
@@ -32,9 +33,9 @@ public class RaftNode {
     private static final Logger logger = LoggerFactory.getLogger(RaftNode.class);
 
     // Raft timing constants — randomized election timeout prevents split votes
-    private static final long ELECTION_TIMEOUT_MIN_MS = 150;
-    private static final long ELECTION_TIMEOUT_MAX_MS = 300;
-    private static final long HEARTBEAT_INTERVAL_MS = 75;
+    private static final long ELECTION_TIMEOUT_MIN_MS = 1000;
+    private static final long ELECTION_TIMEOUT_MAX_MS = 2000;
+    private static final long HEARTBEAT_INTERVAL_MS = 300;
 
     // Proposal timeout — how long a client blocks waiting for Raft commitment
     private static final long PROPOSAL_TIMEOUT_SECONDS = 60;
@@ -43,6 +44,10 @@ public class RaftNode {
     private static final long STALE_PROPOSAL_THRESHOLD_MS = 65000;  // 65 seconds (must exceed PROPOSAL_TIMEOUT_SECONDS)
     private static final long PROPOSAL_CLEANUP_INTERVAL_MS = 5000;  // Check every 5 seconds
     private static final int MAX_PENDING_PROPOSALS = 10000;  // Safety limit
+
+    // Batch coalescing constants
+    private static final int MAX_AGGREGATION_DRAIN = 512;  // Max proposals per aggregation cycle
+    private static final long AGGREGATOR_LINGER_MS = 2;   // Max wait before draining queue (match client lingerMs)
 
     //  Persistent state (survives restart) 
     private volatile long currentTerm;
@@ -76,11 +81,14 @@ public class RaftNode {
     private final Map<String, Function<RequestVoteRequest, RequestVoteResponse>> voteRpcHandlers = new ConcurrentHashMap<>();
     private final Map<String, Function<AppendEntriesRequest, AppendEntriesResponse>> appendRpcHandlers = new ConcurrentHashMap<>();
     private final Map<String, Function<PreVoteRequest, PreVoteResponse>> preVoteRpcHandlers = new ConcurrentHashMap<>();
-    private final Map<String, Function<InstallSnapshotRequest, InstallSnapshotResponse>> installSnapshotRpcHandlers = new ConcurrentHashMap<>();
-
+    private final Map<String, Function<RequestTopicOffsetsRequest, RequestTopicOffsetsResponse>> requestTopicOffsetsRpcHandlers = new ConcurrentHashMap<>();
+    private final Map<String, Function<IncrementalSnapshotChunk, IncrementalSnapshotChunkResponse>> incrementalSnapshotChunkRpcHandlers = new ConcurrentHashMap<>();
+    private final Map<String, Function<IncrementalSnapshotDoneRequest, IncrementalSnapshotDoneResponse>> incrementalSnapshotDoneRpcHandlers = new ConcurrentHashMap<>();
     private final ReentrantLock lock = new ReentrantLock();
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
     private final ExecutorService raftExecutor;
+    private final ExecutorService snapshotExecutor;
+    private final ExecutorService applyExecutor;
     private ScheduledFuture<?> electionTimer;
     private ScheduledFuture<?> heartbeatTimer;    
     private ScheduledFuture<?> proposalCleanupTimer;
@@ -104,7 +112,68 @@ public class RaftNode {
             this.createdAtNanos = System.nanoTime();
         }
     }
+
+    /**
+     * Holds multiple client futures that were coalesced into a single RaftEntry.
+     * When the entry is applied, offsets are distributed sequentially to each constituent.
+     */
+    private static class AggregatedProposalState extends ProposalState {
+        final List<ProposalRequest> constituents;
+
+        AggregatedProposalState(long term, List<ProposalRequest> constituents) {
+            // The "master" future is not directly returned to any client;
+            // individual ProposalRequest futures are completed in applyCommitted.
+            super(term, new CompletableFuture<>());
+            this.constituents = constituents;
+        }
+    }
+
+    /**
+     * Represents a single client proposal waiting in the aggregation queue.
+     */
+    private static class ProposalRequest {
+        final String topic;
+        final List<ProduceBatchRequest.BatchEntry> entries;
+        final CompletableFuture<Long> future;
+        final long createdAtNanos;
+
+        ProposalRequest(String topic, List<ProduceBatchRequest.BatchEntry> entries,
+                        CompletableFuture<Long> future) {
+            this.topic = topic;
+            this.entries = entries;
+            this.future = future;
+            this.createdAtNanos = System.nanoTime();
+        }
+    }
+
+    private static class AtomicProposalRequest {
+        final List<AtomicBatchTopicSlice> slices;
+        final CompletableFuture<Map<String, Long>> future;
+        final long createdAtNanos;
+
+        AtomicProposalRequest(List<AtomicBatchTopicSlice> slices,
+                              CompletableFuture<Map<String, Long>> future) {
+            this.slices = slices;
+            this.future = future;
+            this.createdAtNanos = System.nanoTime();
+        }
+    }
+
+    private static class AtomicAggregatedProposalState extends ProposalState {
+        final List<AtomicProposalRequest> constituents;
+        final List<Map<String, Integer>> constituentStartPositions;
+
+        AtomicAggregatedProposalState(long term, List<AtomicProposalRequest> constituents,
+                                       List<Map<String, Integer>> constituentStartPositions) {
+            super(term, new CompletableFuture<>());
+            this.constituents = constituents;
+            this.constituentStartPositions = constituentStartPositions;
+        }
+    }
+
     private final Map<Long, ProposalState> pendingProposals = new ConcurrentHashMap<>();
+
+
     private final Map<String, Long> lastLogTime = new ConcurrentHashMap<>();
     private final Map<String, Long> lastContactTime = new ConcurrentHashMap<>();
     private static final long LOG_RATE_LIMIT_MS = 1000;  
@@ -115,10 +184,28 @@ public class RaftNode {
     private long expectedSnapshotIndex = -1;
 
     private final Map<String, AtomicBoolean> isReplicating;
+    private final Map<String, AtomicBoolean> isHeartbeatInFlight = new ConcurrentHashMap<>();
+
+    // Background log appender to prevent disk I/O from starving the consensus lock
+    private final java.util.concurrent.LinkedBlockingQueue<Runnable> logAppenderQueue =
+            new java.util.concurrent.LinkedBlockingQueue<>(10000);
+    private volatile Thread logAppenderThread;
+    
+    private long uncommittedNextIndex = 1;
+
+    // Proposal aggregation queue — lock-free intake, drained by aggregator thread
+    private final LinkedBlockingQueue<ProposalRequest> proposalQueue =
+            new LinkedBlockingQueue<>(MAX_PENDING_PROPOSALS);
+    private volatile Thread aggregatorThread;
+
+    // Atomic proposal aggregation queue — same pattern, but for cross-topic atomic requests
+    private final LinkedBlockingQueue<AtomicProposalRequest> atomicProposalQueue =
+            new LinkedBlockingQueue<>(MAX_PENDING_PROPOSALS);
+    private volatile Thread atomicAggregatorThread;
 
     public RaftNode(String nodeId, int port, List<PeerAddress> peers,
                     MessageStore messageStore, OffsetManager offsetManager, Path dataDir,
-                    long raftCompactThreshold) throws IOException {
+                    long raftCompactThreshold, boolean raftFsyncEnabled) throws IOException {
         this.nodeId = nodeId;
         this.port = port;
         this.peers = peers;
@@ -127,7 +214,7 @@ public class RaftNode {
         this.dataDir = dataDir;
         this.snapshotManager = new SnapshotManager(dataDir, messageStore, offsetManager);
         this.raftCompactThreshold = raftCompactThreshold;
-        this.raftLog = new RaftLog(dataDir);
+        this.raftLog = new RaftLog(dataDir, raftFsyncEnabled);
         this.state = RaftState.FOLLOWER;
         this.commitIndex = 0;
         this.lastApplied = 0;
@@ -141,6 +228,18 @@ public class RaftNode {
                     t.setDaemon(true);
                     return t;
                 });
+        this.snapshotExecutor = Executors.newCachedThreadPool(
+                r -> {
+                    Thread t = new Thread(r, "raft-snapshot-" + nodeId);
+                    t.setDaemon(true);
+                    return t;
+                });
+        this.applyExecutor = Executors.newSingleThreadExecutor(
+                r -> {
+                    Thread t = new Thread(r, "raft-apply-" + nodeId);
+                    t.setDaemon(true);
+                    return t;
+                });
 
         Path raftDir = dataDir.resolve("raft");
         Files.createDirectories(raftDir);
@@ -150,7 +249,7 @@ public class RaftNode {
 
     public RaftNode(String nodeId, int port, List<PeerAddress> peers,
                     MessageStore messageStore, OffsetManager offsetManager, Path dataDir) throws IOException {
-        this(nodeId, port, peers, messageStore, offsetManager, dataDir, 1000L);
+        this(nodeId, port, peers, messageStore, offsetManager, dataDir, 1000L, true);
     }
 
   
@@ -171,6 +270,19 @@ public class RaftNode {
         resetElectionTimer();
         startProposalCleanupTask();
         
+        // Start the proposal aggregator threads
+        aggregatorThread = new Thread(this::aggregatorLoop, "raft-aggregator-" + nodeId);
+        aggregatorThread.setDaemon(true);
+        aggregatorThread.start();
+
+        atomicAggregatorThread = new Thread(this::atomicAggregatorLoop, "raft-atomic-aggregator-" + nodeId);
+        atomicAggregatorThread.setDaemon(true);
+        atomicAggregatorThread.start();
+
+        logAppenderThread = new Thread(this::logAppenderLoop, "raft-log-appender-" + nodeId);
+        logAppenderThread.setDaemon(true);
+        logAppenderThread.start();
+
         stateSaveTimer = scheduler.scheduleAtFixedRate(() -> {
             if (stateSaveNeeded) {
                 savePersistentState();
@@ -211,9 +323,18 @@ public class RaftNode {
             
             if (ageNanos > staleThresholdNanos) {
                 iter.remove();
-                ps.future.completeExceptionally(
-                        new IOException("Proposal removed: stale after " + 
-                                TimeUnit.NANOSECONDS.toMillis(ageNanos) + "ms"));
+                IOException err = new IOException("Proposal removed: stale after " + 
+                        TimeUnit.NANOSECONDS.toMillis(ageNanos) + "ms");
+                if (ps instanceof AtomicAggregatedProposalState aaps) {
+                    for (AtomicProposalRequest req : aaps.constituents) {
+                        req.future.completeExceptionally(err);
+                    }
+                } else if (ps instanceof AggregatedProposalState aps) {
+                    for (ProposalRequest req : aps.constituents) {
+                        req.future.completeExceptionally(err);
+                    }
+                }
+                ps.future.completeExceptionally(err);
                 removed++;
             }
         }
@@ -224,9 +345,321 @@ public class RaftNode {
         }
     }
 
+    /**
+     * Retrieves and removes chunks of proposals from the concurrent queue, acquiring the ReentrantLock
+     * ONCE per batch. It merges payloads of the same topic into a single `ProduceBatchRequest` prior to
+     * lock acquisition. This turns N lock acquisitions into 1 per aggregation cycle.
+     */
+    private void logAppenderLoop() {
+        logger.info("[{}] Log appender thread started", nodeId);
+        while (running) {
+            try {
+                Runnable task = logAppenderQueue.poll(100, TimeUnit.MILLISECONDS);
+                if (task != null) {
+                    task.run();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception e) {
+                logger.error("[{}] Log appender error", nodeId, e);
+            }
+        }
+        logger.info("[{}] Log appender thread stopped", nodeId);
+    }
+
+    private void aggregatorLoop() {
+        logger.info("[{}] Proposal aggregator thread started", nodeId);
+        while (running) {
+            try {
+                List<ProposalRequest> drained = new ArrayList<>(MAX_AGGREGATION_DRAIN);
+                ProposalRequest first = proposalQueue.poll(AGGREGATOR_LINGER_MS, TimeUnit.MILLISECONDS);
+                if (first == null) continue;
+                drained.add(first);
+                proposalQueue.drainTo(drained, MAX_AGGREGATION_DRAIN - 1);
+
+                if (drained.isEmpty()) continue;
+
+                // Check leadership before doing work
+                if (state != RaftState.LEADER) {
+                    IOException err = new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
+                    for (ProposalRequest req : drained) {
+                        req.future.completeExceptionally(err);
+                    }
+                    continue;
+                }
+
+                // Group proposals by topic for coalescing
+                Map<String, List<ProposalRequest>> byTopic = new LinkedHashMap<>();
+                for (ProposalRequest req : drained) {
+                    byTopic.computeIfAbsent(req.topic, k -> new ArrayList<>()).add(req);
+                }
+
+                long proposalTerm = -1;
+                List<RaftEntry> toAppend = null;
+
+                // Acquire the Raft lock ONCE for all entries
+                lock.lock();
+                try {
+                    if (state != RaftState.LEADER) {
+                        IOException err = new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
+                        for (ProposalRequest req : drained) {
+                            req.future.completeExceptionally(err);
+                        }
+                    } else {
+                        proposalTerm = currentTerm;
+                        toAppend = new ArrayList<>(byTopic.size());
+
+                        for (var topicEntry : byTopic.entrySet()) {
+                            String topic = topicEntry.getKey();
+                            List<ProposalRequest> requests = topicEntry.getValue();
+
+                            // Merge all entries from all requests into one ProduceBatchRequest
+                            ProduceBatchRequest.Builder merged = ProduceBatchRequest.newBuilder().setTopic(topic);
+                            int totalEntries = 0;
+                            for (ProposalRequest req : requests) {
+                                merged.addAllEntries(req.entries);
+                                totalEntries += req.entries.size();
+                            }
+
+                            long index = uncommittedNextIndex++;
+                            RaftEntry entry = RaftEntry.newBuilder()
+                                    .setTerm(proposalTerm)
+                                    .setIndex(index)
+                                    .setTopic(topic)
+                                    .setPayload(merged.build().toByteString())
+                                    .setCommandType(RaftCommandType.BATCH_MESSAGE)
+                                    .build();
+
+                            toAppend.add(entry);
+                            pendingProposals.put(index, new AggregatedProposalState(proposalTerm, requests));
+
+                            if (shouldLog("aggregator-coalesce")) {
+                                logger.info("[{}] Aggregator coalesced {} proposals ({} entries) for topic '{}' into raft index {}",
+                                        nodeId, requests.size(), totalEntries, topic, index);
+                            }
+                        }
+                    }
+                } finally {
+                    lock.unlock();
+                }
+
+                if (toAppend != null && !toAppend.isEmpty()) {
+                    long finalProposalTerm = proposalTerm;
+                    List<RaftEntry> finalToAppend = toAppend;
+                    boolean enqueued = logAppenderQueue.offer(() -> {
+                        try {
+                            raftLog.append(finalToAppend);
+                            sendHeartbeats();
+                        } catch (IOException e) {
+                            logger.error("[{}] Failed to append batch to RaftLog", nodeId, e);
+                            stepDown(finalProposalTerm);
+                        }
+                    });
+                    
+                    if (!enqueued) {
+                        IOException err = new IOException("Raft log appender queue full or stopped");
+                        for (ProposalRequest req : drained) {
+                            req.future.completeExceptionally(err);
+                        }
+                    }
+                }
+
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception e) {
+                logger.error("[{}] Aggregator loop error", nodeId, e);
+            }
+        }
+        logger.info("[{}] Proposal aggregator thread stopped", nodeId);
+    }
+
+    /**
+     * Atomic aggregator thread main loop. Drains the atomicProposalQueue, merges
+     * multiple independent atomic requests (each with ≥2 topics) into a single
+     * RaftEntry containing all topic slices concatenated per-topic.
+     *
+     * After commit, offsets are distributed to each constituent based on their
+     * position within each topic's merged slice array — exactly like the plain
+     * AggregatedProposalState pattern.
+     */
+    private void atomicAggregatorLoop() {
+        logger.info("[{}] Atomic proposal aggregator thread started", nodeId);
+        while (running) {
+            try {
+                List<AtomicProposalRequest> drained = new ArrayList<>(MAX_AGGREGATION_DRAIN);
+                AtomicProposalRequest first = atomicProposalQueue.poll(AGGREGATOR_LINGER_MS, TimeUnit.MILLISECONDS);
+                if (first == null) continue;
+                drained.add(first);
+                atomicProposalQueue.drainTo(drained, MAX_AGGREGATION_DRAIN - 1);
+
+                if (drained.isEmpty()) continue;
+
+                if (state != RaftState.LEADER) {
+                    IOException err = new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
+                    for (AtomicProposalRequest req : drained) {
+                        req.future.completeExceptionally(err);
+                    }
+                    continue;
+                }
+
+                // Track per-constituent start positions within each topic's merged slice
+                // constituentStartPositions[i] = {topic → startIndexInMergedSlice}
+                List<Map<String, Integer>> constituentStartPositions = new ArrayList<>(drained.size());
+                for (int i = 0; i < drained.size(); i++) {
+                    constituentStartPositions.add(new LinkedHashMap<>());
+                }
+
+                // Merge slices: group all entries by topic, concatenating in order
+                Map<String, List<ProduceBatchRequest.BatchEntry>> mergedByTopic = new LinkedHashMap<>();
+
+                for (int i = 0; i < drained.size(); i++) {
+                    AtomicProposalRequest req = drained.get(i);
+                    Map<String, Integer> myPositions = constituentStartPositions.get(i);
+
+                    for (AtomicBatchTopicSlice slice : req.slices) {
+                        String topic = slice.getTopic();
+                        List<ProduceBatchRequest.BatchEntry> mergedEntries =
+                                mergedByTopic.computeIfAbsent(topic, k -> new ArrayList<>());
+                        // Record this constituent's start position for this topic
+                        if (!myPositions.containsKey(topic)) {
+                            myPositions.put(topic, mergedEntries.size());
+                        }
+                        mergedEntries.addAll(slice.getEntriesList());
+                    }
+                }
+
+                // Build the merged AtomicBatchRequest slices
+                List<AtomicBatchTopicSlice> mergedSlices = new ArrayList<>();
+                for (Map.Entry<String, List<ProduceBatchRequest.BatchEntry>> entry : mergedByTopic.entrySet()) {
+                    mergedSlices.add(AtomicBatchTopicSlice.newBuilder()
+                            .setTopic(entry.getKey())
+                            .addAllEntries(entry.getValue())
+                            .build());
+                }
+
+                long proposalTerm = -1;
+                RaftEntry entry = null;
+
+                // Acquire lock ONCE and append a single Raft entry
+                lock.lock();
+                try {
+                    if (state != RaftState.LEADER) {
+                        IOException err = new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
+                        for (AtomicProposalRequest req : drained) {
+                            req.future.completeExceptionally(err);
+                        }
+                    } else {
+                        proposalTerm = currentTerm;
+                        long index = uncommittedNextIndex++;
+
+                        AtomicBatchRequest payload = AtomicBatchRequest.newBuilder()
+                                .addAllSlices(mergedSlices)
+                                .build();
+
+                        String topicStr = mergedSlices.stream()
+                                .map(AtomicBatchTopicSlice::getTopic)
+                                .collect(java.util.stream.Collectors.joining(","));
+
+                        entry = RaftEntry.newBuilder()
+                                .setTerm(proposalTerm)
+                                .setIndex(index)
+                                .setTopic(topicStr)
+                                .setPayload(payload.toByteString())
+                                .setCommandType(RaftCommandType.ATOMIC_BATCH)
+                                .build();
+
+                        pendingProposals.put(index,
+                                new AtomicAggregatedProposalState(proposalTerm, drained, constituentStartPositions));
+
+                        if (shouldLog("atomic-aggregator-coalesce")) {
+                            logger.info("[{}] Atomic aggregator coalesced {} requests ({} topics) into raft index {}",
+                                    nodeId, drained.size(), mergedSlices.size(), index);
+                        }
+                    }
+                } finally {
+                    lock.unlock();
+                }
+
+                if (entry != null) {
+                    long finalProposalTerm = proposalTerm;
+                    RaftEntry finalEntry = entry;
+                    boolean enqueued = logAppenderQueue.offer(() -> {
+                        try {
+                            raftLog.append(finalEntry);
+                            sendHeartbeats();
+                        } catch (IOException e) {
+                            logger.error("[{}] Failed to append atomic batch to RaftLog", nodeId, e);
+                            stepDown(finalProposalTerm);
+                        }
+                    });
+                    
+                    if (!enqueued) {
+                        IOException err = new IOException("Raft log appender queue full or stopped");
+                        for (AtomicProposalRequest req : drained) {
+                            req.future.completeExceptionally(err);
+                        }
+                    }
+                }
+
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception e) {
+                logger.error("[{}] Atomic aggregator loop error", nodeId, e);
+            }
+        }
+        logger.info("[{}] Atomic proposal aggregator thread stopped", nodeId);
+    }
+
+    /**
+     * Drain all pending proposals from the aggregation queue, completing each
+     * future exceptionally with the given reason. Called during stepDown() and stop().
+     */
+    private void drainProposalQueue(String reason) {
+        List<ProposalRequest> remaining = new ArrayList<>();
+        proposalQueue.drainTo(remaining);
+        if (!remaining.isEmpty()) {
+            IOException err = new IOException(reason);
+            for (ProposalRequest req : remaining) {
+                req.future.completeExceptionally(err);
+            }
+            logger.info("[{}] Drained {} proposals from aggregation queue: {}", nodeId, remaining.size(), reason);
+        }
+    }
+
+    private void drainAtomicProposalQueue(String reason) {
+        List<AtomicProposalRequest> remaining = new ArrayList<>();
+        atomicProposalQueue.drainTo(remaining);
+        if (!remaining.isEmpty()) {
+            IOException err = new IOException(reason);
+            for (AtomicProposalRequest req : remaining) {
+                req.future.completeExceptionally(err);
+            }
+            logger.info("[{}] Drained {} atomic proposals from aggregation queue: {}", nodeId, remaining.size(), reason);
+        }
+    }
 
     public void stop() {
         running = false;
+
+        // Stop the aggregator threads and drain any queued proposals
+        if (aggregatorThread != null) {
+            aggregatorThread.interrupt();
+            try { aggregatorThread.join(2000); } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        if (atomicAggregatorThread != null) {
+            atomicAggregatorThread.interrupt();
+            try { atomicAggregatorThread.join(2000); } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        drainProposalQueue("Raft node shutting down");
+        drainAtomicProposalQueue("Raft node shutting down");
+
         if (electionTimer != null) electionTimer.cancel(false);
         if (heartbeatTimer != null) heartbeatTimer.cancel(false);
         if (proposalCleanupTimer != null) proposalCleanupTimer.cancel(false);
@@ -234,9 +667,20 @@ public class RaftNode {
         if (quorumCheckTimer != null) quorumCheckTimer.cancel(false);
         scheduler.shutdownNow();
         raftExecutor.shutdownNow();
+        applyExecutor.shutdownNow();
 
-        pendingProposals.values().forEach(ps -> ps.future.completeExceptionally(
-                new IOException("Raft node shutting down")));
+        pendingProposals.values().forEach(ps -> {
+            ps.future.completeExceptionally(new IOException("Raft node shutting down"));
+            if (ps instanceof AtomicAggregatedProposalState aaps) {
+                for (AtomicProposalRequest req : aaps.constituents) {
+                    req.future.completeExceptionally(new IOException("Raft node shutting down"));
+                }
+            } else if (ps instanceof AggregatedProposalState aps) {
+                for (ProposalRequest req : aps.constituents) {
+                    req.future.completeExceptionally(new IOException("Raft node shutting down"));
+                }
+            }
+        });
         pendingProposals.clear();
 
         try {
@@ -276,11 +720,16 @@ public class RaftNode {
         preVoteRpcHandlers.put(peerId, handler);
     }
 
-    /**
-     * Register an RPC handler for sending InstallSnapshot to a peer.
-     */
-    public void registerInstallSnapshotHandler(String peerId, Function<InstallSnapshotRequest, InstallSnapshotResponse> handler) {
-        installSnapshotRpcHandlers.put(peerId, handler);
+    public void registerRequestTopicOffsetsHandler(String peerId, Function<RequestTopicOffsetsRequest, RequestTopicOffsetsResponse> handler) {
+        requestTopicOffsetsRpcHandlers.put(peerId, handler);
+    }
+
+    public void registerIncrementalSnapshotChunkHandler(String peerId, Function<IncrementalSnapshotChunk, IncrementalSnapshotChunkResponse> handler) {
+        incrementalSnapshotChunkRpcHandlers.put(peerId, handler);
+    }
+
+    public void registerIncrementalSnapshotDoneHandler(String peerId, Function<IncrementalSnapshotDoneRequest, IncrementalSnapshotDoneResponse> handler) {
+        incrementalSnapshotDoneRpcHandlers.put(peerId, handler);
     }
 
     
@@ -383,7 +832,7 @@ public class RaftNode {
                 if (shouldStartElection) {
                     startElection(proposedTerm);
                 }
-            });
+            }, raftExecutor);
         }
 
         resetElectionTimer();
@@ -467,7 +916,7 @@ public class RaftNode {
                 } finally {
                     lock.unlock();
                 }
-            });
+            }, raftExecutor);
         }
     }
 
@@ -481,6 +930,7 @@ public class RaftNode {
         long electionDuration = recordElectionDuration(true);
 
         long lastLogIndex = raftLog.getLastIndex();
+        uncommittedNextIndex = lastLogIndex + 1;
         for (PeerAddress peer : peers) {
             nextIndex.put(peer.id(), lastLogIndex + 1);
             matchIndex.put(peer.id(), 0L);
@@ -519,10 +969,27 @@ public class RaftNode {
         leaderId = null;
         savePersistentState();
 
+        // Drain any queued proposals that haven't been appended yet
+        drainProposalQueue("Lost leadership at term " + oldTerm + "; stepped down to term " + newTerm);
+        drainAtomicProposalQueue("Lost leadership at term " + oldTerm + "; stepped down to term " + newTerm);
+
         pendingProposals.values().stream()
                 .filter(ps -> ps.term == oldTerm)
-                .forEach(ps -> ps.future.completeExceptionally(
-                        new IOException("Lost leadership at term " + oldTerm + "; stepped down to term " + newTerm)));
+                .forEach(ps -> {
+                    ps.future.completeExceptionally(
+                            new IOException("Lost leadership at term " + oldTerm + "; stepped down to term " + newTerm));
+                    if (ps instanceof AtomicAggregatedProposalState aaps) {
+                        for (AtomicProposalRequest req : aaps.constituents) {
+                            req.future.completeExceptionally(
+                                    new IOException("Lost leadership at term " + oldTerm + "; stepped down to term " + newTerm));
+                        }
+                    } else if (ps instanceof AggregatedProposalState aps) {
+                        for (ProposalRequest req : aps.constituents) {
+                            req.future.completeExceptionally(
+                                    new IOException("Lost leadership at term " + oldTerm + "; stepped down to term " + newTerm));
+                        }
+                    }
+                });
 
         if (wasCandidate) {
             recordElectionDuration(false);
@@ -576,15 +1043,85 @@ public class RaftNode {
         if (state != RaftState.LEADER || !running) return;
 
         for (PeerAddress peer : peers) {
-            AtomicBoolean replicating = isReplicating.computeIfAbsent(peer.id(), k -> new AtomicBoolean(false));
-            if (replicating.compareAndSet(false, true)) {
-                CompletableFuture.runAsync(() -> {
-                    try {
-                        replicateTo(peer);
-                    } finally {
-                        replicating.set(false);
-                    }
-                }, raftExecutor);
+            if (snapshotInProgress.getOrDefault(peer.id(), false)) {
+                // If replication is blocked generating a massive snapshot, the peer lock is free.
+                // Send a lightweight heartbeat so the follower's election timer doesn't fire.
+                AtomicBoolean heartbeatInFlight = isHeartbeatInFlight.computeIfAbsent(peer.id(), k -> new AtomicBoolean(false));
+                if (heartbeatInFlight.compareAndSet(false, true)) {
+                    CompletableFuture.runAsync(() -> {
+                        try {
+                            sendLightweightHeartbeat(peer);
+                        } finally {
+                            heartbeatInFlight.set(false);
+                        }
+                    }, raftExecutor);
+                }
+            } else {
+                AtomicBoolean replicating = isReplicating.computeIfAbsent(peer.id(), k -> new AtomicBoolean(false));
+                if (replicating.compareAndSet(false, true)) {
+                    CompletableFuture.runAsync(() -> {
+                        try {
+                            replicateTo(peer);
+                        } finally {
+                            replicating.set(false);
+                            // If more entries were appended while replication was in flight,
+                            // immediately start a new round instead of waiting for the
+                            // 300ms heartbeat timer. This is critical for the atomic
+                            // aggregator which appends entries rapidly.
+                            if (state == RaftState.LEADER) {
+                                long lastIdx = raftLog.getLastIndex();
+                                long peerNext = nextIndex.getOrDefault(peer.id(), lastIdx + 1);
+                                if (peerNext <= lastIdx) {
+                                    sendHeartbeats();
+                                }
+                            }
+                        }
+                    }, raftExecutor);
+                }
+            }
+        }
+    }
+
+    private void sendLightweightHeartbeat(PeerAddress peer) {
+        long peerNextIndex;
+        long prevLogIndex;
+        long prevLogTerm = 0;
+        long currentTermLocal;
+        long commitIndexLocal;
+        
+        lock.lock();
+        try {
+            if (state != RaftState.LEADER) return;
+            currentTermLocal = currentTerm;
+            commitIndexLocal = commitIndex;
+            peerNextIndex = nextIndex.getOrDefault(peer.id(), raftLog.getLastIndex() + 1);
+            prevLogIndex = peerNextIndex - 1;
+            
+            if (prevLogIndex > 0 && prevLogIndex >= raftLog.getStartIndex() && prevLogIndex <= raftLog.getLastIndex()) {
+                prevLogTerm = raftLog.getTermAt(prevLogIndex);
+            } else if (prevLogIndex == lastApplied && lastApplied > 0) {
+                prevLogTerm = lastAppliedTerm;
+            }
+        } finally {
+            lock.unlock();
+        }
+
+        AppendEntriesRequest request = AppendEntriesRequest.newBuilder()
+                .setTerm(currentTermLocal)
+                .setLeaderId(nodeId)
+                .setPrevLogIndex(prevLogIndex)
+                .setPrevLogTerm(prevLogTerm)
+                .setLeaderCommit(commitIndexLocal)
+                .build();
+
+        java.util.function.Function<AppendEntriesRequest, AppendEntriesResponse> handler = appendRpcHandlers.get(peer.id());
+        if (handler != null) {
+            try {
+                AppendEntriesResponse response = handler.apply(request);
+                if (response != null) {
+                    lastContactTime.put(peer.id(), System.currentTimeMillis());
+                }
+            } catch (Exception ignored) {
             }
         }
     }
@@ -604,11 +1141,16 @@ public class RaftNode {
         try {
             if (state != RaftState.LEADER) return;
 
+            if (snapshotInProgress.getOrDefault(peer.id(), false)) {
+                return;
+            }
+
             peerNextIndex = nextIndex.getOrDefault(peer.id(), raftLog.getLastIndex() + 1);
             prevLogIndex = peerNextIndex - 1;
             
             if (peerNextIndex < raftLog.getStartIndex()) {
                 needsSnapshot = true;
+                snapshotInProgress.put(peer.id(), true);
                 return;
             }
 
@@ -618,7 +1160,9 @@ public class RaftNode {
         } finally {
             lock.unlock();
             if (needsSnapshot) {
-                sendInstallSnapshotToPeer(peer);
+                CompletableFuture.runAsync(() -> {
+                    syncFollowerTier2(peer);
+                }, snapshotExecutor);
             }
         }
 
@@ -676,7 +1220,7 @@ public class RaftNode {
         }
     }
 
-    private void sendInstallSnapshotToPeer(PeerAddress peer) {
+    private void syncFollowerTier2(PeerAddress peer) {
         long snapshotIndex;
         long snapshotTerm;
         long term;
@@ -692,76 +1236,64 @@ public class RaftNode {
 
         snapshotInProgress.put(peer.id(), true);
         try {
-            Path snapshotZip;
-            try {
-                snapshotZip = snapshotManager.createSnapshot(snapshotIndex);
-            } catch (IOException e) {
-                logger.error("[{}] Failed to create snapshot for peer {}", nodeId, peer.id(), e);
-                return;
-            }
+            Function<RequestTopicOffsetsRequest, RequestTopicOffsetsResponse> offsetHandler = requestTopicOffsetsRpcHandlers.get(peer.id());
+            if (offsetHandler == null) return;
 
-        Function<InstallSnapshotRequest, InstallSnapshotResponse> handler = installSnapshotRpcHandlers.get(peer.id());
-        if (handler == null) return;
+            RequestTopicOffsetsRequest req = RequestTopicOffsetsRequest.newBuilder()
+                    .setTerm(term)
+                    .setLeaderId(nodeId)
+                    .build();
+            RequestTopicOffsetsResponse offsetResp = offsetHandler.apply(req);
 
-        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(snapshotZip.toFile(), "r")) {
-            long totalBytes = raf.length();
-            long offset = 0;
-            int chunkSize = 2 * 1024 * 1024; // 2MB chunks
-            byte[] buffer = new byte[chunkSize];
-
-            while (offset < totalBytes || totalBytes == 0) {
-                int bytesRead = totalBytes == 0 ? -1 : raf.read(buffer);
-                boolean isDone = (bytesRead <= 0) || (offset + bytesRead >= totalBytes);
-                int payloadSize = Math.max(0, bytesRead);
-
-                InstallSnapshotRequest request = InstallSnapshotRequest.newBuilder()
-                        .setTerm(term)
-                        .setLeaderId(nodeId)
-                        .setLastIncludedIndex(snapshotIndex)
-                        .setLastIncludedTerm(snapshotTerm)
-                        .setOffset(offset)
-                        .setData(com.google.protobuf.ByteString.copyFrom(buffer, 0, payloadSize))
-                        .setDone(isDone)
-                        .build();
-
-                InstallSnapshotResponse response = handler.apply(request);
-                if (response.getTerm() == 0) {
-                    throw new IOException("InstallSnapshot RPC failed (peer offline)");
-                }
-                
-                lastContactTime.put(peer.id(), System.currentTimeMillis());
-                
+            if (offsetResp.getTerm() > term) {
                 lock.lock();
                 try {
-                    if (state != RaftState.LEADER) return;
-                    if (response.getTerm() > currentTerm) {
-                        stepDown(response.getTerm());
-                        return;
-                    }
+                    stepDown(offsetResp.getTerm());
                 } finally {
                     lock.unlock();
                 }
-
-                if (isDone) {
-                    lock.lock();
-                    try {
-                        if (state == RaftState.LEADER) {
-                            nextIndex.put(peer.id(), snapshotIndex + 1);
-                            matchIndex.put(peer.id(), snapshotIndex);
-                            logger.info("[{}] InstallSnapshot to {} succeeded. NextIndex updated to {}", 
-                                nodeId, peer.id(), snapshotIndex + 1);
-                            ClusterEventBuffer.emitSnapshot(String.format("Broker-%s installed snapshot successfully", peer.id()), peer.id());
-                        }
-                    } finally {
-                        lock.unlock();
-                    }
-                    break;
-                }
-                offset += bytesRead;
+                return;
             }
+
+            Map<String, Long> followerOffsets = offsetResp.getTopicOffsetsMap();
+
+            Function<IncrementalSnapshotChunk, IncrementalSnapshotChunkResponse> chunkHandler = incrementalSnapshotChunkRpcHandlers.get(peer.id());
+            Function<IncrementalSnapshotDoneRequest, IncrementalSnapshotDoneResponse> doneHandler = incrementalSnapshotDoneRpcHandlers.get(peer.id());
+
+            if (chunkHandler == null || doneHandler == null) return;
+
+            snapshotManager.streamIncrementalSegments(
+                    followerOffsets,
+                    snapshotIndex,
+                    snapshotTerm,
+                    nodeId,
+                    peer,
+                    chunkHandler,
+                    doneHandler
+            );
+
+            // If we succeed, advance matchIndex and nextIndex.
+            // snapshotIndex was captured at the START of this sync; by now the leader
+            // may have compacted many times. Clamp nextIndex to at least the current
+            // log start so the follower can receive normal AppendEntries immediately
+            // instead of triggering another Tier 2 sync on the very next heartbeat.
+            lock.lock();
+            try {
+                if (state == RaftState.LEADER) {
+                    long logStart = raftLog.getStartIndex();
+                    long newNextIndex = Math.max(snapshotIndex + 1, logStart);
+                    nextIndex.put(peer.id(), newNextIndex);
+                    matchIndex.put(peer.id(), newNextIndex - 1);
+                    logger.info("[{}] Tier 2 Sync to {} succeeded. NextIndex set to {} (snapshotIndex={}, logStart={})",
+                            nodeId, peer.id(), newNextIndex, snapshotIndex, logStart);
+                    ClusterEventBuffer.emitSnapshot(String.format("Broker-%s installed Tier 2 sync successfully", peer.id()), peer.id());
+                }
+            } finally {
+                lock.unlock();
+            }
+
         } catch (Exception e) {
-            logger.debug("[{}] InstallSnapshot to {} failed: {}", nodeId, peer.id(), e.getMessage());
-        }
+            logger.debug("[{}] Tier 2 Sync to {} failed: {}", nodeId, peer.id(), e.getMessage());
         } finally {
             snapshotInProgress.put(peer.id(), false);
         }
@@ -797,191 +1329,246 @@ public class RaftNode {
      * unblocks the client thread that is waiting for Raft commitment.
      */
     private void applyCommitted() {
-        boolean applied = false;
+        applyExecutor.execute(() -> {
+            boolean applied = false;
+            
+            while (lastApplied < commitIndex) {
+                Map<String, Long> localAtomicBatchBaseOffsets = null;
+                lastApplied++;
+                applied = true;
+                RaftEntry entry = raftLog.getEntry(lastApplied);
+                if (entry == null) {
+                    logger.error("[{}] Missing raft entry at index {} during apply", nodeId, lastApplied);
+                    break;
+                }
+                lastAppliedTerm = entry.getTerm();
 
-        while (lastApplied < commitIndex) {
-            lastApplied++;
-            applied = true;
-            RaftEntry entry = raftLog.getEntry(lastApplied);
-            if (entry == null) {
-                logger.error("[{}] Missing raft entry at index {} during apply", nodeId, lastApplied);
-                break;
-            }
-            lastAppliedTerm = entry.getTerm();
+                long completionValue = lastApplied;
+                boolean applySucceeded = true;
+                Exception applyException = null;
 
-            long completionValue = lastApplied;
-            boolean applySucceeded = true;
-            Exception applyException = null;
-
-            try {
-                switch (entry.getCommandType()) {
-                    case OFFSET_COMMIT -> {
-                        if (offsetManager != null && entry.hasConsumerGroup() && entry.hasOffsetValue()) {
-                            offsetManager.commit(
-                                    entry.getConsumerGroup(),
+                try {
+                    switch (entry.getCommandType()) {
+                        case OFFSET_COMMIT -> {
+                            if (offsetManager != null && entry.hasConsumerGroup() && entry.hasOffsetValue()) {
+                                offsetManager.commit(
+                                        entry.getConsumerGroup(),
+                                        entry.getTopic(),
+                                        entry.getOffsetValue()
+                                );
+                                logger.debug("[{}] Applied offset commit: group={}, topic={}, offset={}",
+                                        nodeId, entry.getConsumerGroup(), entry.getTopic(), entry.getOffsetValue());
+                            }
+                        }
+                        case BATCH_MESSAGE -> {
+                            ProduceBatchRequest batchRequest = ProduceBatchRequest.parseFrom(entry.getPayload());
+                            long baseOffset = messageStore.appendBatch(entry.getTopic(), batchRequest.getEntriesList());
+                            completionValue = baseOffset;
+                            logger.debug("[{}] Applied raft batch entry {} to MessageStore (topic={}, count={})",
+                                    nodeId, lastApplied, entry.getTopic(), batchRequest.getEntriesCount());
+                        }
+                        case ATOMIC_BATCH -> {
+                            com.drmq.protocol.AtomicBatchRequest req = com.drmq.protocol.AtomicBatchRequest.parseFrom(entry.getPayload());
+                            Map<String, Long> baseOffsets = messageStore.appendAtomicBatch(req.getSlicesList());
+                            localAtomicBatchBaseOffsets = baseOffsets;
+                            completionValue = lastApplied;
+                            logger.debug("[{}] Applied ATOMIC_BATCH entry {} to {} topics: {}",
+                                    nodeId, lastApplied, req.getSlicesCount(),
+                                    baseOffsets.keySet());
+                        }
+                        default -> {
+                            long msgOffset = messageStore.append(
                                     entry.getTopic(),
-                                    entry.getOffsetValue()
+                                    entry.getPayload(),
+                                    entry.hasKey() ? entry.getKey() : null,
+                                    entry.getTimestamp()
                             );
-                            logger.debug("[{}] Applied offset commit: group={}, topic={}, offset={}",
-                                    nodeId, entry.getConsumerGroup(), entry.getTopic(), entry.getOffsetValue());
+                            completionValue = msgOffset;
+                            logger.debug("[{}] Applied raft entry {} to MessageStore (topic={})",
+                                    nodeId, lastApplied, entry.getTopic());
                         }
                     }
-                    case BATCH_MESSAGE -> {
-                        ProduceBatchRequest batchRequest = ProduceBatchRequest.parseFrom(entry.getPayload());
-                        long baseOffset = messageStore.appendBatch(entry.getTopic(), batchRequest.getEntriesList());
-                        completionValue = baseOffset;
-                        logger.debug("[{}] Applied raft batch entry {} to MessageStore (topic={}, count={})",
-                                nodeId, lastApplied, entry.getTopic(), batchRequest.getEntriesCount());
+                } catch (Exception e) {
+                    applySucceeded = false;
+                    applyException = e;
+                    logger.error("FATAL: [{}] Failed to apply entry {} (type={}) to MessageStore. Panicking to avoid becoming a zombie node!",
+                            nodeId, lastApplied, entry.getCommandType(), e);
+                    System.exit(1);
+                }
+
+                        // Complete futures — handle simple, aggregated, and atomic-aggregated proposals
+                ProposalState ps = pendingProposals.get(lastApplied);
+                if (ps != null && ps.term == currentTerm) {
+                    pendingProposals.remove(lastApplied);
+                    if (applySucceeded) {
+                        if (ps instanceof AtomicAggregatedProposalState aaps) {
+                            Map<String, Long> baseOffsets = localAtomicBatchBaseOffsets;
+                            if (baseOffsets == null) baseOffsets = new java.util.LinkedHashMap<>();
+                            for (int i = 0; i < aaps.constituents.size(); i++) {
+                                AtomicProposalRequest req = aaps.constituents.get(i);
+                                Map<String, Integer> positions = aaps.constituentStartPositions.get(i);
+                                Map<String, Long> offsets = new java.util.LinkedHashMap<>();
+                                for (AtomicBatchTopicSlice slice : req.slices) {
+                                    String topic = slice.getTopic();
+                                    Long base = baseOffsets.get(topic);
+                                    Integer pos = positions.get(topic);
+                                    if (base != null && pos != null) {
+                                        offsets.put(topic, base + pos);
+                                    }
+                                }
+                                req.future.complete(offsets);
+                            }
+                            aaps.future.complete(completionValue);
+                            logger.debug("[{}] Completed atomic aggregated proposal for entry index {} ({} constituents, term={})",
+                                    nodeId, lastApplied, aaps.constituents.size(), ps.term);
+                        } else if (ps instanceof AggregatedProposalState aps) {
+                            // Distribute offsets to each constituent future
+                            long offset = completionValue; // baseOffset from appendBatch
+                            for (ProposalRequest req : aps.constituents) {
+                                req.future.complete(offset);
+                                offset += req.entries.size();
+                            }
+                            ps.future.complete(completionValue);
+                            logger.debug("[{}] Completed aggregated proposal for entry index {} ({} constituents, term={})",
+                                    nodeId, lastApplied, aps.constituents.size(), ps.term);
+                        } else {
+                            ps.future.complete(completionValue);
+                            logger.debug("[{}] Completed proposal for entry index {} (term={})",
+                                    nodeId, lastApplied, ps.term);
+                        }
+                    } else {
+                        IOException failure = applyException != null
+                                ? new IOException(applyException)
+                                : new IOException("Failed to apply entry " + lastApplied);
+                        if (ps instanceof AtomicAggregatedProposalState aaps) {
+                            for (AtomicProposalRequest req : aaps.constituents) {
+                                req.future.completeExceptionally(failure);
+                            }
+                        } else if (ps instanceof AggregatedProposalState aps) {
+                            for (ProposalRequest req : aps.constituents) {
+                                req.future.completeExceptionally(failure);
+                            }
+                        }
+                        ps.future.completeExceptionally(failure);
                     }
-                    case ATOMIC_BATCH -> {
-                        com.drmq.protocol.DRMQProtocol.AtomicBatchRequest req = com.drmq.protocol.DRMQProtocol.AtomicBatchRequest.parseFrom(entry.getPayload());
-                        Map<String, Long> baseOffsets = messageStore.appendAtomicBatch(req.getSlicesList());
-                        completionValue = lastApplied;
-                        logger.debug("[{}] Applied ATOMIC_BATCH entry {} to {} topics: {}",
-                                nodeId, lastApplied, req.getSlicesCount(),
-                                baseOffsets.keySet());
-                    }
-                    default -> {
-                        long msgOffset = messageStore.append(
-                                entry.getTopic(),
-                                entry.getPayload().toByteArray(),
-                                entry.hasKey() ? entry.getKey() : null,
-                                entry.getTimestamp()
-                        );
-                        completionValue = msgOffset;
-                        logger.debug("[{}] Applied raft entry {} to MessageStore (topic={})",
-                                nodeId, lastApplied, entry.getTopic());
+                } else if (ps != null) {
+                    pendingProposals.remove(lastApplied);
+                    logger.warn("[{}] Discarding future for entry {} (was term {}, now term {})",
+                            nodeId, lastApplied, ps.term, currentTerm);
+                    if (ps instanceof AtomicAggregatedProposalState aaps) {
+                        for (AtomicProposalRequest req : aaps.constituents) {
+                            req.future.completeExceptionally(
+                                    new IOException("Term mismatch: entry term " + ps.term + " != current " + currentTerm));
+                        }
+                    } else if (ps instanceof AggregatedProposalState aps) {
+                        for (ProposalRequest req : aps.constituents) {
+                            req.future.completeExceptionally(
+                                    new IOException("Term mismatch: entry term " + ps.term + " != current " + currentTerm));
+                        }
                     }
                 }
-            } catch (Exception e) {
-                applySucceeded = false;
-                applyException = e;
-                logger.error("[{}] Failed to apply entry {} (type={})",
-                        nodeId, lastApplied, entry.getCommandType(), e);
             }
 
-            ProposalState ps = pendingProposals.get(lastApplied);
-            if (ps != null && ps.term == currentTerm) {
-                pendingProposals.remove(lastApplied);
-                if (applySucceeded) {
-                    ps.future.complete(completionValue);
-                    logger.debug("[{}] Completed proposal for entry index {} (term={})",
-                            nodeId, lastApplied, ps.term);
+            if (applied) {
+                stateSaveNeeded = true;
+
+                long retentionLimit = lastApplied - (raftCompactThreshold * 2);
+                long safeCompactIndex;
+
+                if (isLeader()) {
+                    long minMatchIndex = lastApplied;
+                    for (long idx : matchIndex.values()) {
+                        minMatchIndex = Math.min(minMatchIndex, idx);
+                    }
+                    safeCompactIndex = Math.max(retentionLimit, minMatchIndex);
                 } else {
-                    ps.future.completeExceptionally(applyException != null
-                            ? applyException
-                            : new IOException("Failed to apply entry " + lastApplied));
+                    safeCompactIndex = lastApplied;
                 }
-            } else if (ps != null) {
-                pendingProposals.remove(lastApplied);
-                logger.warn("[{}] Discarding future for entry {} (was term {}, now term {})",
-                        nodeId, lastApplied, ps.term, currentTerm);
-            }
-        }
 
-        if (applied) {
-            stateSaveNeeded = true;
+                long finalCompactIndex = Math.min(safeCompactIndex, lastApplied - raftCompactThreshold);
+      
+                long currentLogStart = raftLog.getStartIndex();
+                boolean compactionDue = finalCompactIndex > 0
+                        && (finalCompactIndex - currentLogStart) >= raftCompactThreshold;
 
-            long retentionLimit = lastApplied - (raftCompactThreshold * 100);
-            long safeCompactIndex;
-
-            if (isLeader()) {
-                long minMatchIndex = lastApplied;
-                for (long idx : matchIndex.values()) {
-                    minMatchIndex = Math.min(minMatchIndex, idx);
-                }
-                safeCompactIndex = Math.max(retentionLimit, minMatchIndex);
-            } else {
-                safeCompactIndex = retentionLimit;
-            }
-
-            long finalCompactIndex = Math.min(safeCompactIndex, lastApplied - raftCompactThreshold);
-  
-            long currentLogStart = raftLog.getStartIndex();
-            boolean compactionDue = finalCompactIndex > 0
-                    && (finalCompactIndex - currentLogStart) >= raftCompactThreshold;
-
-            if (compactionDue) {
-                if (isCompacting.compareAndSet(false, true)) {
-                    raftExecutor.execute(() -> {
-                        try {
-                            raftLog.compact(finalCompactIndex);
-                            logger.debug("[{}] Chunked compaction complete: log now starts at {}",
-                                    nodeId, finalCompactIndex + 1);
-                        } catch (IOException e) {
-                            logger.error("Failed to compact Raft log", e);
-                        } finally {
-                            isCompacting.set(false);
-                        }
-                    });
+                if (compactionDue) {
+                    if (isCompacting.compareAndSet(false, true)) {
+                        snapshotExecutor.execute(() -> {
+                            try {
+                                if (messageStore != null) messageStore.forceFlush();
+                                if (offsetManager != null) offsetManager.forceFlush();
+                                raftLog.compact(finalCompactIndex);
+                                logger.debug("[{}] Chunked compaction complete: log now starts at {}",
+                                        nodeId, finalCompactIndex + 1);
+                            } catch (IOException e) {
+                                logger.error("Failed to compact Raft log", e);
+                            } finally {
+                                isCompacting.set(false);
+                            }
+                        });
+                    }
                 }
             }
-        }
+        });
     }
 
 
     /**
      * Propose a new message to be replicated via Raft.
-     * Blocks until the entry is committed (majority ACK) or times out.
-
+     * Routes through the aggregation queue for batch coalescing.
      */
-    public long propose(String topic, byte[] payload, String key, long timestamp) throws IOException {
-        lock.lock();
-        long index;
-        long proposalTerm;
-        CompletableFuture<Long> future;
-        try {
-            if (state != RaftState.LEADER) {
-                throw new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
-            }
+    public CompletableFuture<Long> proposeAsync(String topic, byte[] payload, String key, long timestamp) {
+        return proposeAsync(topic, com.google.protobuf.ByteString.copyFrom(payload), key, timestamp);
+    }
 
-            proposalTerm = currentTerm;
-            index = raftLog.getLastIndex() + 1;
-
-            if (pendingProposals.size() >= MAX_PENDING_PROPOSALS) {
-                throw new IOException("Too many pending proposals (" + pendingProposals.size()
-                        + "/" + MAX_PENDING_PROPOSALS + ")");
-            }
-
-            RaftEntry.Builder entryBuilder = RaftEntry.newBuilder()
-                    .setTerm(proposalTerm)
-                    .setIndex(index)
-                    .setTopic(topic)
-                    .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
-                    .setTimestamp(timestamp)
-                    .setCommandType(RaftCommandType.MESSAGE);
-
-            if (key != null && !key.isEmpty()) {
-                entryBuilder.setKey(key);
-            }
-
-            RaftEntry entry = entryBuilder.build();
-            raftLog.append(entry);
-            future = new CompletableFuture<>();
-            pendingProposals.put(index, new ProposalState(proposalTerm, future));
-
-        } finally {
-            lock.unlock();
+    public CompletableFuture<Long> proposeAsync(String topic, com.google.protobuf.ByteString payload, String key, long timestamp) {
+        // Quick guard: must be leader (volatile read, no lock)
+        if (state != RaftState.LEADER) {
+            CompletableFuture<Long> err = new CompletableFuture<>();
+            err.completeExceptionally(new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN")));
+            return err;
         }
-        
-        sendHeartbeats();
+
+        // Wrap single message as a 1-entry batch and route through aggregation
+        ProduceBatchRequest.BatchEntry.Builder batchEntry = ProduceBatchRequest.BatchEntry.newBuilder()
+                .setPayload(payload)
+                .setClientTimestamp(timestamp);
+        if (key != null && !key.isEmpty()) {
+            batchEntry.setKey(key);
+        }
+
+        CompletableFuture<Long> future = new CompletableFuture<>();
+        ProposalRequest req = new ProposalRequest(topic, List.of(batchEntry.build()), future);
+
+        if (!proposalQueue.offer(req)) {
+            future.completeExceptionally(new IOException("Proposal queue full (" + proposalQueue.size()
+                    + "/" + MAX_PENDING_PROPOSALS + "). Apply backpressure."));
+            return future;
+        }
+
+        return future.orTimeout(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .exceptionally(e -> {
+                    if (e instanceof java.util.concurrent.TimeoutException) {
+                        throw new java.util.concurrent.CompletionException(
+                                new IOException("Raft proposal timed out; entry may still commit"));
+                    }
+                    throw new java.util.concurrent.CompletionException(
+                            new IOException("Raft proposal failed: " + e.getMessage(), e));
+                });
+    }
+
+    public long propose(String topic, byte[] payload, String key, long timestamp) throws IOException {
+        return propose(topic, com.google.protobuf.ByteString.copyFrom(payload), key, timestamp);
+    }
+
+    public long propose(String topic, com.google.protobuf.ByteString payload, String key, long timestamp) throws IOException {
         try {
-            return future.get(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        } catch (TimeoutException e) {
-            ProposalState ps = pendingProposals.get(index);
-            if (ps != null) {
-                ps.timedOut = true;
-                if (pendingProposals.size() > MAX_PENDING_PROPOSALS / 2) {
-                    logger.warn("[{}] High number of pending proposals: {} (threshold: {})",
-                            nodeId, pendingProposals.size(), MAX_PENDING_PROPOSALS);
-                }
+            return proposeAsync(topic, payload, key, timestamp).join();
+        } catch (java.util.concurrent.CompletionException e) {
+            if (e.getCause() instanceof IOException) {
+                throw (IOException) e.getCause();
             }
-            throw new IOException("Raft proposal timed out (index=" + index + "); entry may still commit");
-        } catch (ExecutionException e) {
-            throw new IOException("Raft proposal failed: " + e.getCause().getMessage());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Raft proposal interrupted");
+            throw new IOException(e.getCause());
         }
     }
 
@@ -994,62 +1581,42 @@ public class RaftNode {
      * @param entries The batch entries from the ProduceBatchRequest
      * @return The base offset (offset of the first message in the batch)
      */
-    public long proposeBatch(String topic, List<ProduceBatchRequest.BatchEntry> entries) throws IOException {
-        lock.lock();
-        long index;
-        long proposalTerm;
-        CompletableFuture<Long> future;
-        try {
-            if (state != RaftState.LEADER) {
-                throw new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
-            }
-
-            proposalTerm = currentTerm;
-            index = raftLog.getLastIndex() + 1;
-
-            if (pendingProposals.size() >= MAX_PENDING_PROPOSALS) {
-                throw new IOException("Too many pending proposals (" + pendingProposals.size()
-                        + "/" + MAX_PENDING_PROPOSALS + ")");
-            }
-
-            ProduceBatchRequest batchPayload = ProduceBatchRequest.newBuilder()
-                    .setTopic(topic)
-                    .addAllEntries(entries)
-                    .build();
-
-            RaftEntry entry = RaftEntry.newBuilder()
-                    .setTerm(proposalTerm)
-                    .setIndex(index)
-                    .setTopic(topic)
-                    .setPayload(batchPayload.toByteString())
-                    .setCommandType(RaftCommandType.BATCH_MESSAGE)
-                    .build();
-
-            raftLog.append(entry);
-            future = new CompletableFuture<>();
-            pendingProposals.put(index, new ProposalState(proposalTerm, future));
-
-        } finally {
-            lock.unlock();
+    public CompletableFuture<Long> proposeBatchAsync(String topic, List<ProduceBatchRequest.BatchEntry> entries) {
+        // Quick guard: must be leader (volatile read, no lock)
+        if (state != RaftState.LEADER) {
+            CompletableFuture<Long> err = new CompletableFuture<>();
+            err.completeExceptionally(new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN")));
+            return err;
         }
-        sendHeartbeats();
+
+        CompletableFuture<Long> future = new CompletableFuture<>();
+        ProposalRequest req = new ProposalRequest(topic, entries, future);
+
+        if (!proposalQueue.offer(req)) {
+            future.completeExceptionally(new IOException("Proposal queue full (" + proposalQueue.size()
+                    + "/" + MAX_PENDING_PROPOSALS + "). Apply backpressure."));
+            return future;
+        }
+
+        return future.orTimeout(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .exceptionally(e -> {
+                    if (e instanceof java.util.concurrent.TimeoutException) {
+                        throw new java.util.concurrent.CompletionException(
+                                new IOException("Raft batch proposal timed out; entry may still commit"));
+                    }
+                    throw new java.util.concurrent.CompletionException(
+                            new IOException("Raft batch proposal failed: " + e.getMessage(), e));
+                });
+    }
+
+    public long proposeBatch(String topic, List<ProduceBatchRequest.BatchEntry> entries) throws IOException {
         try {
-            return future.get(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        } catch (TimeoutException e) {
-            ProposalState ps = pendingProposals.get(index);
-            if (ps != null) {
-                ps.timedOut = true;
-                if (pendingProposals.size() > MAX_PENDING_PROPOSALS / 2) {
-                    logger.warn("[{}] High number of pending proposals: {} (threshold: {})",
-                            nodeId, pendingProposals.size(), MAX_PENDING_PROPOSALS);
-                }
+            return proposeBatchAsync(topic, entries).join();
+        } catch (java.util.concurrent.CompletionException e) {
+            if (e.getCause() instanceof IOException) {
+                throw (IOException) e.getCause();
             }
-            throw new IOException("Raft batch proposal timed out (index=" + index + "); entry may still commit");
-        } catch (ExecutionException e) {
-            throw new IOException("Raft batch proposal failed: " + e.getCause().getMessage());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Raft batch proposal interrupted");
+            throw new IOException(e.getCause());
         }
     }
 
@@ -1060,67 +1627,50 @@ public class RaftNode {
      * @param slices  list of (topic, entries) pairs — must contain ≥2 topics
      * @return map of topic -> base offset, populated after commit
      */
-    public Map<String, Long> proposeAtomicBatch(List<AtomicBatchTopicSlice> slices) throws IOException {
+    public CompletableFuture<Map<String, Long>> proposeAtomicBatchAsync(List<AtomicBatchTopicSlice> slices) {
         if (slices.size() < 2) {
-            throw new IllegalArgumentException(
-                "ATOMIC_BATCH requires at least 2 topics. Use proposeBatch() for single-topic.");
+            CompletableFuture<Map<String, Long>> err = new CompletableFuture<>();
+            err.completeExceptionally(new IllegalArgumentException("ATOMIC_BATCH requires at least 2 topics. Use proposeBatch() for single-topic."));
+            return err;
         }
 
-        lock.lock();
-        long index;
-        long proposalTerm;
-        CompletableFuture<Long> future;
-        try {
-            if (state != RaftState.LEADER) {
-                throw new IOException("NOT_LEADER:" +
-                    (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
-            }
-
-            proposalTerm = currentTerm;
-            index = raftLog.getLastIndex() + 1;
-
-            if (pendingProposals.size() >= MAX_PENDING_PROPOSALS) {
-                throw new IOException("Too many pending proposals");
-            }
-
-            AtomicBatchRequest payload = AtomicBatchRequest.newBuilder()
-                    .addAllSlices(slices)
-                    .build();
-
-            RaftEntry entry = RaftEntry.newBuilder()
-                    .setTerm(proposalTerm)
-                    .setIndex(index)
-                    .setTopic(slices.stream()
-                        .map(AtomicBatchTopicSlice::getTopic)
-                        .collect(java.util.stream.Collectors.joining(",")))
-                    .setPayload(payload.toByteString())
-                    .setCommandType(RaftCommandType.ATOMIC_BATCH)
-                    .build();
-
-            raftLog.append(entry);
-            future = new CompletableFuture<>();
-            pendingProposals.put(index, new ProposalState(proposalTerm, future));
-
-        } finally {
-            lock.unlock();
+        if (state != RaftState.LEADER) {
+            CompletableFuture<Map<String, Long>> err = new CompletableFuture<>();
+            err.completeExceptionally(new IOException("NOT_LEADER:" +
+                (leaderId != null ? getLeaderAddress() : "UNKNOWN")));
+            return err;
         }
-        sendHeartbeats();
+
+        CompletableFuture<Map<String, Long>> future = new CompletableFuture<>();
+        AtomicProposalRequest req = new AtomicProposalRequest(slices, future);
+
+        if (!atomicProposalQueue.offer(req)) {
+            future.completeExceptionally(new IOException("Atomic proposal queue full (" + atomicProposalQueue.size()
+                    + "/" + MAX_PENDING_PROPOSALS + "). Apply backpressure."));
+            return future;
+        }
+
+        return future.orTimeout(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .exceptionally(e -> {
+                    if (e instanceof java.util.concurrent.TimeoutException) {
+                        throw new java.util.concurrent.CompletionException(new IOException("Atomic batch proposal timed out; entry may still commit"));
+                    }
+                    throw new java.util.concurrent.CompletionException(
+                            new IOException("Atomic batch proposal failed: " + e.getMessage(), e));
+                });
+    }
+
+    public Map<String, Long> proposeAtomicBatch(List<AtomicBatchTopicSlice> slices) throws IOException {
         try {
-            future.get(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            // After commit, fetch offsets from the message store
-            Map<String, Long> offsets = new java.util.LinkedHashMap<>();
-            for (com.drmq.protocol.DRMQProtocol.AtomicBatchTopicSlice s : slices) {
-                offsets.put(s.getTopic(),
-                    messageStore.getHeadOffset(s.getTopic()) - s.getEntriesCount() + 1);
+            return proposeAtomicBatchAsync(slices).join();
+        } catch (java.util.concurrent.CompletionException e) {
+            if (e.getCause() instanceof IOException) {
+                throw (IOException) e.getCause();
             }
-            return offsets;
-        } catch (TimeoutException e) {
-            throw new IOException("Atomic batch proposal timed out");
-        } catch (ExecutionException e) {
-            throw new IOException("Atomic batch proposal failed: " + e.getCause().getMessage());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Interrupted");
+            if (e.getCause() instanceof RuntimeException) {
+                throw (RuntimeException) e.getCause();
+            }
+            throw new IOException(e.getCause());
         }
     }
     /**
@@ -1133,22 +1683,26 @@ public class RaftNode {
      * @return the committed Raft log index
      * @throws IOException if not leader, or commitment fails
      */
-    public long proposeOffsetCommit(String consumerGroup, String topic, long offset) throws IOException {
+    public CompletableFuture<Long> proposeOffsetCommitAsync(String consumerGroup, String topic, long offset) {
         lock.lock();
         long index;
         long proposalTerm;
         CompletableFuture<Long> future;
         try {
             if (state != RaftState.LEADER) {
-                throw new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
+                CompletableFuture<Long> err = new CompletableFuture<>();
+                err.completeExceptionally(new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN")));
+                return err;
             }
 
             proposalTerm = currentTerm;
             index = raftLog.getLastIndex() + 1;
 
             if (pendingProposals.size() >= MAX_PENDING_PROPOSALS) {
-                throw new IOException("Too many pending proposals (" + pendingProposals.size()
-                        + "/" + MAX_PENDING_PROPOSALS + ")");
+                CompletableFuture<Long> err = new CompletableFuture<>();
+                err.completeExceptionally(new IOException("Too many pending proposals (" + pendingProposals.size()
+                        + "/" + MAX_PENDING_PROPOSALS + ")"));
+                return err;
             }
 
             RaftEntry entry = RaftEntry.newBuilder()
@@ -1165,29 +1719,41 @@ public class RaftNode {
             future = new CompletableFuture<>();
             pendingProposals.put(index, new ProposalState(proposalTerm, future));
 
+        } catch (Exception e) {
+            CompletableFuture<Long> err = new CompletableFuture<>();
+            err.completeExceptionally(e);
+            return err;
         } finally {
             lock.unlock();
         }
 
         sendHeartbeats();
+        final long finalIndex = index;
+        return future.orTimeout(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .exceptionally(e -> {
+                    if (e instanceof java.util.concurrent.TimeoutException) {
+                        ProposalState ps = pendingProposals.get(finalIndex);
+                        if (ps != null) {
+                            ps.timedOut = true;
+                            if (pendingProposals.size() > MAX_PENDING_PROPOSALS / 2) {
+                                logger.warn("[{}] High number of pending proposals: {} (threshold: {})",
+                                        nodeId, pendingProposals.size(), MAX_PENDING_PROPOSALS);
+                            }
+                        }
+                        throw new java.util.concurrent.CompletionException(new IOException("Raft offset commit timed out (index=" + finalIndex + "); entry may still commit"));
+                    }
+                    throw new java.util.concurrent.CompletionException(new IOException("Raft offset commit failed: " + e.getMessage(), e));
+                });
+    }
 
+    public long proposeOffsetCommit(String consumerGroup, String topic, long offset) throws IOException {
         try {
-            return future.get(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        } catch (TimeoutException e) {
-            ProposalState ps = pendingProposals.get(index);
-            if (ps != null) {
-                ps.timedOut = true;
-                if (pendingProposals.size() > MAX_PENDING_PROPOSALS / 2) {
-                    logger.warn("[{}] High number of pending proposals: {} (threshold: {})",
-                            nodeId, pendingProposals.size(), MAX_PENDING_PROPOSALS);
-                }
+            return proposeOffsetCommitAsync(consumerGroup, topic, offset).join();
+        } catch (java.util.concurrent.CompletionException e) {
+            if (e.getCause() instanceof IOException) {
+                throw (IOException) e.getCause();
             }
-            throw new IOException("Raft offset commit timed out (index=" + index + "); entry may still commit");
-        } catch (ExecutionException e) {
-            throw new IOException("Raft offset commit failed: " + e.getCause().getMessage());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Raft offset commit interrupted");
+            throw new IOException(e.getCause());
         }
     }
 
@@ -1243,7 +1809,7 @@ public class RaftNode {
 
             boolean leaderAlive = (state == RaftState.LEADER)
                     || (lastHeartbeatReceivedMs > 0
-                        && (System.currentTimeMillis() - lastHeartbeatReceivedMs) < ELECTION_TIMEOUT_MIN_MS);
+                        && (System.currentTimeMillis() - lastHeartbeatReceivedMs) < ELECTION_TIMEOUT_MAX_MS);
 
             if (leaderAlive) {
                 logger.info("[{}] Rejecting pre-vote for {} (term {}) — leader is alive (state={})",
@@ -1371,9 +1937,9 @@ public class RaftNode {
     }
 
     /**
-     * Handle an incoming InstallSnapshot RPC from the leader.
+     * Handle an incoming Tier 2 Incremental Sync chunk.
      */
-    public InstallSnapshotResponse handleInstallSnapshot(InstallSnapshotRequest request) {
+    public IncrementalSnapshotChunkResponse handleIncrementalSnapshotChunk(IncrementalSnapshotChunk request) {
         lock.lock();
         try {
             if (request.getTerm() > currentTerm) {
@@ -1381,78 +1947,121 @@ public class RaftNode {
             }
 
             if (request.getTerm() < currentTerm) {
-                return InstallSnapshotResponse.newBuilder().setTerm(currentTerm).build();
+                return IncrementalSnapshotChunkResponse.newBuilder()
+                        .setTerm(currentTerm)
+                        .setSuccess(false)
+                        .build();
             }
 
             resetElectionTimer();
             leaderId = request.getLeaderId();
             state = RaftState.FOLLOWER;
 
-            if (request.getOffset() == 0 || request.getLastIncludedIndex() != expectedSnapshotIndex) {
-                if (snapshotReceiveStream != null) {
-                    try { snapshotReceiveStream.close(); } catch (Exception ignored) {}
-                }
-                Path tempDir = dataDir.resolve("raft/snapshots");
-                Files.createDirectories(tempDir);
-                snapshotTempFile = tempDir.resolve("temp_receive_" + request.getLastIncludedIndex() + ".zip");
-                snapshotReceiveStream = Files.newOutputStream(snapshotTempFile, 
-                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-                snapshotReceiveOffset = 0;
-                expectedSnapshotIndex = request.getLastIncludedIndex();
+            String topic = request.getTopic();
+            String fileName = request.getFileName();
+            Path topicDir = dataDir.resolve(topic);
+            Files.createDirectories(topicDir);
+            Path filePath = topicDir.resolve(fileName);
+            
+            if (request.getFileOffset() == 0) {
+                 logger.info("[{}] Receiving Tier 2 Sync chunk for topic: {}, file: {}", nodeId, topic, fileName);
             }
 
-            if (request.getOffset() != snapshotReceiveOffset) {
-                throw new IllegalStateException("Expected chunk offset " + snapshotReceiveOffset + 
-                                                " but got " + request.getOffset());
-            }
-
-            if (request.getData().size() > 0) {
-                snapshotReceiveStream.write(request.getData().toByteArray());
-                snapshotReceiveOffset += request.getData().size();
-            }
-
-            if (request.getDone()) {
-                snapshotReceiveStream.close();
-                snapshotReceiveStream = null;
-
-                long snapshotIndex = request.getLastIncludedIndex();
-                if (snapshotIndex > lastApplied) {
-                    logger.info("[{}] Received full snapshot. Applying hot-swap up to index {}", nodeId, snapshotIndex);
-                    
-                    snapshotManager.restoreSnapshot(snapshotTempFile);
-                    messageStore.reload();
-                    if (offsetManager != null) {
-                        offsetManager.reload();
-                    }
-
-                    if (raftLog.getLastIndex() > 0) {
-                        try {
-                            long compactUpTo = Math.min(snapshotIndex, raftLog.getLastIndex());
-                            raftLog.compact(compactUpTo);
-                        } catch (IOException e) {
-                            logger.error("Failed to compact Raft log during InstallSnapshot", e);
-                        }
-                    }
-                    raftLog.setStartIndex(snapshotIndex + 1);
-                    lastApplied = snapshotIndex;
-                    lastAppliedTerm = request.getLastIncludedTerm();
-                    commitIndex = Math.max(commitIndex, snapshotIndex);
-                    logger.info("[{}] Successfully applied snapshot. lastApplied={}, commitIndex={}",
-                            nodeId, lastApplied, commitIndex);
-                }
+            try (java.nio.channels.FileChannel channel = java.nio.channels.FileChannel.open(filePath, 
+                    java.nio.file.StandardOpenOption.CREATE, 
+                    java.nio.file.StandardOpenOption.READ, 
+                    java.nio.file.StandardOpenOption.WRITE)) {
                 
-                Files.deleteIfExists(snapshotTempFile);
+                int size = request.getData().size();
+                if (size > 0) {
+                    java.nio.MappedByteBuffer mappedBuffer = channel.map(java.nio.channels.FileChannel.MapMode.READ_WRITE, request.getFileOffset(), size);
+                    request.getData().copyTo(mappedBuffer);
+                    mappedBuffer.force(); // Force flush for durability
+                }
             }
 
-            return InstallSnapshotResponse.newBuilder().setTerm(currentTerm).build();
+            return IncrementalSnapshotChunkResponse.newBuilder()
+                    .setTerm(currentTerm)
+                    .setSuccess(true)
+                    .build();
         } catch (Exception e) {
-             logger.error("Error handling InstallSnapshot", e);
-             return InstallSnapshotResponse.newBuilder().setTerm(currentTerm).build();
+            logger.error("Error handling IncrementalSnapshotChunk", e);
+            return IncrementalSnapshotChunkResponse.newBuilder()
+                    .setTerm(currentTerm)
+                    .setSuccess(false)
+                    .build();
         } finally {
             lock.unlock();
         }
     }
 
+    /**
+     * Handle the completion of a Tier 2 Incremental Sync.
+     */
+    public IncrementalSnapshotDoneResponse handleIncrementalSnapshotDone(IncrementalSnapshotDoneRequest request) {
+        lock.lock();
+        try {
+            if (request.getTerm() > currentTerm) {
+                stepDown(request.getTerm());
+            }
+
+            if (request.getTerm() < currentTerm) {
+                return IncrementalSnapshotDoneResponse.newBuilder()
+                        .setTerm(currentTerm)
+                        .setSuccess(false)
+                        .build();
+            }
+
+            resetElectionTimer();
+            leaderId = request.getLeaderId();
+            state = RaftState.FOLLOWER;
+
+            long snapshotIndex = request.getLastIncludedIndex();
+            if (snapshotIndex > lastApplied) {
+                logger.info("[{}] Received IncrementalSnapshotDone. Advancing state up to index {}", nodeId, snapshotIndex);
+                
+                if (raftLog.getLastIndex() > 0) {
+                    try {
+                        long compactUpTo = Math.min(snapshotIndex, raftLog.getLastIndex());
+                        raftLog.compact(compactUpTo);
+                    } catch (IOException e) {
+                        logger.error("Failed to compact Raft log during Incremental Sync", e);
+                    }
+                }
+                raftLog.setStartIndex(snapshotIndex + 1);
+                lastApplied = snapshotIndex;
+                lastAppliedTerm = request.getLastIncludedTerm();
+                commitIndex = Math.max(commitIndex, snapshotIndex);
+                
+                applyExecutor.execute(() -> {
+                    try {
+                        messageStore.reload();
+                        if (offsetManager != null) {
+                            offsetManager.reload();
+                        }
+                        logger.info("[{}] Successfully applied Tier 2 sync. lastApplied={}, commitIndex={}",
+                                nodeId, snapshotIndex, commitIndex);
+                    } catch (IOException e) {
+                        logger.error("FATAL: Failed to reload MessageStore after Tier 2 Sync. Panicking!", e);
+                        System.exit(1);
+                    }
+                });
+            }
+
+            return IncrementalSnapshotDoneResponse.newBuilder()
+                    .setTerm(currentTerm)
+                    .setSuccess(true)
+                    .build();
+        } catch (Exception e) {
+            logger.error("Error handling IncrementalSnapshotDone", e);
+            return IncrementalSnapshotDoneResponse.newBuilder()
+                    .setTerm(currentTerm)
+                    .setSuccess(false)
+                    .build();
+        } finally {
+            lock.unlock();
+        }
+    }
 
     /**
      Election restriction: only vote for candidates whose log

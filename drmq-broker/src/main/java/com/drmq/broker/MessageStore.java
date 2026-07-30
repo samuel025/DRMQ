@@ -2,9 +2,7 @@ package com.drmq.broker;
 
 import com.drmq.broker.persistence.LogManager;
 import com.drmq.broker.persistence.LogSegment;
-import com.drmq.protocol.DRMQProtocol.AtomicBatchTopicSlice;
-import com.drmq.protocol.DRMQProtocol.ProduceBatchRequest;
-import com.drmq.protocol.DRMQProtocol.StoredMessage;
+import com.drmq.protocol.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -192,17 +190,21 @@ public class MessageStore implements Closeable {
                 .add(message);
     }
 
+    public long append(String topic, byte[] payload, String key, long clientTimestamp) {
+        return append(topic, com.google.protobuf.ByteString.copyFrom(payload), key, clientTimestamp);
+    }
+
     /**
      * Append a message to the specified topic.
      */
-    public long append(String topic, byte[] payload, String key, long clientTimestamp) {
+    public long append(String topic, com.google.protobuf.ByteString payload, String key, long clientTimestamp) {
         long offset = globalOffset.getAndIncrement();
         long storedAt = System.currentTimeMillis();
 
         StoredMessage.Builder builder = StoredMessage.newBuilder()
                 .setOffset(offset)
                 .setTopic(topic)
-                .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
+                .setPayload(payload)
                 .setTimestamp(clientTimestamp)
                 .setStoredAt(storedAt);
 
@@ -379,7 +381,7 @@ public class MessageStore implements Closeable {
             topicMessages.put(topic, messages);
         }
 
-        globalLock.writeLock().lock();
+        globalLock.readLock().lock();
         try {
             for (var entry : topicMessages.entrySet()) {
                 String topic = entry.getKey();
@@ -412,7 +414,7 @@ public class MessageStore implements Closeable {
             logger.error("Failed to persist atomic batch", e);
             throw new RuntimeException("Failed to persist atomic batch", e);
         } finally {
-            globalLock.writeLock().unlock();
+            globalLock.readLock().unlock();
         }
 
         synchronized (messageMonitor) {
@@ -639,6 +641,48 @@ public class MessageStore implements Closeable {
         return topicMessageCounts.size();
     }
 
+    /**
+     * Get the highest offset for each topic.
+     * Used for Tier 2 Incremental Sync to report follower state to the leader.
+     * @return Map of topic name to its max offset
+     */
+    public Map<String, Long> getTopicMaxOffsets() {
+        Map<String, Long> maxOffsets = new java.util.HashMap<>();
+        for (Map.Entry<String, AtomicLong> entry : topicHeadOffsets.entrySet()) {
+            maxOffsets.put(entry.getKey(), entry.getValue().get());
+        }
+        return maxOffsets;
+    }
+
+    /**
+     * Get paths of segments that contain offsets greater than the provided offset.
+     * Used for Tier 2 Incremental Sync.
+     */
+    public List<Path> getSegmentsForSync(String topic, long followerOffset) {
+        ConcurrentSkipListMap<Long, LogSegment> segments = logManager.getAllSegments().get(topic);
+        if (segments == null) return Collections.emptyList();
+
+        List<Path> paths = new ArrayList<>();
+        // We need any segment where the next segment's baseOffset > followerOffset,
+        // or the current segment's baseOffset > followerOffset.
+        // A simpler approach: Include the segment that contains followerOffset,
+        // and all segments after it.
+        Map.Entry<Long, LogSegment> floorEntry = segments.floorEntry(followerOffset);
+        if (floorEntry != null) {
+            paths.add(floorEntry.getValue().getFilePath());
+            for (LogSegment seg : segments.tailMap(floorEntry.getKey(), false).values()) {
+                paths.add(seg.getFilePath());
+            }
+        } else {
+            // followerOffset is before the oldest segment we have, so send all
+            for (LogSegment seg : segments.values()) {
+                paths.add(seg.getFilePath());
+            }
+        }
+        return paths;
+    }
+
+
     public long getCachedMessageCount() {
         long total = 0;
         for (BoundedMessageCache cache : messageCache.values()) {
@@ -656,7 +700,10 @@ public class MessageStore implements Closeable {
         logger.info("Message store memory state cleared");
     }
 
-    @Override
+    public void forceFlush() throws IOException {
+        logManager.forceFlush();
+    }
+
     public void close() throws IOException {
         if (cleanerScheduler != null) {
             cleanerScheduler.shutdown();
@@ -824,4 +871,3 @@ public class MessageStore implements Closeable {
     }
 
 }
-

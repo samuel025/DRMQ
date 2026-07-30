@@ -1,7 +1,7 @@
 package com.drmq.broker;
 
 import com.drmq.broker.persistence.LogManager;
-import com.drmq.protocol.DRMQProtocol.StoredMessage;
+import com.drmq.protocol.*;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;

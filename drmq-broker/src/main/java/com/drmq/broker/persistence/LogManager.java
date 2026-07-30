@@ -131,7 +131,7 @@ public class LogManager implements AutoCloseable {
         LogSegment prevSegment = null;
         for (LogSegment segment : segments.values()) {
             try {
-                com.drmq.protocol.DRMQProtocol.StoredMessage firstMsg = segment.read(0);
+                com.drmq.protocol.StoredMessage firstMsg = segment.read(0);
                 if (firstMsg != null) {
                     if (firstMsg.getTimestamp() >= targetTimestamp) {
                         // The current segment starts at or after the target timestamp.
@@ -225,7 +225,14 @@ public class LogManager implements AutoCloseable {
         return topicSegments.values().stream().mapToInt(ConcurrentSkipListMap::size).sum();
     }
 
-    @Override
+    public void forceFlush() throws IOException {
+        for (ConcurrentSkipListMap<Long, LogSegment> segments : topicSegments.values()) {
+            for (LogSegment segment : segments.values()) {
+                segment.forceFlush();
+            }
+        }
+    }
+
     public void close() throws IOException {
         IOException primaryException = null;
         

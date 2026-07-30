@@ -1,7 +1,7 @@
 package com.drmq.broker.persistence;
 
 import com.drmq.broker.BrokerMetrics;
-import com.drmq.protocol.DRMQProtocol.StoredMessage;
+import com.drmq.protocol.StoredMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -92,7 +92,8 @@ public class LogSegment implements AutoCloseable {
         int totalBytesWritten = 0;
 
         try {
-            // Pre-validate and serialize all messages before any writes
+            // Pre-validate, serialize, and calculate total size
+            int totalBatchSize = 0;
             List<byte[]> serializedMessages = new ArrayList<>(messages.size());
             for (StoredMessage message : messages) {
                 byte[] messageBytes = message.toByteArray();
@@ -102,24 +103,25 @@ public class LogSegment implements AutoCloseable {
                         MAX_MESSAGE_SIZE + " bytes. Message cannot be persisted.");
                 }
                 serializedMessages.add(messageBytes);
+                totalBatchSize += 4 + messageBytes.length;
             }
 
-            // Write all validated messages
+            // Allocate a single buffer for the entire batch
+            java.nio.ByteBuffer buffer = java.nio.ByteBuffer.allocate(totalBatchSize);
             for (byte[] messageBytes : serializedMessages) {
-                ByteBuffer buffer = ByteBuffer.allocate(4 + messageBytes.length);
+                positions.add(currentSize + buffer.position());
                 buffer.putInt(messageBytes.length);
                 buffer.put(messageBytes);
-                buffer.flip();
-
-                long position = currentSize;
-                positions.add(position);
-
-                while (buffer.hasRemaining()) {
-                    fileChannel.write(buffer, position + buffer.position());
-                }
-                currentSize += buffer.limit();
-                totalBytesWritten += buffer.limit();
             }
+            buffer.flip();
+
+            // Write the entire batch in minimal syscalls
+            long position = currentSize;
+            while (buffer.hasRemaining()) {
+                fileChannel.write(buffer, position + buffer.position());
+            }
+            currentSize += totalBatchSize;
+            totalBytesWritten = totalBatchSize;
 
             if (fsyncEnabled) {
                 fileChannel.force(true);
@@ -214,6 +216,10 @@ public class LogSegment implements AutoCloseable {
         close();
         java.nio.file.Files.deleteIfExists(filePath);
         logger.info("Deleted log segment: {}", filePath);
+    }
+
+    public void forceFlush() throws IOException {
+        fileChannel.force(true);
     }
 
     public synchronized void truncate(long size) throws IOException {

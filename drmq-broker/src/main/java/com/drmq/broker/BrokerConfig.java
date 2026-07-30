@@ -28,6 +28,7 @@ public class BrokerConfig {
     private final int maxDeliveries;
     private final String dlqTopicPrefix;
     private final boolean logSegmentFsync;
+    private final boolean raftFsyncEnabled;
     private final String s3ArchiveBucket;
     private final String s3ArchiveRegion;
     private final String s3ArchiveEndpoint;
@@ -37,13 +38,13 @@ public class BrokerConfig {
                         long logSegmentBytes, long logRetentionMs, long raftCompactThreshold,
                         int maxDeliveries, String dlqTopicPrefix) {
         this(nodeId, port, dataDir, peers, metricsEnabled, metricsPort, metricsPath,
-             logSegmentBytes, logRetentionMs, raftCompactThreshold, maxDeliveries, dlqTopicPrefix, true, null, null, null);
+             logSegmentBytes, logRetentionMs, raftCompactThreshold, maxDeliveries, dlqTopicPrefix, false, true, null, null, null);
     }
 
     public BrokerConfig(String nodeId, int port, String dataDir, List<PeerAddress> peers,
                         boolean metricsEnabled, int metricsPort, String metricsPath,
                         long logSegmentBytes, long logRetentionMs, long raftCompactThreshold,
-                        int maxDeliveries, String dlqTopicPrefix, boolean logSegmentFsync,
+                        int maxDeliveries, String dlqTopicPrefix, boolean logSegmentFsync, boolean raftFsyncEnabled,
                         String s3ArchiveBucket, String s3ArchiveRegion, String s3ArchiveEndpoint) {
         this.nodeId = nodeId;
         this.port = port;
@@ -58,6 +59,7 @@ public class BrokerConfig {
         this.maxDeliveries = maxDeliveries > 0 ? maxDeliveries : 5;
         this.dlqTopicPrefix = dlqTopicPrefix != null ? dlqTopicPrefix : "dlq.";
         this.logSegmentFsync = logSegmentFsync;
+        this.raftFsyncEnabled = raftFsyncEnabled;
         this.s3ArchiveBucket = s3ArchiveBucket;
         this.s3ArchiveRegion = (s3ArchiveRegion != null && !s3ArchiveRegion.isBlank()) ? s3ArchiveRegion : "us-east-1";
         this.s3ArchiveEndpoint = s3ArchiveEndpoint;
@@ -65,13 +67,13 @@ public class BrokerConfig {
 
     public BrokerConfig(String nodeId, int port, String dataDir, List<PeerAddress> peers) {
         this(nodeId, port, dataDir, peers, true, 9096, "/metrics", 
-             100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.", true, null, null, null);
+             100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.", false, true, null, null, null);
     }
 
     /** Single-node config (backward compatible) */
     public BrokerConfig(int port, String dataDir) {
         this("standalone", port, dataDir, List.of(), true, 9096, "/metrics",
-             100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.", true, null, null, null);
+             100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.", false, true, null, null, null);
     }
 
     public String getNodeId() { return nodeId; }
@@ -87,6 +89,7 @@ public class BrokerConfig {
     public int getMaxDeliveries() { return maxDeliveries; }
     public String getDlqTopicPrefix() { return dlqTopicPrefix; }
     public boolean isLogSegmentFsync() { return logSegmentFsync; }
+    public boolean isRaftFsyncEnabled() { return raftFsyncEnabled; }
     public String getS3ArchiveBucket() { return s3ArchiveBucket; }
     public String getS3ArchiveRegion() { return s3ArchiveRegion; }
     public String getS3ArchiveEndpoint() { return s3ArchiveEndpoint; }
@@ -141,10 +144,11 @@ public class BrokerConfig {
         String metricsPath = "/metrics";
         long logSegmentBytes = 100 * 1024 * 1024L; // 100MB
         long logRetentionMs = 7L * 24 * 60 * 60 * 1000; // 7 days
-        long raftCompactThreshold = 1000L; 
+        long raftCompactThreshold = 10000L; 
         int maxDeliveries = 5;
         String dlqTopicPrefix = "dlq.";
-        boolean logSegmentFsync = true;
+        boolean logSegmentFsync = false;
+        boolean raftFsyncEnabled = true;
         String s3ArchiveBucket = null;
         String s3ArchiveRegion = "us-east-1";
         String s3ArchiveEndpoint = null;
@@ -181,6 +185,7 @@ public class BrokerConfig {
             if (props.containsKey("max.deliveries")) maxDeliveries = Integer.parseInt(props.getProperty("max.deliveries"));
             if (props.containsKey("dlq.topic.prefix")) dlqTopicPrefix = props.getProperty("dlq.topic.prefix");
             if (props.containsKey("log.segment.fsync")) logSegmentFsync = Boolean.parseBoolean(props.getProperty("log.segment.fsync"));
+            if (props.containsKey("raft.fsync.enabled")) raftFsyncEnabled = Boolean.parseBoolean(props.getProperty("raft.fsync.enabled"));
             if (props.containsKey("s3.archive.bucket")) s3ArchiveBucket = props.getProperty("s3.archive.bucket");
             if (props.containsKey("s3.archive.region")) s3ArchiveRegion = props.getProperty("s3.archive.region");
             if (props.containsKey("s3.archive.endpoint")) s3ArchiveEndpoint = props.getProperty("s3.archive.endpoint");
@@ -209,6 +214,7 @@ public class BrokerConfig {
                 case "--max-deliveries" -> maxDeliveries = (int) parseLongArg(args, ++i, "--max-deliveries");
                 case "--dlq-topic-prefix" -> dlqTopicPrefix = parsePrefixArg(args, ++i, "--dlq-topic-prefix");
                 case "--log-segment-fsync" -> logSegmentFsync = parseBooleanArg(args, ++i, "--log-segment-fsync");
+                case "--raft-fsync-enabled" -> raftFsyncEnabled = parseBooleanArg(args, ++i, "--raft-fsync-enabled");
                 case "--s3-archive-bucket" -> s3ArchiveBucket = requireValue(args, ++i, "--s3-archive-bucket");
                 case "--s3-archive-region" -> s3ArchiveRegion = requireValue(args, ++i, "--s3-archive-region");
                 case "--s3-archive-endpoint" -> s3ArchiveEndpoint = requireValue(args, ++i, "--s3-archive-endpoint");
@@ -228,7 +234,7 @@ public class BrokerConfig {
 
         return new BrokerConfig(nodeId, port, dataDir, peers, metricsEnabled, metricsPort, metricsPath,
                                 logSegmentBytes, logRetentionMs, raftCompactThreshold,
-                                maxDeliveries, dlqTopicPrefix, logSegmentFsync, s3ArchiveBucket, s3ArchiveRegion, s3ArchiveEndpoint);
+                                maxDeliveries, dlqTopicPrefix, logSegmentFsync, raftFsyncEnabled, s3ArchiveBucket, s3ArchiveRegion, s3ArchiveEndpoint);
     }
 
     private static boolean parseBooleanArg(String[] args, int index, String flag) {

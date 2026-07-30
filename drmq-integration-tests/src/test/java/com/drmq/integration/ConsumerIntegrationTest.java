@@ -43,9 +43,11 @@ class ConsumerIntegrationTest {
         // Produce some messages
         try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
             producer.connect();
-            producer.send("test-topic", "Message 1".getBytes());
-            producer.send("test-topic", "Message 2".getBytes());
-            producer.send("test-topic", "Message 3".getBytes());
+            java.util.List<java.util.concurrent.CompletableFuture<?>> futures = new java.util.ArrayList<>();
+            futures.add(producer.send("test-topic", "Message 1".getBytes()));
+            futures.add(producer.send("test-topic", "Message 2".getBytes()));
+            futures.add(producer.send("test-topic", "Message 3".getBytes()));
+            java.util.concurrent.CompletableFuture.allOf(futures.toArray(new java.util.concurrent.CompletableFuture[0])).join();
         }
 
         // Consume the messages
@@ -70,9 +72,11 @@ class ConsumerIntegrationTest {
         // Produce messages
         try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
             producer.connect();
+            java.util.List<java.util.concurrent.CompletableFuture<?>> futures = new java.util.ArrayList<>();
             for (int i = 0; i < 10; i++) {
-                producer.send("offset-test", ("Message " + i).getBytes());
+                futures.add(producer.send("offset-test", ("Message " + i).getBytes()));
             }
+            java.util.concurrent.CompletableFuture.allOf(futures.toArray(new java.util.concurrent.CompletableFuture[0])).join();
         }
 
         // Consume starting from offset 5 (requires single mode for explicit offset)
@@ -96,8 +100,10 @@ class ConsumerIntegrationTest {
         // Produce messages
         try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
             producer.connect();
-            producer.send("shared-topic", "Shared Message 1".getBytes());
-            producer.send("shared-topic", "Shared Message 2".getBytes());
+            java.util.List<java.util.concurrent.CompletableFuture<?>> futures = new java.util.ArrayList<>();
+            futures.add(producer.send("shared-topic", "Shared Message 1".getBytes()));
+            futures.add(producer.send("shared-topic", "Shared Message 2".getBytes()));
+            java.util.concurrent.CompletableFuture.allOf(futures.toArray(new java.util.concurrent.CompletableFuture[0])).join();
         }
 
         // Consumer 1 (group-a) reads all messages
@@ -123,8 +129,10 @@ class ConsumerIntegrationTest {
         // Produce messages
         try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
             producer.connect();
-            producer.send("group-topic", "Message 1".getBytes());
-            producer.send("group-topic", "Message 2".getBytes());
+            java.util.List<java.util.concurrent.CompletableFuture<?>> futures = new java.util.ArrayList<>();
+            futures.add(producer.send("group-topic", "Message 1".getBytes()));
+            futures.add(producer.send("group-topic", "Message 2".getBytes()));
+            java.util.concurrent.CompletableFuture.allOf(futures.toArray(new java.util.concurrent.CompletableFuture[0])).join();
         }
 
         // Consumer reads and commits offset
@@ -161,7 +169,7 @@ class ConsumerIntegrationTest {
     void consumerCanPollMultipleTimes() throws Exception {
         try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
             producer.connect();
-            producer.send("multi-poll", "First".getBytes());
+            producer.send("multi-poll", "First".getBytes()).join();
         }
 
         try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT, "default-test-group")) {
@@ -176,7 +184,7 @@ class ConsumerIntegrationTest {
             // Produce another message
             try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
                 producer.connect();
-                producer.send("multi-poll", "Second".getBytes());
+                producer.send("multi-poll", "Second".getBytes()).join();
             }
 
             // Second poll gets the new message
@@ -190,9 +198,11 @@ class ConsumerIntegrationTest {
     void consumerTracksOffsetCorrectly() throws Exception {
         try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
             producer.connect();
-            producer.send("offset-tracking", "A".getBytes());
-            producer.send("offset-tracking", "B".getBytes());
-            producer.send("offset-tracking", "C".getBytes());
+            java.util.List<java.util.concurrent.CompletableFuture<?>> futures = new java.util.ArrayList<>();
+            futures.add(producer.send("offset-tracking", "A".getBytes()));
+            futures.add(producer.send("offset-tracking", "B".getBytes()));
+            futures.add(producer.send("offset-tracking", "C".getBytes()));
+            java.util.concurrent.CompletableFuture.allOf(futures.toArray(new java.util.concurrent.CompletableFuture[0])).join();
         }
 
         try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT, "default-test-group")) {
@@ -217,7 +227,7 @@ class ConsumerIntegrationTest {
     void consumerHandlesMessageWithKey() throws Exception {
         try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
             producer.connect();
-            producer.send("keyed-topic", "Value".getBytes(), "my-key");
+            producer.send("keyed-topic", "Value".getBytes(), "my-key").join();
         }
 
         try (DRMQConsumer consumer = new DRMQConsumer("localhost", TEST_PORT, "default-test-group")) {

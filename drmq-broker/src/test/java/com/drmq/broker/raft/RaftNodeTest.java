@@ -10,6 +10,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import com.drmq.protocol.*;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -110,86 +111,67 @@ class RaftNodeTest {
     }
 
     // ===========================
-    //  InstallSnapshot Tests
+    //  Incremental Sync Tests
     // ===========================
 
     @Test
-    void handlesInstallSnapshotFromValidLeader() {
+    void handlesIncrementalSnapshotChunkFromValidLeader() {
         // Assume node has some initial state
         raftNode.handleAppendEntries(AppendEntriesRequest.newBuilder()
                 .setTerm(1).setLeaderId("node2").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0).build());
 
-        // Create a real in-memory ZIP file
-        java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
-        try (java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(baos)) {
-            zos.putNextEntry(new java.util.zip.ZipEntry("state.properties"));
-            zos.write("currentTerm=2\nlastApplied=50\nlastAppliedTerm=2\nvotedFor=\n".getBytes());
-            zos.closeEntry();
-        } catch (java.io.IOException e) {
-            throw new RuntimeException(e);
-        }
-        byte[] zipBytes = baos.toByteArray();
-        int splitPoint = zipBytes.length / 2;
-        com.google.protobuf.ByteString zipPart1 = com.google.protobuf.ByteString.copyFrom(zipBytes, 0, splitPoint);
-        com.google.protobuf.ByteString zipPart2 = com.google.protobuf.ByteString.copyFrom(zipBytes, splitPoint, zipBytes.length - splitPoint);
-
-        // Send install snapshot (first chunk)
-        InstallSnapshotRequest chunk1 = InstallSnapshotRequest.newBuilder()
+        // Send a chunk
+        IncrementalSnapshotChunk chunk = IncrementalSnapshotChunk.newBuilder()
                 .setTerm(2)
                 .setLeaderId("node3")
-                .setLastIncludedIndex(50)
-                .setLastIncludedTerm(2)
-                .setOffset(0)
-                .setData(zipPart1)
-                .setDone(false)
+                .setTopic("test-topic")
+                .setFileName("000000.log")
+                .setFileOffset(0)
+                .setData(com.google.protobuf.ByteString.copyFromUtf8("hello"))
+                .setIsLastChunkForFile(false)
                 .build();
 
-        InstallSnapshotResponse response1 = raftNode.handleInstallSnapshot(chunk1);
-        assertEquals(2, response1.getTerm());
+        IncrementalSnapshotChunkResponse response = raftNode.handleIncrementalSnapshotChunk(chunk);
+        assertEquals(2, response.getTerm());
         assertEquals(2, raftNode.getCurrentTerm());
         assertEquals("node3", raftNode.getLeaderId());
         assertEquals(RaftState.FOLLOWER, raftNode.getState());
+        assertTrue(response.getSuccess());
 
-        // Send final chunk
-        InstallSnapshotRequest chunk2 = InstallSnapshotRequest.newBuilder()
+        // And the Done request
+        IncrementalSnapshotDoneRequest doneReq = IncrementalSnapshotDoneRequest.newBuilder()
                 .setTerm(2)
                 .setLeaderId("node3")
                 .setLastIncludedIndex(50)
                 .setLastIncludedTerm(2)
-                .setOffset(splitPoint)
-                .setData(zipPart2)
-                .setDone(true)
                 .build();
-                
-        // Note: the test will fail during restoreSnapshot if we don't mock it or if it's not a real zip,
-        // but since we handle exceptions gracefully in handleInstallSnapshot, we can just verify term state.
-        // Actually, handleInstallSnapshot catches Exception and returns term=2.
-        InstallSnapshotResponse response2 = raftNode.handleInstallSnapshot(chunk2);
-
-        assertEquals(2, response2.getTerm());
-        assertEquals(2, raftNode.getCurrentTerm());
+        
+        IncrementalSnapshotDoneResponse doneResponse = raftNode.handleIncrementalSnapshotDone(doneReq);
+        assertEquals(2, doneResponse.getTerm());
+        assertTrue(doneResponse.getSuccess());
     }
 
     @Test
-    void rejectsInstallSnapshotFromOlderTerm() {
+    void rejectsIncrementalSnapshotChunkFromOlderTerm() {
         // Set node term to 3
         raftNode.handleAppendEntries(AppendEntriesRequest.newBuilder()
                 .setTerm(3).setLeaderId("node3").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0).build());
 
-        InstallSnapshotRequest request = InstallSnapshotRequest.newBuilder()
+        IncrementalSnapshotChunk chunk = IncrementalSnapshotChunk.newBuilder()
                 .setTerm(2)
                 .setLeaderId("node2")
-                .setLastIncludedIndex(50)
-                .setLastIncludedTerm(2)
-                .setOffset(0)
-                .setDone(true)
+                .setTopic("test-topic")
+                .setFileName("000000.log")
+                .setFileOffset(0)
+                .setData(com.google.protobuf.ByteString.copyFromUtf8("hello"))
                 .build();
 
-        InstallSnapshotResponse response = raftNode.handleInstallSnapshot(request);
+        IncrementalSnapshotChunkResponse response = raftNode.handleIncrementalSnapshotChunk(chunk);
 
         assertEquals(3, response.getTerm());
         assertEquals(3, raftNode.getCurrentTerm());
         assertEquals("node3", raftNode.getLeaderId(), "Leader should not change on older term request");
+        assertFalse(response.getSuccess());
     }
 
     // ===========================
@@ -247,7 +229,7 @@ class RaftNodeTest {
         // RequestVote with term=10 should cause step-down to term 10
         // (standard Raft — no lease interference)
         // Wait for heartbeat lease to expire
-        try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+        try { Thread.sleep(2500); } catch (InterruptedException ignored) {}
 
         RequestVoteResponse response = raftNode.handleRequestVote(RequestVoteRequest.newBuilder()
                 .setTerm(10).setCandidateId("node3").setLastLogIndex(0).setLastLogTerm(0).build());
@@ -266,7 +248,7 @@ class RaftNodeTest {
                 .build());
 
         // Wait for heartbeat lease to expire
-        try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+        try { Thread.sleep(2500); } catch (InterruptedException ignored) {}
 
         // Candidate with stale log (term 3, index 0) should be rejected
         RequestVoteResponse response = raftNode.handleRequestVote(RequestVoteRequest.newBuilder()
@@ -284,7 +266,7 @@ class RaftNodeTest {
         // Make node1 become leader
         registerAllHandlers(true, true, true);
         raftNode.start();
-        Thread.sleep(1500);
+        Thread.sleep(8500);
         assertEquals(RaftState.LEADER, raftNode.getState(), "Node should be leader");
 
         // A restarting node sends PreVote — leader must reject
@@ -320,7 +302,7 @@ class RaftNodeTest {
                 .setTerm(5).setLeaderId("node2").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0).build());
 
         // Wait for heartbeat lease to expire (> ELECTION_TIMEOUT_MIN_MS = 150ms)
-        Thread.sleep(200);
+        Thread.sleep(2500);
 
         // Now PreVote should be granted (no recent heartbeat = leader might be dead)
         PreVoteResponse response = raftNode.handlePreVote(PreVoteRequest.newBuilder()
@@ -339,7 +321,7 @@ class RaftNodeTest {
                 .setTerm(5).setLeaderId("node2").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0).build());
 
         // Wait for lease to expire
-        try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+        try { Thread.sleep(2500); } catch (InterruptedException ignored) {}
 
         // PreVote with proposedTerm=3 (behind node's term=5) — must reject
         PreVoteResponse response = raftNode.handlePreVote(PreVoteRequest.newBuilder()
@@ -361,7 +343,7 @@ class RaftNodeTest {
                 .build());
 
         // Wait for heartbeat lease to expire
-        Thread.sleep(200);
+        Thread.sleep(2500);
 
         // PreVote with stale log (term 3) — must reject even though heartbeat is stale
         PreVoteResponse response = raftNode.handlePreVote(PreVoteRequest.newBuilder()
@@ -384,7 +366,7 @@ class RaftNodeTest {
         String leaderBefore = raftNode.getLeaderId();
 
         // Wait for lease to expire so pre-vote is actually processed
-        try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+        try { Thread.sleep(2500); } catch (InterruptedException ignored) {}
 
         // Send pre-vote with higher term
         raftNode.handlePreVote(PreVoteRequest.newBuilder()
@@ -405,7 +387,7 @@ class RaftNodeTest {
                 .setTerm(5).setLeaderId("node2").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0).build());
 
         // Wait for lease expiry
-        Thread.sleep(200);
+        Thread.sleep(2500);
 
         // Candidate with same (empty) log — should be granted
         PreVoteResponse response = raftNode.handlePreVote(PreVoteRequest.newBuilder()
@@ -454,7 +436,7 @@ class RaftNodeTest {
 
         raftNode.start();
         // Startup grace = 900ms + normal timeout ~225ms + some buffer
-        Thread.sleep(1500);
+        Thread.sleep(8500);
 
         assertTrue(preVotesSent.get() > 0, "Should have sent PreVote RPCs before real election");
         assertTrue(votesSent.get() > 0, "Should have sent real RequestVote after pre-vote succeeded");
@@ -465,7 +447,7 @@ class RaftNodeTest {
     void winsElectionAndBecomesLeader() throws InterruptedException {
         registerAllHandlers(true, true, true);
         raftNode.start();
-        Thread.sleep(1500);
+        Thread.sleep(8500);
 
         assertEquals(RaftState.LEADER, raftNode.getState());
         assertEquals(nodeId, raftNode.getLeaderId());
@@ -490,7 +472,7 @@ class RaftNodeTest {
         }
 
         raftNode.start();
-        Thread.sleep(1500);
+        Thread.sleep(8500);
 
         assertEquals(0, raftNode.getCurrentTerm(),
                 "Term must NOT be incremented when pre-vote fails — this is the core Pre-Vote guarantee");
@@ -506,7 +488,7 @@ class RaftNodeTest {
     void stepsDownWhenQuorumIsLost() throws InterruptedException {
         registerAllHandlers(true, true, true);
         raftNode.start();
-        Thread.sleep(1500);
+        Thread.sleep(8500);
         assertEquals(RaftState.LEADER, raftNode.getState());
 
         // Simulate complete network partition — all RPCs throw exceptions.
@@ -524,7 +506,7 @@ class RaftNodeTest {
         // checkQuorum every 900ms. The quorum window is 900ms.
         // Need: staleness > 900ms, i.e., we need at least one full check cycle
         // AFTER the contacts go stale. With generous buffer for scheduling jitter.
-        Thread.sleep(6000);
+        Thread.sleep(14000);
 
         assertNotEquals(RaftState.LEADER, raftNode.getState(),
                 "Leader should step down after losing quorum");

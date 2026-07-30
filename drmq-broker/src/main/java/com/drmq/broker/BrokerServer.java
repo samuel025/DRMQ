@@ -12,8 +12,7 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 import io.netty.handler.codec.LengthFieldPrepender;
-import io.netty.handler.codec.bytes.ByteArrayDecoder;
-import io.netty.handler.codec.bytes.ByteArrayEncoder;
+import io.netty.handler.codec.LengthFieldPrepender;
 import io.netty.util.concurrent.DefaultEventExecutorGroup;
 import io.netty.util.concurrent.EventExecutorGroup;
 import io.netty.util.concurrent.GlobalEventExecutor;
@@ -88,7 +87,8 @@ public class BrokerServer {
                     messageStore,
                     offsetManager,
                     Paths.get(config.getDataDir()),
-                    config.getRaftCompactThreshold()
+                    config.getRaftCompactThreshold(),
+                    config.isRaftFsyncEnabled()
             );
 
             for (BrokerConfig.PeerAddress peer : config.getPeers()) {
@@ -97,7 +97,9 @@ public class BrokerServer {
                 raftNode.registerVoteHandler(peer.id(), raftPeer::sendRequestVote);
                 raftNode.registerAppendHandler(peer.id(), raftPeer::sendAppendEntries);
                 raftNode.registerPreVoteHandler(peer.id(), raftPeer::sendPreVote);
-                raftNode.registerInstallSnapshotHandler(peer.id(), raftPeer::sendInstallSnapshot);
+                raftNode.registerRequestTopicOffsetsHandler(peer.id(), raftPeer::sendRequestTopicOffsets);
+                raftNode.registerIncrementalSnapshotChunkHandler(peer.id(), raftPeer::sendIncrementalSnapshotChunk);
+                raftNode.registerIncrementalSnapshotDoneHandler(peer.id(), raftPeer::sendIncrementalSnapshotDone);
             }
 
             logger.info("Cluster mode: nodeId={}, peers={}", config.getNodeId(), config.getPeers());
@@ -154,9 +156,7 @@ public class BrokerServer {
                  public void initChannel(SocketChannel ch) {
                      ChannelPipeline p = ch.pipeline();
                      p.addLast(new LengthFieldBasedFrameDecoder(256 * 1024 * 1024, 0, 4, 0, 4));
-                     p.addLast(new ByteArrayDecoder());
                      p.addLast(new LengthFieldPrepender(4));
-                     p.addLast(new ByteArrayEncoder());
                      p.addLast(businessGroup, "clientHandler", new ClientHandler(messageStore, offsetManager, raftNode, activeChannels, groupCoordinator, rpcExecutor));
                  }
              });
@@ -208,10 +208,10 @@ public class BrokerServer {
         }
     }
 
-    private volatile boolean isShutdownComplete = false;
+    private final java.util.concurrent.atomic.AtomicBoolean shutdownStarted = new java.util.concurrent.atomic.AtomicBoolean(false);
 
     public void shutdown() {
-        if (isShutdownComplete) return;
+        if (!shutdownStarted.compareAndSet(false, true)) return;
         logger.info("Shutting down Netty broker...");
         if (raftNode != null) {
             raftNode.stop();
@@ -282,7 +282,6 @@ public class BrokerServer {
             metrics.close();
         }
         running = false;
-        isShutdownComplete = true;
     }
 
     public boolean isRunning() { return running; }

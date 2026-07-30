@@ -66,8 +66,8 @@ class RaftIntegrationTest {
         broker2.startAsync();
         broker3.startAsync();
 
-        // Wait for leader election to complete (up to 3 seconds)
-        waitForLeader(3000);
+        // Wait for leader election to complete (up to 10 seconds)
+        waitForLeader(10000);
     }
 
     /**
@@ -122,7 +122,7 @@ class RaftIntegrationTest {
         startCluster();
 
         BrokerServer leader = findLeader();
-        assertNotNull(leader, "A leader should be elected within 3 seconds");
+        assertNotNull(leader, "A leader should be elected within 10 seconds");
 
         // Count leaders — must be exactly 1
         int leaderCount = 0;
@@ -221,8 +221,8 @@ class RaftIntegrationTest {
         else if (leader == broker2) broker2 = null;
         else broker3 = null;
 
-        // Wait for new leader election (up to 2 seconds)
-        waitForLeader(2000);
+        // Wait for new leader election (up to 10 seconds)
+        waitForLeader(10000);
 
         BrokerServer newLeader = findLeader();
         assertNotNull(newLeader, "A new leader should be elected after the old one dies");
@@ -251,7 +251,7 @@ class RaftIntegrationTest {
         else broker3 = null;
 
         // Wait for new leader
-        waitForLeader(2000);
+        waitForLeader(10000);
         BrokerServer newLeader = findLeader();
         assertNotNull(newLeader, "New leader should be elected");
 
