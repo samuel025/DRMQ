@@ -176,9 +176,16 @@ public class DRMQProducer implements AutoCloseable {
     }
 
     private void senderLoop() {
-        while (running || !accumulator.isEmpty()) { 
+        PendingMessage leftoverMsg = null;
+        while (running || !accumulator.isEmpty() || leftoverMsg != null) { 
             try {
-                PendingMessage firstMsg = accumulator.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS);
+                PendingMessage firstMsg = leftoverMsg;
+                leftoverMsg = null;
+                
+                if (firstMsg == null) {
+                    firstMsg = accumulator.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS);
+                }
+                
                 if (firstMsg == null) continue;
 
                 List<PendingMessage> currentBatch = new ArrayList<>();
@@ -194,6 +201,7 @@ public class DRMQProducer implements AutoCloseable {
                     PendingMessage msg = accumulator.poll(remaining, java.util.concurrent.TimeUnit.MILLISECONDS);
                     if (msg == null) break;
                     if (!currentTopic.equals(msg.topic)) {
+                        leftoverMsg = msg;
                         break;
                     }
                     currentBatch.add(msg);

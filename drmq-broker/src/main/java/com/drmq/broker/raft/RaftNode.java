@@ -395,6 +395,9 @@ public class RaftNode {
                     byTopic.computeIfAbsent(req.topic, k -> new ArrayList<>()).add(req);
                 }
 
+                long proposalTerm = -1;
+                List<RaftEntry> toAppend = null;
+
                 // Acquire the Raft lock ONCE for all entries
                 lock.lock();
                 try {
@@ -404,8 +407,8 @@ public class RaftNode {
                             req.future.completeExceptionally(err);
                         }
                     } else {
-                        long proposalTerm = currentTerm;
-                        List<RaftEntry> toAppend = new ArrayList<>(byTopic.size());
+                        proposalTerm = currentTerm;
+                        toAppend = new ArrayList<>(byTopic.size());
 
                         for (var topicEntry : byTopic.entrySet()) {
                             String topic = topicEntry.getKey();
@@ -436,25 +439,30 @@ public class RaftNode {
                                         nodeId, requests.size(), totalEntries, topic, index);
                             }
                         }
-
-                        if (!toAppend.isEmpty()) {
-                            try {
-                                logAppenderQueue.put(() -> {
-                                    try {
-                                        raftLog.append(toAppend);
-                                        sendHeartbeats();
-                                    } catch (IOException e) {
-                                        logger.error("[{}] Failed to append batch to RaftLog", nodeId, e);
-                                        stepDown(proposalTerm);
-                                    }
-                                });
-                            } catch (InterruptedException e) {
-                                Thread.currentThread().interrupt();
-                            }
-                        }
                     }
                 } finally {
                     lock.unlock();
+                }
+
+                if (toAppend != null && !toAppend.isEmpty()) {
+                    long finalProposalTerm = proposalTerm;
+                    List<RaftEntry> finalToAppend = toAppend;
+                    boolean enqueued = logAppenderQueue.offer(() -> {
+                        try {
+                            raftLog.append(finalToAppend);
+                            sendHeartbeats();
+                        } catch (IOException e) {
+                            logger.error("[{}] Failed to append batch to RaftLog", nodeId, e);
+                            stepDown(finalProposalTerm);
+                        }
+                    });
+                    
+                    if (!enqueued) {
+                        IOException err = new IOException("Raft log appender queue full or stopped");
+                        for (ProposalRequest req : drained) {
+                            req.future.completeExceptionally(err);
+                        }
+                    }
                 }
 
             } catch (InterruptedException e) {
@@ -531,6 +539,9 @@ public class RaftNode {
                             .build());
                 }
 
+                long proposalTerm = -1;
+                RaftEntry entry = null;
+
                 // Acquire lock ONCE and append a single Raft entry
                 lock.lock();
                 try {
@@ -540,7 +551,7 @@ public class RaftNode {
                             req.future.completeExceptionally(err);
                         }
                     } else {
-                        long proposalTerm = currentTerm;
+                        proposalTerm = currentTerm;
                         long index = uncommittedNextIndex++;
 
                         AtomicBatchRequest payload = AtomicBatchRequest.newBuilder()
@@ -551,7 +562,7 @@ public class RaftNode {
                                 .map(AtomicBatchTopicSlice::getTopic)
                                 .collect(java.util.stream.Collectors.joining(","));
 
-                        RaftEntry entry = RaftEntry.newBuilder()
+                        entry = RaftEntry.newBuilder()
                                 .setTerm(proposalTerm)
                                 .setIndex(index)
                                 .setTopic(topicStr)
@@ -566,23 +577,30 @@ public class RaftNode {
                             logger.info("[{}] Atomic aggregator coalesced {} requests ({} topics) into raft index {}",
                                     nodeId, drained.size(), mergedSlices.size(), index);
                         }
-
-                        try {
-                            logAppenderQueue.put(() -> {
-                                try {
-                                    raftLog.append(entry);
-                                    sendHeartbeats();
-                                } catch (IOException e) {
-                                    logger.error("[{}] Failed to append atomic batch to RaftLog", nodeId, e);
-                                    stepDown(proposalTerm);
-                                }
-                            });
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                        }
                     }
                 } finally {
                     lock.unlock();
+                }
+
+                if (entry != null) {
+                    long finalProposalTerm = proposalTerm;
+                    RaftEntry finalEntry = entry;
+                    boolean enqueued = logAppenderQueue.offer(() -> {
+                        try {
+                            raftLog.append(finalEntry);
+                            sendHeartbeats();
+                        } catch (IOException e) {
+                            logger.error("[{}] Failed to append atomic batch to RaftLog", nodeId, e);
+                            stepDown(finalProposalTerm);
+                        }
+                    });
+                    
+                    if (!enqueued) {
+                        IOException err = new IOException("Raft log appender queue full or stopped");
+                        for (AtomicProposalRequest req : drained) {
+                            req.future.completeExceptionally(err);
+                        }
+                    }
                 }
 
             } catch (InterruptedException e) {
