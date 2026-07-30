@@ -186,6 +186,13 @@ public class RaftNode {
     private final Map<String, AtomicBoolean> isReplicating;
     private final Map<String, AtomicBoolean> isHeartbeatInFlight = new ConcurrentHashMap<>();
 
+    // Background log appender to prevent disk I/O from starving the consensus lock
+    private final java.util.concurrent.LinkedBlockingQueue<Runnable> logAppenderQueue =
+            new java.util.concurrent.LinkedBlockingQueue<>(10000);
+    private volatile Thread logAppenderThread;
+    
+    private long uncommittedNextIndex = 1;
+
     // Proposal aggregation queue — lock-free intake, drained by aggregator thread
     private final LinkedBlockingQueue<ProposalRequest> proposalQueue =
             new LinkedBlockingQueue<>(MAX_PENDING_PROPOSALS);
@@ -272,6 +279,10 @@ public class RaftNode {
         atomicAggregatorThread.setDaemon(true);
         atomicAggregatorThread.start();
 
+        logAppenderThread = new Thread(this::logAppenderLoop, "raft-log-appender-" + nodeId);
+        logAppenderThread.setDaemon(true);
+        logAppenderThread.start();
+
         stateSaveTimer = scheduler.scheduleAtFixedRate(() -> {
             if (stateSaveNeeded) {
                 savePersistentState();
@@ -335,10 +346,28 @@ public class RaftNode {
     }
 
     /**
-     * Aggregator thread main loop. Drains the proposalQueue, groups proposals by topic,
-     * merges same-topic entries into a single RaftEntry, and appends them all under one
+     * Retrieves and removes chunks of proposals from the concurrent queue, acquiring the ReentrantLock
+     * ONCE per batch. It merges payloads of the same topic into a single `ProduceBatchRequest` prior to
      * lock acquisition. This turns N lock acquisitions into 1 per aggregation cycle.
      */
+    private void logAppenderLoop() {
+        logger.info("[{}] Log appender thread started", nodeId);
+        while (running) {
+            try {
+                Runnable task = logAppenderQueue.poll(100, TimeUnit.MILLISECONDS);
+                if (task != null) {
+                    task.run();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception e) {
+                logger.error("[{}] Log appender error", nodeId, e);
+            }
+        }
+        logger.info("[{}] Log appender thread stopped", nodeId);
+    }
+
     private void aggregatorLoop() {
         logger.info("[{}] Proposal aggregator thread started", nodeId);
         while (running) {
@@ -367,7 +396,6 @@ public class RaftNode {
                 }
 
                 // Acquire the Raft lock ONCE for all entries
-                boolean appended = false;
                 lock.lock();
                 try {
                     if (state != RaftState.LEADER) {
@@ -377,6 +405,7 @@ public class RaftNode {
                         }
                     } else {
                         long proposalTerm = currentTerm;
+                        List<RaftEntry> toAppend = new ArrayList<>(byTopic.size());
 
                         for (var topicEntry : byTopic.entrySet()) {
                             String topic = topicEntry.getKey();
@@ -390,7 +419,7 @@ public class RaftNode {
                                 totalEntries += req.entries.size();
                             }
 
-                            long index = raftLog.getLastIndex() + 1;
+                            long index = uncommittedNextIndex++;
                             RaftEntry entry = RaftEntry.newBuilder()
                                     .setTerm(proposalTerm)
                                     .setIndex(index)
@@ -399,7 +428,7 @@ public class RaftNode {
                                     .setCommandType(RaftCommandType.BATCH_MESSAGE)
                                     .build();
 
-                            raftLog.append(entry);
+                            toAppend.add(entry);
                             pendingProposals.put(index, new AggregatedProposalState(proposalTerm, requests));
 
                             if (shouldLog("aggregator-coalesce")) {
@@ -407,15 +436,25 @@ public class RaftNode {
                                         nodeId, requests.size(), totalEntries, topic, index);
                             }
                         }
-                        appended = true;
+
+                        if (!toAppend.isEmpty()) {
+                            try {
+                                logAppenderQueue.put(() -> {
+                                    try {
+                                        raftLog.append(toAppend);
+                                        sendHeartbeats();
+                                    } catch (IOException e) {
+                                        logger.error("[{}] Failed to append batch to RaftLog", nodeId, e);
+                                        stepDown(proposalTerm);
+                                    }
+                                });
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                            }
+                        }
                     }
                 } finally {
                     lock.unlock();
-                }
-
-                // Trigger replication once after all entries are appended
-                if (appended) {
-                    sendHeartbeats();
                 }
 
             } catch (InterruptedException e) {
@@ -493,7 +532,6 @@ public class RaftNode {
                 }
 
                 // Acquire lock ONCE and append a single Raft entry
-                boolean appended = false;
                 lock.lock();
                 try {
                     if (state != RaftState.LEADER) {
@@ -503,7 +541,7 @@ public class RaftNode {
                         }
                     } else {
                         long proposalTerm = currentTerm;
-                        long index = raftLog.getLastIndex() + 1;
+                        long index = uncommittedNextIndex++;
 
                         AtomicBatchRequest payload = AtomicBatchRequest.newBuilder()
                                 .addAllSlices(mergedSlices)
@@ -521,7 +559,6 @@ public class RaftNode {
                                 .setCommandType(RaftCommandType.ATOMIC_BATCH)
                                 .build();
 
-                        raftLog.append(entry);
                         pendingProposals.put(index,
                                 new AtomicAggregatedProposalState(proposalTerm, drained, constituentStartPositions));
 
@@ -529,14 +566,23 @@ public class RaftNode {
                             logger.info("[{}] Atomic aggregator coalesced {} requests ({} topics) into raft index {}",
                                     nodeId, drained.size(), mergedSlices.size(), index);
                         }
-                        appended = true;
+
+                        try {
+                            logAppenderQueue.put(() -> {
+                                try {
+                                    raftLog.append(entry);
+                                    sendHeartbeats();
+                                } catch (IOException e) {
+                                    logger.error("[{}] Failed to append atomic batch to RaftLog", nodeId, e);
+                                    stepDown(proposalTerm);
+                                }
+                            });
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
                     }
                 } finally {
                     lock.unlock();
-                }
-
-                if (appended) {
-                    sendHeartbeats();
                 }
 
             } catch (InterruptedException e) {
@@ -866,6 +912,7 @@ public class RaftNode {
         long electionDuration = recordElectionDuration(true);
 
         long lastLogIndex = raftLog.getLastIndex();
+        uncommittedNextIndex = lastLogIndex + 1;
         for (PeerAddress peer : peers) {
             nextIndex.put(peer.id(), lastLogIndex + 1);
             matchIndex.put(peer.id(), 0L);
