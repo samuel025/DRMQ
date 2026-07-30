@@ -293,7 +293,6 @@ public class ConsumerGroupCoordinator implements Closeable {
         return total;
     }
 
-    // ---- Dead-Letter Queue (DLQ) Support ----
 
     /**
      * Explicitly reject (NACK) a message offset for a consumer within a group.
@@ -319,7 +318,6 @@ public class ConsumerGroupCoordinator implements Closeable {
 
         state.lock.lock();
         try {
-            // Remove the consumer's active lease
             Lease lease = state.activeLeases.remove(consumerId);
             if (lease != null) {
                 state.members.remove(consumerId);
@@ -333,7 +331,6 @@ public class ConsumerGroupCoordinator implements Closeable {
                 routeToDlq(state, group, topic, offset);
                 return true;
             } else {
-                // Rewind for redelivery using the lease's fromOffset to not skip messages
                 long rewindOffset = (lease != null) ? lease.fromOffset : offset;
                 if (rewindOffset < state.dispatchOffset) {
                     state.dispatchOffset = rewindOffset;
@@ -379,7 +376,6 @@ public class ConsumerGroupCoordinator implements Closeable {
             }
         });
 
-        // Advance past the bad offset regardless — don't let a DLQ write failure block progress
         long nextOffset = badOffset + 1;
         state.committedRanges.add(new CommittedRange(badOffset, nextOffset));
         advanceCommittedOffset(state, group, topic);
@@ -387,7 +383,6 @@ public class ConsumerGroupCoordinator implements Closeable {
             state.dispatchOffset = nextOffset;
         }
 
-        // Clean up the delivery counter for this offset
         state.deliveryCounts.remove(badOffset);
     }
 

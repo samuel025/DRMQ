@@ -16,8 +16,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Timer;
 import java.util.TimerTask;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CopyOnWriteArraySet;
-import java.util.concurrent.TimeUnit;
 
 public class TelemetryWebSocketServer extends WebSocketServer {
     private static final Logger logger = LoggerFactory.getLogger(TelemetryWebSocketServer.class);
@@ -28,7 +28,10 @@ public class TelemetryWebSocketServer extends WebSocketServer {
     private final Gson gson;
 
     // Throughput history (0-100 scaled for chart)
-    private final List<Double> throughputHistory = new ArrayList<>();
+    private final List<Double> throughputHistory = new CopyOnWriteArrayList<>();
+    private final List<Double> produceHistory = new CopyOnWriteArrayList<>();
+    private final List<Double> consumeHistory = new CopyOnWriteArrayList<>();
+    private final List<Double> errorHistory = new CopyOnWriteArrayList<>();
 
     // Rolling byte snapshots to compute per-second rates
     private double lastProduceBytes = 0;
@@ -51,16 +54,23 @@ public class TelemetryWebSocketServer extends WebSocketServer {
         this.broadcastTimer = new Timer("TelemetryBroadcastTimer", true);
         this.gson = new Gson();
         
-        for (int i = 0; i < 30; i++) {
+        for (int i = 0; i < 300; i++) {
             throughputHistory.add(0.0);
+            produceHistory.add(0.0);
+            consumeHistory.add(0.0);
+            errorHistory.add(0.0);
         }
     }
 
     @Override
     public void onOpen(WebSocket conn, ClientHandshake handshake) {
-        connections.add(conn);
-        logger.info("New telemetry dashboard connected: {}", conn.getRemoteSocketAddress());
-        conn.send(buildTelemetryPayload());
+        try {
+            connections.add(conn);
+            logger.info("New telemetry dashboard connected: {}", conn.getRemoteSocketAddress());
+            conn.send(buildTelemetryPayload());
+        } catch (Exception e) {
+            logger.error("Error during onOpen, preventing SelectorThread crash", e);
+        }
     }
 
     @Override
@@ -138,14 +148,19 @@ public class TelemetryWebSocketServer extends WebSocketServer {
         lastConsumeRecords = consumeRecords;
         lastErrorCount     = errors;
 
-        // Throughput chart history: scale (produce + consume) MB/s to 0-100
         double totalMBps = currentProduceMBps + currentConsumeMBps;
-        // Scale: 50 MB/s = 100 on chart
-        double chartVal = Math.min(100, (totalMBps / 50.0) * 100);
-        if (chartVal < 3 && totalMBps > 0) chartVal = 3; // minimum visibility
         synchronized (throughputHistory) {
             throughputHistory.remove(0);
-            throughputHistory.add(chartVal);
+            throughputHistory.add(totalMBps);
+            
+            produceHistory.remove(0);
+            produceHistory.add(currentProduceMBps);
+            
+            consumeHistory.remove(0);
+            consumeHistory.add(currentConsumeMBps);
+            
+            errorHistory.remove(0);
+            errorHistory.add(currentErrorRate);
         }
     }
 
@@ -159,9 +174,9 @@ public class TelemetryWebSocketServer extends WebSocketServer {
         JsonObject metrics = new JsonObject();
 
         double totalMBps = currentProduceMBps + currentConsumeMBps;
-        metrics.addProperty("totalThroughputMB",    round2(totalMBps));
-        metrics.addProperty("produceThroughputMB",  round2(currentProduceMBps));
-        metrics.addProperty("consumeThroughputMB",  round2(currentConsumeMBps));
+        metrics.addProperty("totalThroughputMB",    round4(totalMBps));
+        metrics.addProperty("produceThroughputMB",  round4(currentProduceMBps));
+        metrics.addProperty("consumeThroughputMB",  round4(currentConsumeMBps));
         metrics.addProperty("produceRate",          Math.round(currentProduceRecordRate)); // msgs/s
         metrics.addProperty("consumeRate",          Math.round(currentConsumeRecordRate)); // msgs/s
         metrics.addProperty("errorRate",            Math.round(currentErrorRate));         // errors/s
@@ -175,8 +190,8 @@ public class TelemetryWebSocketServer extends WebSocketServer {
             produceLatencyMs = Math.max(singleLatency, batchLatency); // use whichever path is active
             consumeLatencyMs = bm.getTimerMeanMs("drmq.broker.request.latency", "consume");
         }
-        metrics.addProperty("produceLatencyMs", round2(produceLatencyMs));
-        metrics.addProperty("consumeLatencyMs", round2(consumeLatencyMs));
+        metrics.addProperty("produceLatencyMs", round4(produceLatencyMs));
+        metrics.addProperty("consumeLatencyMs", round4(consumeLatencyMs));
 
         // Active connections: real handler count from Netty
         int totalHandlers = brokerServer.getActiveChannelsCount();
@@ -265,12 +280,21 @@ public class TelemetryWebSocketServer extends WebSocketServer {
 
         // Throughput chart history
         JsonArray history = new JsonArray();
+        JsonArray pHistory = new JsonArray();
+        JsonArray cHistory = new JsonArray();
+        JsonArray eHistory = new JsonArray();
         synchronized (throughputHistory) {
-            for (Double val : throughputHistory) {
-                history.add(round2(val));
+            for (int i = 0; i < throughputHistory.size(); i++) {
+                history.add(round4(throughputHistory.get(i)));
+                pHistory.add(round4(produceHistory.get(i)));
+                cHistory.add(round4(consumeHistory.get(i)));
+                eHistory.add(round4(errorHistory.get(i)));
             }
         }
         metrics.add("throughputHistory", history);
+        metrics.add("produceHistory", pHistory);
+        metrics.add("consumeHistory", cHistory);
+        metrics.add("errorHistory", eHistory);
 
         // Produce-rate history (msgs/s scaled similarly)
         state.add("metrics", metrics);
@@ -286,7 +310,7 @@ public class TelemetryWebSocketServer extends WebSocketServer {
         localNode.addProperty("name",       "Broker-" + localId.toUpperCase());
         localNode.addProperty("status",     localStatus);
         // throughput in bytes/s for this node (real produce traffic it handled)
-        localNode.addProperty("throughputMBps", round2(currentProduceMBps + currentConsumeMBps));
+        localNode.addProperty("throughputMBps", round4(currentProduceMBps + currentConsumeMBps));
         localNode.addProperty("produceRate",    Math.round(currentProduceRecordRate));
         localNode.addProperty("consumeRate",    Math.round(currentConsumeRecordRate));
         localNode.addProperty("commitIndex",    commitIndex);
@@ -366,9 +390,9 @@ public class TelemetryWebSocketServer extends WebSocketServer {
         }
         JsonObject latencies = new JsonObject();
         // Inter-node Raft RPC latency (same for all links since we only know our own outbound)
-        latencies.addProperty("alphaBeta",   round2(raftRpcLatencyMs > 0 ? raftRpcLatencyMs : 0));
-        latencies.addProperty("betaGamma",   round2(raftRpcLatencyMs > 0 ? raftRpcLatencyMs : 0));
-        latencies.addProperty("raftRpcMs",   round2(raftRpcLatencyMs));
+        latencies.addProperty("alphaBeta",   round4(raftRpcLatencyMs > 0 ? raftRpcLatencyMs : 0));
+        latencies.addProperty("betaGamma",   round4(raftRpcLatencyMs > 0 ? raftRpcLatencyMs : 0));
+        latencies.addProperty("raftRpcMs",   round4(raftRpcLatencyMs));
         state.add("latencies", latencies);
 
         // ── EVENTS ────────────────────────────────────────────────────────────
@@ -377,7 +401,7 @@ public class TelemetryWebSocketServer extends WebSocketServer {
         return gson.toJson(state);
     }
 
-    private static double round2(double v) {
-        return Math.round(v * 100.0) / 100.0;
+    private static double round4(double v) {
+        return Math.round(v * 10000.0) / 10000.0;
     }
 }

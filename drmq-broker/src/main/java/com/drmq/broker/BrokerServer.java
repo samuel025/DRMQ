@@ -46,6 +46,7 @@ public class BrokerServer {
     private final List<RaftPeer> raftPeers; 
     private final BrokerMetrics metrics;
     private TelemetryWebSocketServer telemetryServer;
+    private AdminHttpServer adminHttpServer;
 
     private volatile boolean running = false;
     
@@ -171,6 +172,10 @@ public class BrokerServer {
             telemetryServer = new TelemetryWebSocketServer(wsPort, this);
             telemetryServer.start();
 
+            int adminPort = config.getPort() + 300;
+            adminHttpServer = new AdminHttpServer(adminPort, messageStore, offsetManager, groupCoordinator);
+            adminHttpServer.start();
+
             logger.info("DRMQ Broker started on port {} with data directory {}",
                     config.getPort(), config.getDataDir());
 
@@ -213,6 +218,9 @@ public class BrokerServer {
         }
         if (telemetryServer != null) {
             telemetryServer.shutdown();
+        }
+        if (adminHttpServer != null) {
+            adminHttpServer.stop();
         }
 
         if (activeChannels != null) {
