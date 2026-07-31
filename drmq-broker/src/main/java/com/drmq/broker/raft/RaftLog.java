@@ -184,26 +184,27 @@ public class RaftLog {
 
     public RaftEntry getEntry(long index) {
         byte[] data;
+        long pos;
+        java.nio.ByteBuffer buf;
         synchronized (this) {
             if (index < startIndex || index > getLastIndex()) {
                 return null;
             }
             int listIndex = (int) (index - startIndex);
-            try {
-                long pos = filePositions.get(listIndex);
-                
-                int originalPos = mappedBuffer.position();
-                mappedBuffer.position((int) pos);
-                
-                int length = mappedBuffer.getInt();
-                data = new byte[length];
-                mappedBuffer.get(data);
-                
-                mappedBuffer.position(originalPos);
-            } catch (Exception e) {
-                logger.error("Failed to read raft entry at index {} from mapped buffer", index, e);
+            if (listIndex >= filePositions.size()) {
                 return null;
             }
+            pos = filePositions.get(listIndex);
+            buf = mappedBuffer.duplicate();
+        }
+        try {
+            buf.position((int) pos);
+            int length = buf.getInt();
+            data = new byte[length];
+            buf.get(data);
+        } catch (Exception e) {
+            logger.error("Failed to read raft entry at index {} from mapped buffer", index, e);
+            return null;
         }
         try {
             return RaftEntry.parseFrom(data);
@@ -222,6 +223,9 @@ public class RaftLog {
     public List<RaftEntry> getEntriesFrom(long fromIndex, int maxEntries) {
         List<byte[]> rawDataList = new ArrayList<>();
         int maxBytes = 8 * 1024 * 1024; // 8 MB limit per RPC
+        java.nio.ByteBuffer buf;
+        long startPos;
+        int countToRead;
         
         synchronized (this) {
             if (fromIndex < startIndex || fromIndex > getLastIndex() + 1) {
@@ -231,29 +235,31 @@ public class RaftLog {
                 return Collections.emptyList();
             }
             int from = (int) (fromIndex - startIndex);
-            long currentBytes = 0;
-            
-            try {
-                int originalPos = mappedBuffer.position();
-                mappedBuffer.position((int) (long) filePositions.get(from));
-                
-                int to = from;
-                while (to < entries.size() && to - from < maxEntries) {
-                    int length = mappedBuffer.getInt();
-                    if (to > from && currentBytes + length > maxBytes) {
-                        break; 
-                    }
-                    byte[] data = new byte[length];
-                    mappedBuffer.get(data);
-                    rawDataList.add(data);
-                    
-                    currentBytes += length;
-                    to++;
-                }
-                mappedBuffer.position(originalPos);
-            } catch (Exception e) {
-                logger.error("Failed to read raft entries from mapped buffer", e);
+            if (from < 0 || from >= filePositions.size()) {
+                return Collections.emptyList();
             }
+            startPos = filePositions.get(from);
+            buf = mappedBuffer.duplicate();
+            countToRead = Math.min(maxEntries, filePositions.size() - from);
+        }
+        
+        try {
+            buf.position((int) startPos);
+            long currentBytes = 0;
+            for (int i = 0; i < countToRead; i++) {
+                if (buf.remaining() < 4) break;
+                int length = buf.getInt();
+                if (length <= 0 || buf.remaining() < length) break;
+                if (i > 0 && currentBytes + length > maxBytes) {
+                    break;
+                }
+                byte[] data = new byte[length];
+                buf.get(data);
+                rawDataList.add(data);
+                currentBytes += length;
+            }
+        } catch (Exception e) {
+            logger.error("Failed to read raft entries from mapped buffer", e);
         }
         
         List<RaftEntry> result = new ArrayList<>(rawDataList.size());

@@ -226,13 +226,7 @@ public class DRMQProducer implements AutoCloseable {
                 .setTopic(topic);
 
         for (PendingMessage pm : batch) {
-            ProduceBatchRequest.BatchEntry.Builder entryBuilder = ProduceBatchRequest.BatchEntry.newBuilder()
-                    .setPayload(com.google.protobuf.ByteString.copyFrom(pm.payload))
-                    .setClientTimestamp(pm.timestamp);
-            if (pm.key != null) {
-                entryBuilder.setKey(pm.key);
-            }
-            requestBuilder.addEntries(entryBuilder.build());
+            requestBuilder.addEntries(pm.batchEntry);
         }
 
         MessageEnvelope envelope = MessageEnvelope.newBuilder()
@@ -616,6 +610,7 @@ public class DRMQProducer implements AutoCloseable {
         final String key;
         final long timestamp;
         final CompletableFuture<SendResult> future;
+        final ProduceBatchRequest.BatchEntry batchEntry;
 
         PendingMessage(String topic, byte[] payload, String key, CompletableFuture<SendResult> future) {
             this.topic = topic;
@@ -623,6 +618,14 @@ public class DRMQProducer implements AutoCloseable {
             this.key = key;
             this.timestamp = System.currentTimeMillis();
             this.future = future;
+
+            ProduceBatchRequest.BatchEntry.Builder builder = ProduceBatchRequest.BatchEntry.newBuilder()
+                    .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
+                    .setClientTimestamp(this.timestamp);
+            if (key != null) {
+                builder.setKey(key);
+            }
+            this.batchEntry = builder.build();
         }
     }
 
