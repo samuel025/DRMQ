@@ -395,73 +395,116 @@ public class RaftNode {
                     byTopic.computeIfAbsent(req.topic, k -> new ArrayList<>()).add(req);
                 }
 
-                long proposalTerm = -1;
-                List<RaftEntry> toAppend = null;
+                // --- BUILD CHUNKS AND SERIALIZE OUTSIDE LOCK ---
+                class ChunkData {
+                    String topic;
+                    List<ProposalRequest> requests;
+                    RaftEntry.Builder entryBuilder;
+                    int totalEntries;
+                    int totalBytes;
+                }
+                List<ChunkData> preparedChunks = new ArrayList<>();
 
-                // Acquire the Raft lock ONCE for all entries
-                lock.lock();
-                try {
-                    if (state != RaftState.LEADER) {
-                        IOException err = new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
-                        for (ProposalRequest req : drained) {
-                            req.future.completeExceptionally(err);
+                for (var topicEntry : byTopic.entrySet()) {
+                    String topic = topicEntry.getKey();
+                    List<ProposalRequest> requests = topicEntry.getValue();
+
+                    ProduceBatchRequest.Builder merged = ProduceBatchRequest.newBuilder().setTopic(topic);
+                    int totalEntries = 0;
+                    int currentBytes = 0;
+                    List<ProposalRequest> currentChunk = new ArrayList<>();
+
+                    for (ProposalRequest req : requests) {
+                        int reqBytes = 0;
+                        for (var e : req.entries) {
+                            reqBytes += e.getPayload().size();
                         }
-                    } else {
-                        proposalTerm = currentTerm;
-                        toAppend = new ArrayList<>(byTopic.size());
 
-                        for (var topicEntry : byTopic.entrySet()) {
-                            String topic = topicEntry.getKey();
-                            List<ProposalRequest> requests = topicEntry.getValue();
-
-                            // Merge all entries from all requests into one ProduceBatchRequest
-                            ProduceBatchRequest.Builder merged = ProduceBatchRequest.newBuilder().setTopic(topic);
-                            int totalEntries = 0;
-                            for (ProposalRequest req : requests) {
-                                merged.addAllEntries(req.entries);
-                                totalEntries += req.entries.size();
-                            }
-
-                            long index = uncommittedNextIndex++;
-                            RaftEntry entry = RaftEntry.newBuilder()
-                                    .setTerm(proposalTerm)
-                                    .setIndex(index)
+                        if (!currentChunk.isEmpty() && currentBytes + reqBytes > 4 * 1024 * 1024) {
+                            ChunkData cd = new ChunkData();
+                            cd.topic = topic;
+                            cd.requests = currentChunk;
+                            cd.entryBuilder = RaftEntry.newBuilder()
                                     .setTopic(topic)
                                     .setPayload(merged.build().toByteString())
-                                    .setCommandType(RaftCommandType.BATCH_MESSAGE)
-                                    .build();
+                                    .setCommandType(RaftCommandType.BATCH_MESSAGE);
+                            cd.totalEntries = totalEntries;
+                            cd.totalBytes = currentBytes;
+                            preparedChunks.add(cd);
 
-                            toAppend.add(entry);
-                            pendingProposals.put(index, new AggregatedProposalState(proposalTerm, requests));
-
-                            if (shouldLog("aggregator-coalesce")) {
-                                logger.info("[{}] Aggregator coalesced {} proposals ({} entries) for topic '{}' into raft index {}",
-                                        nodeId, requests.size(), totalEntries, topic, index);
-                            }
+                            merged = ProduceBatchRequest.newBuilder().setTopic(topic);
+                            totalEntries = 0;
+                            currentBytes = 0;
+                            currentChunk = new ArrayList<>();
                         }
+
+                        merged.addAllEntries(req.entries);
+                        totalEntries += req.entries.size();
+                        currentBytes += reqBytes;
+                        currentChunk.add(req);
                     }
-                } finally {
-                    lock.unlock();
+
+                    if (!currentChunk.isEmpty()) {
+                        ChunkData cd = new ChunkData();
+                        cd.topic = topic;
+                        cd.requests = currentChunk;
+                        cd.entryBuilder = RaftEntry.newBuilder()
+                                .setTopic(topic)
+                                .setPayload(merged.build().toByteString())
+                                .setCommandType(RaftCommandType.BATCH_MESSAGE);
+                        cd.totalEntries = totalEntries;
+                        cd.totalBytes = currentBytes;
+                        preparedChunks.add(cd);
+                    }
                 }
 
-                if (toAppend != null && !toAppend.isEmpty()) {
-                    long finalProposalTerm = proposalTerm;
-                    List<RaftEntry> finalToAppend = toAppend;
-                    boolean enqueued = logAppenderQueue.offer(() -> {
-                        try {
-                            raftLog.append(finalToAppend);
-                            sendHeartbeats();
-                        } catch (IOException e) {
-                            logger.error("[{}] Failed to append batch to RaftLog", nodeId, e);
-                            stepDown(finalProposalTerm);
+                long proposalTerm = -1;
+
+                for (ChunkData cd : preparedChunks) {
+                    lock.lock();
+                    try {
+                        if (state != RaftState.LEADER) {
+                            IOException err = new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
+                            for (ProposalRequest req : cd.requests) {
+                                req.future.completeExceptionally(err);
+                            }
+                        } else {
+                            proposalTerm = currentTerm;
+                            long index = uncommittedNextIndex++;
+                            RaftEntry entry = cd.entryBuilder
+                                    .setTerm(proposalTerm)
+                                    .setIndex(index)
+                                    .build();
+
+                            pendingProposals.put(index, new AggregatedProposalState(proposalTerm, cd.requests));
+
+                            if (shouldLog("aggregator-coalesce")) {
+                                logger.info("[{}] Aggregator coalesced {} proposals ({} entries, {} bytes) for topic '{}' into raft index {}",
+                                        nodeId, cd.requests.size(), cd.totalEntries, cd.totalBytes, cd.topic, index);
+                            }
+
+                            List<RaftEntry> finalToAppend = java.util.Collections.singletonList(entry);
+                            long finalProposalTerm = proposalTerm;
+                            try {
+                                logAppenderQueue.put(() -> {
+                                    try {
+                                        raftLog.append(finalToAppend);
+                                        sendHeartbeats();
+                                    } catch (IOException e) {
+                                        logger.error("[{}] Failed to append batch to RaftLog", nodeId, e);
+                                        stepDown(finalProposalTerm);
+                                    }
+                                });
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                IOException err = new IOException("Interrupted while enqueueing append");
+                                for (ProposalRequest req : cd.requests) {
+                                    req.future.completeExceptionally(err);
+                                }
+                            }
                         }
-                    });
-                    
-                    if (!enqueued) {
-                        IOException err = new IOException("Raft log appender queue full or stopped");
-                        for (ProposalRequest req : drained) {
-                            req.future.completeExceptionally(err);
-                        }
+                    } finally {
+                        lock.unlock();
                     }
                 }
 
@@ -504,102 +547,124 @@ public class RaftNode {
                     continue;
                 }
 
-                // Track per-constituent start positions within each topic's merged slice
-                // constituentStartPositions[i] = {topic → startIndexInMergedSlice}
-                List<Map<String, Integer>> constituentStartPositions = new ArrayList<>(drained.size());
-                for (int i = 0; i < drained.size(); i++) {
-                    constituentStartPositions.add(new LinkedHashMap<>());
-                }
-
-                // Merge slices: group all entries by topic, concatenating in order
-                Map<String, List<ProduceBatchRequest.BatchEntry>> mergedByTopic = new LinkedHashMap<>();
-
-                for (int i = 0; i < drained.size(); i++) {
-                    AtomicProposalRequest req = drained.get(i);
-                    Map<String, Integer> myPositions = constituentStartPositions.get(i);
-
-                    for (AtomicBatchTopicSlice slice : req.slices) {
-                        String topic = slice.getTopic();
-                        List<ProduceBatchRequest.BatchEntry> mergedEntries =
-                                mergedByTopic.computeIfAbsent(topic, k -> new ArrayList<>());
-                        // Record this constituent's start position for this topic
-                        if (!myPositions.containsKey(topic)) {
-                            myPositions.put(topic, mergedEntries.size());
-                        }
-                        mergedEntries.addAll(slice.getEntriesList());
-                    }
-                }
-
-                // Build the merged AtomicBatchRequest slices
-                List<AtomicBatchTopicSlice> mergedSlices = new ArrayList<>();
-                for (Map.Entry<String, List<ProduceBatchRequest.BatchEntry>> entry : mergedByTopic.entrySet()) {
-                    mergedSlices.add(AtomicBatchTopicSlice.newBuilder()
-                            .setTopic(entry.getKey())
-                            .addAllEntries(entry.getValue())
-                            .build());
-                }
-
-                long proposalTerm = -1;
-                RaftEntry entry = null;
-
-                // Acquire lock ONCE and append a single Raft entry
-                lock.lock();
-                try {
-                    if (state != RaftState.LEADER) {
-                        IOException err = new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
-                        for (AtomicProposalRequest req : drained) {
-                            req.future.completeExceptionally(err);
-                        }
-                    } else {
-                        proposalTerm = currentTerm;
-                        long index = uncommittedNextIndex++;
-
-                        AtomicBatchRequest payload = AtomicBatchRequest.newBuilder()
-                                .addAllSlices(mergedSlices)
-                                .build();
-
-                        String topicStr = mergedSlices.stream()
-                                .map(AtomicBatchTopicSlice::getTopic)
-                                .collect(java.util.stream.Collectors.joining(","));
-
-                        entry = RaftEntry.newBuilder()
-                                .setTerm(proposalTerm)
-                                .setIndex(index)
-                                .setTopic(topicStr)
-                                .setPayload(payload.toByteString())
-                                .setCommandType(RaftCommandType.ATOMIC_BATCH)
-                                .build();
-
-                        pendingProposals.put(index,
-                                new AtomicAggregatedProposalState(proposalTerm, drained, constituentStartPositions));
-
-                        if (shouldLog("atomic-aggregator-coalesce")) {
-                            logger.info("[{}] Atomic aggregator coalesced {} requests ({} topics) into raft index {}",
-                                    nodeId, drained.size(), mergedSlices.size(), index);
+                List<List<AtomicProposalRequest>> chunks = new ArrayList<>();
+                List<AtomicProposalRequest> currentReqChunk = new ArrayList<>();
+                int currentReqBytes = 0;
+                
+                for (AtomicProposalRequest req : drained) {
+                    int reqBytes = 0;
+                    for (var slice : req.slices) {
+                        for (var e : slice.getEntriesList()) {
+                            reqBytes += e.getPayload().size();
                         }
                     }
-                } finally {
-                    lock.unlock();
+                    if (!currentReqChunk.isEmpty() && currentReqBytes + reqBytes > 4 * 1024 * 1024) {
+                        chunks.add(currentReqChunk);
+                        currentReqChunk = new ArrayList<>();
+                        currentReqBytes = 0;
+                    }
+                    currentReqChunk.add(req);
+                    currentReqBytes += reqBytes;
+                }
+                if (!currentReqChunk.isEmpty()) {
+                    chunks.add(currentReqChunk);
                 }
 
-                if (entry != null) {
-                    long finalProposalTerm = proposalTerm;
-                    RaftEntry finalEntry = entry;
-                    boolean enqueued = logAppenderQueue.offer(() -> {
-                        try {
-                            raftLog.append(finalEntry);
-                            sendHeartbeats();
-                        } catch (IOException e) {
-                            logger.error("[{}] Failed to append atomic batch to RaftLog", nodeId, e);
-                            stepDown(finalProposalTerm);
+                for (List<AtomicProposalRequest> chunk : chunks) {
+                    List<Map<String, Integer>> constituentStartPositions = new ArrayList<>(chunk.size());
+                    for (int i = 0; i < chunk.size(); i++) {
+                        constituentStartPositions.add(new LinkedHashMap<>());
+                    }
+
+                    Map<String, List<ProduceBatchRequest.BatchEntry>> mergedByTopic = new LinkedHashMap<>();
+
+                    for (int i = 0; i < chunk.size(); i++) {
+                        AtomicProposalRequest req = chunk.get(i);
+                        Map<String, Integer> myPositions = constituentStartPositions.get(i);
+
+                        for (AtomicBatchTopicSlice slice : req.slices) {
+                            String topic = slice.getTopic();
+                            List<ProduceBatchRequest.BatchEntry> mergedEntries =
+                                    mergedByTopic.computeIfAbsent(topic, k -> new ArrayList<>());
+                            if (!myPositions.containsKey(topic)) {
+                                myPositions.put(topic, mergedEntries.size());
+                            }
+                            mergedEntries.addAll(slice.getEntriesList());
                         }
-                    });
-                    
-                    if (!enqueued) {
-                        IOException err = new IOException("Raft log appender queue full or stopped");
-                        for (AtomicProposalRequest req : drained) {
-                            req.future.completeExceptionally(err);
+                    }
+
+                    List<AtomicBatchTopicSlice> mergedSlices = new ArrayList<>();
+                    for (Map.Entry<String, List<ProduceBatchRequest.BatchEntry>> entry : mergedByTopic.entrySet()) {
+                        mergedSlices.add(AtomicBatchTopicSlice.newBuilder()
+                                .setTopic(entry.getKey())
+                                .addAllEntries(entry.getValue())
+                                .build());
+                    }
+
+                    // --- SERIALIZATION OUTSIDE THE LOCK ---
+                    AtomicBatchRequest payload = AtomicBatchRequest.newBuilder()
+                            .addAllSlices(mergedSlices)
+                            .build();
+
+                    String topicStr = mergedSlices.stream()
+                            .map(AtomicBatchTopicSlice::getTopic)
+                            .collect(java.util.stream.Collectors.joining(","));
+
+                    RaftEntry.Builder entryBuilder = RaftEntry.newBuilder()
+                            .setTopic(topicStr)
+                            .setPayload(payload.toByteString())
+                            .setCommandType(RaftCommandType.ATOMIC_BATCH);
+
+                    long proposalTerm = -1;
+
+                    lock.lock();
+                    try {
+                        if (state != RaftState.LEADER) {
+                            IOException err = new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
+                            for (AtomicProposalRequest req : chunk) {
+                                req.future.completeExceptionally(err);
+                            }
+                        } else {
+                            proposalTerm = currentTerm;
+                            long index = uncommittedNextIndex++;
+
+                            RaftEntry entry = entryBuilder
+                                    .setTerm(proposalTerm)
+                                    .setIndex(index)
+                                    .build();
+
+                            pendingProposals.put(index,
+                                    new AtomicAggregatedProposalState(proposalTerm, chunk, constituentStartPositions));
+
+                            if (shouldLog("atomic-aggregator-coalesce")) {
+                                logger.info("[{}] Atomic aggregator coalesced {} requests ({} topics) into raft index {}",
+                                        nodeId, chunk.size(), mergedSlices.size(), index);
+                            }
+
+                            if (entry != null) {
+                                long finalProposalTerm = proposalTerm;
+                                RaftEntry finalEntry = entry;
+                                try {
+                                    logAppenderQueue.put(() -> {
+                                        try {
+                                            raftLog.append(finalEntry);
+                                            sendHeartbeats();
+                                        } catch (IOException e) {
+                                            logger.error("[{}] Failed to append atomic batch to RaftLog", nodeId, e);
+                                            stepDown(finalProposalTerm);
+                                        }
+                                    });
+                                } catch (InterruptedException e) {
+                                    Thread.currentThread().interrupt();
+                                    IOException err = new IOException("Interrupted while enqueueing append");
+                                    for (AtomicProposalRequest req : chunk) {
+                                        req.future.completeExceptionally(err);
+                                    }
+                                }
+                            }
                         }
+                    } finally {
+                        lock.unlock();
                     }
                 }
 
@@ -1485,11 +1550,18 @@ public class RaftNode {
                     safeCompactIndex = lastApplied;
                 }
 
-                long finalCompactIndex = Math.min(safeCompactIndex, lastApplied - raftCompactThreshold);
-      
                 long currentLogStart = raftLog.getStartIndex();
+                boolean sizeThresholdReached = raftLog.getLogicalFileSize() > 512 * 1024 * 1024; // 512MB
+                
+                long finalCompactIndex;
+                if (sizeThresholdReached) {
+                    finalCompactIndex = safeCompactIndex;
+                } else {
+                    finalCompactIndex = Math.min(safeCompactIndex, lastApplied - raftCompactThreshold);
+                }
+
                 boolean compactionDue = finalCompactIndex > 0
-                        && (finalCompactIndex - currentLogStart) >= raftCompactThreshold;
+                        && ((finalCompactIndex - currentLogStart) >= raftCompactThreshold || sizeThresholdReached);
 
                 if (compactionDue) {
                     if (isCompacting.compareAndSet(false, true)) {
