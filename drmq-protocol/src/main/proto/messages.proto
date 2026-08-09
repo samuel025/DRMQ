@@ -129,6 +129,7 @@ message NackResponse {
 message MessageEnvelope {
     MessageType type = 1;
     bytes payload = 2; 
+    int64 correlation_id = 3;  // Client-assigned ID to match requests with responses in pipelined mode
 }
 
 enum RaftCommandType {

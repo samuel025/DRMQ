@@ -39,6 +39,7 @@ MODE="shared"              # "shared" (single producer) or "separate" (one per t
 # ACKS = "all" is enforced by the Raft quorum — no extra flag needed
 BOOTSTRAP="localhost:9092,localhost:9093,localhost:9094"
 DATA_BASE_DIR="/tmp/drmq-benchmark"
+INFLIGHT=5
 
 # Broker ports must match BOOTSTRAP above
 BROKER_PORTS=(9092 9093 9094)
@@ -156,6 +157,7 @@ run_producer_perf_test() {
   echo "   Linger       : ${LINGER_MS} ms"
   echo "   Concurrency  : ${CONCURRENCY} thread(s)"
   echo "   Producer mode: ${MODE} ($([ "${MODE}" = "separate" ] && echo 'one per thread' || echo 'single shared producer'))"
+  echo "   Inflight     : ${INFLIGHT}"
   echo "   ACKs         : all (Raft quorum)"
   echo "   Bootstrap    : ${BOOTSTRAP}"
   echo "────────────────────────────────────────────────────────────"
@@ -164,7 +166,7 @@ run_producer_perf_test() {
   (cd "${CLIENT_DIR}" && \
     mvn exec:java \
       -Dexec.mainClass="com.drmq.client.commandLineExample.StressTestApp" \
-      -Dexec.args="${BOOTSTRAP} ${CONCURRENCY} ${TOPIC_NAME} ${RECORD_SIZE} ${NUM_RECORDS} ${MODE}")
+      -Dexec.args="${BOOTSTRAP} ${CONCURRENCY} ${TOPIC_NAME} ${RECORD_SIZE} ${NUM_RECORDS} ${MODE} ${INFLIGHT}")
 }
 
 # ──────────────────── Cleanup ─────────────────────────────────────────────────
@@ -180,14 +182,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-while getopts "b:c:n:s:m:h" opt; do
+while getopts "b:c:n:s:m:i:h" opt; do
   case $opt in
     b) BOOTSTRAP="$OPTARG" ;;
     c) CONCURRENCY="$OPTARG" ;;
     n) NUM_RECORDS="$OPTARG" ;;
     s) RECORD_SIZE="$OPTARG" ;;
     m) MODE="$OPTARG" ;;
-    h) echo "Usage: ./stress_test.sh [-b brokers] [-c concurrency] [-n numRecords] [-s recordSize] [-m mode]"
+    i) INFLIGHT="$OPTARG" ;;
+    h) echo "Usage: ./stress_test.sh [-b brokers] [-c concurrency] [-n numRecords] [-s recordSize] [-m mode] [-i inflight]"
        echo ""
        echo "  Modes:"
        echo "    shared    (default) — single producer, threads fill accumulator"
@@ -196,8 +199,9 @@ while getopts "b:c:n:s:m:h" opt; do
        echo "  Examples:"
        echo "    ./stress_test.sh                           → shared mode, 200K records"
        echo "    ./stress_test.sh -c 4 -m separate           → 4 independent producers"
+       echo "    ./stress_test.sh -i 10                      → max inflight of 10 batches"
        exit 0 ;;
-    *) echo "Usage: ./stress_test.sh [-b brokers] [-c concurrency] [-n numRecords] [-s recordSize] [-m mode]" >&2
+    *) echo "Usage: ./stress_test.sh [-b brokers] [-c concurrency] [-n numRecords] [-s recordSize] [-m mode] [-i inflight]" >&2
        exit 1 ;;
   esac
 done

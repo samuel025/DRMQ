@@ -43,7 +43,9 @@ public class StressTestApp {
             msgSize      = args.length > 3 ? Integer.parseInt(args[3]) : 1024;
             numRecords   = args.length > 4 ? Long.parseLong(args[4])   : 0L;
             producerMode = args.length > 5 ? args[5]                    : "shared";
-            if (concurrency < 1 || msgSize < 1 || numRecords < 0) {
+            int maxInflight = args.length > 6 ? Integer.parseInt(args[6]) : 5;
+            
+            if (concurrency < 1 || msgSize < 1 || numRecords < 0 || maxInflight < 1) {
                 throw new NumberFormatException("Values must be positive");
             }
             if (!producerMode.equals("shared") && !producerMode.equals("separate")) {
@@ -51,7 +53,7 @@ public class StressTestApp {
             }
         } catch (NumberFormatException e) {
             System.err.println("Error: " + e.getMessage());
-            System.err.println("Usage: StressTestApp [bootstrapServers] [concurrency] [topic] [msgSize] [numRecords] [mode]");
+            System.err.println("Usage: StressTestApp [bootstrapServers] [concurrency] [topic] [msgSize] [numRecords] [mode] [maxInflight]");
             System.err.println("  mode: 'shared' (default, single producer) or 'separate' (one producer per thread)");
             System.exit(1);
             return;
@@ -60,6 +62,7 @@ public class StressTestApp {
         String topic = args.length > 2 ? args[2] : "load-test-topic";
         boolean bounded = numRecords > 0;
         boolean separateProducers = producerMode.equals("separate");
+        int maxInflight = args.length > 6 ? Integer.parseInt(args[6]) : 5;
 
         // ── Configuration banner ──────────────────────────────────────────────
         System.out.println("Configuration:");
@@ -131,6 +134,7 @@ public class StressTestApp {
                 producers[i] = new DRMQProducer(bootstrapServers);
                 producers[i].setBatchSizeBytes(1 * 1024 * 1024);
                 producers[i].setLingerMs(10);
+                producers[i].setMaxInflight(maxInflight);
                 try {
                     producers[i].connect();
                 } catch (java.io.IOException e) {
@@ -143,6 +147,7 @@ public class StressTestApp {
             producers[0] = new DRMQProducer(bootstrapServers);
             producers[0].setBatchSizeBytes(1 * 1024 * 1024);
             producers[0].setLingerMs(10);
+            producers[0].setMaxInflight(maxInflight);
             try {
                 producers[0].connect();
             } catch (Exception e) {
@@ -194,7 +199,11 @@ public class StressTestApp {
                                     doneLatch.countDown();
                                 }
                             } else {
-                                errors.incrementAndGet();
+                                long currentErrors = errors.incrementAndGet();
+                                if (currentErrors <= 5) {
+                                    System.err.println("Message failed: " + (ex != null ? ex.getMessage() : "Unknown error"));
+                                    if (ex != null) ex.printStackTrace();
+                                }
                                 // Still signal done if errors pushed us past the target
                                 if (bounded && (messagesSent.get() + errors.get()) >= numRecords && doneLatch != null) {
                                     doneLatch.countDown();

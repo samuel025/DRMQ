@@ -64,13 +64,18 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
         java.nio.ByteBuffer nioBuffer = msg.nioBuffer();
         com.google.protobuf.CodedInputStream input = com.google.protobuf.CodedInputStream.newInstance(nioBuffer);
         MessageEnvelope envelope = MessageEnvelope.parseFrom(input);
+        long correlationId = envelope.getCorrelationId();
         
         handleMessage(envelope).thenAccept(response -> {
-            int size = response.getSerializedSize();
+            // Echo the correlation_id so the client can match pipelined responses
+            MessageEnvelope tagged = correlationId != 0
+                    ? response.toBuilder().setCorrelationId(correlationId).build()
+                    : response;
+            int size = tagged.getSerializedSize();
             io.netty.buffer.ByteBuf outBuf = ctx.alloc().directBuffer(size);
             try {
                 com.google.protobuf.CodedOutputStream output = com.google.protobuf.CodedOutputStream.newInstance(outBuf.nioBuffer(0, size));
-                response.writeTo(output);
+                tagged.writeTo(output);
                 output.flush();
                 outBuf.writerIndex(size);
                 ctx.writeAndFlush(outBuf);
