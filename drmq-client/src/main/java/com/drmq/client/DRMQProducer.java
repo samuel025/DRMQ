@@ -512,6 +512,29 @@ public class DRMQProducer implements AutoCloseable {
         logger.info("Redirected to leader at {}:{}", host, port);
     }
 
+    /**
+     * Extracts the leader address from a NOT_LEADER error message.
+     * The broker sends error messages in the format "NOT_LEADER:host:port".
+     * @return the "host:port" string, or null if the format is unrecognised.
+     */
+    private String extractLeaderAddress(String errorMsg) {
+        if (errorMsg == null) return null;
+        String prefix = "NOT_LEADER:";
+        int idx = errorMsg.indexOf(prefix);
+        if (idx == -1) return null;
+        String addr = errorMsg.substring(idx + prefix.length()).trim();
+        if (addr.isEmpty() || "UNKNOWN".equals(addr)) return null;
+        // Validate it looks like host:port
+        String[] parts = addr.split(":");
+        if (parts.length != 2) return null;
+        try {
+            Integer.parseInt(parts[1]);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+        return addr;
+    }
+
     private void closeConnection() {
         connected = false;
         try { if (in != null) in.close(); } catch (IOException ignored) {}
@@ -645,8 +668,20 @@ public class DRMQProducer implements AutoCloseable {
                 String errorMsg = response.getErrorMessage();
                 
                 if (errorCode == ErrorCode.NOT_LEADER && running) {
-                    rotateToNextServer();
-                    closeConnection();
+                    // Parse leader address from error message (format: "NOT_LEADER:host:port")
+                    String leaderAddr = extractLeaderAddress(errorMsg);
+                    if (leaderAddr != null) {
+                        try {
+                            redirectToLeader(leaderAddr);
+                        } catch (IOException e) {
+                            logger.warn("Failed to redirect to leader {}: {}", leaderAddr, e.getMessage());
+                            rotateToNextServer();
+                            closeConnection();
+                        }
+                    } else {
+                        rotateToNextServer();
+                        closeConnection();
+                    }
                     if (batch.regularBatch != null) {
                         retryQueue.addFirst(batch.regularBatch);
                     }
@@ -691,8 +726,20 @@ public class DRMQProducer implements AutoCloseable {
                 String errorMsg = response.getErrorMessage();
                 
                 if (errorCode == ErrorCode.NOT_LEADER && running) {
-                    rotateToNextServer();
-                    closeConnection();
+                    // Parse leader address from error message (format: "NOT_LEADER:host:port")
+                    String leaderAddr = extractLeaderAddress(errorMsg);
+                    if (leaderAddr != null) {
+                        try {
+                            redirectToLeader(leaderAddr);
+                        } catch (IOException e) {
+                            logger.warn("Failed to redirect to leader {}: {}", leaderAddr, e.getMessage());
+                            rotateToNextServer();
+                            closeConnection();
+                        }
+                    } else {
+                        rotateToNextServer();
+                        closeConnection();
+                    }
                     atomicRetryQueue.addFirst(atomicData.batch);
                 } else {
                     for (PendingAtomicMessage pm : atomicData.batch) {
