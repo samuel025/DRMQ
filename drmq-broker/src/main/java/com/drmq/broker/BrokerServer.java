@@ -91,15 +91,26 @@ public class BrokerServer {
                     config.isRaftFsyncEnabled()
             );
 
+            // Pipeline connection pool size — must match RaftNode.MAX_INFLIGHT_RPCS
+            final int APPEND_POOL_SIZE = 4;
+
             for (BrokerConfig.PeerAddress peer : config.getPeers()) {
                 RaftPeer raftPeer = new RaftPeer(peer);
                 raftPeers.add(raftPeer);
                 raftNode.registerVoteHandler(peer.id(), raftPeer::sendRequestVote);
-                raftNode.registerAppendHandler(peer.id(), raftPeer::sendAppendEntries);
                 raftNode.registerPreVoteHandler(peer.id(), raftPeer::sendPreVote);
                 raftNode.registerRequestTopicOffsetsHandler(peer.id(), raftPeer::sendRequestTopicOffsets);
                 raftNode.registerIncrementalSnapshotChunkHandler(peer.id(), raftPeer::sendIncrementalSnapshotChunk);
                 raftNode.registerIncrementalSnapshotDoneHandler(peer.id(), raftPeer::sendIncrementalSnapshotDone);
+
+                // Create a pool of connections for pipelined AppendEntries RPCs.
+                // Each connection has its own TCP socket, so parallel RPCs don't
+                // contend on a single socket mutex.
+                for (int i = 0; i < APPEND_POOL_SIZE; i++) {
+                    RaftPeer appendPeer = new RaftPeer(peer);
+                    raftPeers.add(appendPeer); // track for shutdown cleanup
+                    raftNode.registerAppendHandler(peer.id(), appendPeer::sendAppendEntries);
+                }
             }
 
             logger.info("Cluster mode: nodeId={}, peers={}", config.getNodeId(), config.getPeers());

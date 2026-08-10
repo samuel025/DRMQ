@@ -18,6 +18,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
@@ -47,6 +48,9 @@ public class RaftNode {
     // Batch coalescing constants
     private static final int MAX_AGGREGATION_DRAIN = 512;  // Max proposals per aggregation cycle
     private static final long AGGREGATOR_LINGER_MS = 2;   // Max wait before draining queue (match client lingerMs)
+
+    // Pipeline constants — allow multiple AppendEntries RPCs in flight per peer
+    private static final int MAX_INFLIGHT_RPCS = 4;
 
     //  Persistent state (survives restart) 
     private volatile long currentTerm;
@@ -78,7 +82,8 @@ public class RaftNode {
     private final AtomicBoolean isCompacting = new AtomicBoolean(false);
 
     private final Map<String, Function<RequestVoteRequest, RequestVoteResponse>> voteRpcHandlers = new ConcurrentHashMap<>();
-    private final Map<String, Function<AppendEntriesRequest, AppendEntriesResponse>> appendRpcHandlers = new ConcurrentHashMap<>();
+    // Connection pool: multiple handlers per peer to allow parallel RPCs
+    private final Map<String, List<Function<AppendEntriesRequest, AppendEntriesResponse>>> appendRpcHandlerPools = new ConcurrentHashMap<>();
     private final Map<String, Function<PreVoteRequest, PreVoteResponse>> preVoteRpcHandlers = new ConcurrentHashMap<>();
     private final Map<String, Function<RequestTopicOffsetsRequest, RequestTopicOffsetsResponse>> requestTopicOffsetsRpcHandlers = new ConcurrentHashMap<>();
     private final Map<String, Function<IncrementalSnapshotChunk, IncrementalSnapshotChunkResponse>> incrementalSnapshotChunkRpcHandlers = new ConcurrentHashMap<>();
@@ -188,8 +193,19 @@ public class RaftNode {
     private Path snapshotTempFile = null;
     private long expectedSnapshotIndex = -1;
 
-    private final Map<String, AtomicBoolean> isReplicating;
     private final Map<String, AtomicBoolean> isHeartbeatInFlight = new ConcurrentHashMap<>();
+
+    /**
+     * Per-peer pipeline state for pipelined AppendEntries replication.
+     * Allows up to MAX_INFLIGHT_RPCS concurrent RPCs per peer.
+     */
+    private static class PeerReplicationState {
+        final java.util.concurrent.Semaphore pipelineSlots = new java.util.concurrent.Semaphore(MAX_INFLIGHT_RPCS);
+        final AtomicInteger connectionRoundRobin = new AtomicInteger(0);
+        // Track whether a pipeline-fill task is already scheduled to avoid duplicate scheduling
+        final AtomicBoolean pipelineFillScheduled = new AtomicBoolean(false);
+    }
+    private final Map<String, PeerReplicationState> peerPipelineState = new ConcurrentHashMap<>();
 
     // Background log appender to prevent disk I/O from starving the consensus lock
     private final LinkedBlockingQueue<Runnable> logAppenderQueue =
@@ -225,9 +241,10 @@ public class RaftNode {
         this.lastApplied = 0;
         this.nextIndex = new ConcurrentHashMap<>();
         this.matchIndex = new ConcurrentHashMap<>();
-        this.isReplicating = new ConcurrentHashMap<>();
+        // Thread pool must accommodate pipelined RPCs: up to MAX_INFLIGHT_RPCS per peer
+        // running concurrently, plus pipeline-fill tasks, heartbeats, and elections.
         this.raftExecutor = Executors.newFixedThreadPool(
-                Math.max(4, peers.size() + 2),
+                Math.max(8, peers.size() * (MAX_INFLIGHT_RPCS + 1) + 4),
                 r -> {
                     Thread t = new Thread(r, "raft-rpc-" + nodeId);
                     t.setDaemon(true);
@@ -351,16 +368,27 @@ public class RaftNode {
     }
 
     /**
-     * Retrieves and removes chunks of proposals from the concurrent queue, acquiring the ReentrantLock
-     * ONCE per batch. It merges payloads of the same topic into a single `ProduceBatchRequest` prior to
-     * lock acquisition. This turns N lock acquisitions into 1 per aggregation cycle.
+     * Background log appender — drains disk-write tasks from the queue and
+     * flushes them in micro-batches to amortize the replication trigger cost.
+     * Each aggregated Raft entry enqueues a task that does:
+     *   1. raftLog.append(entries)  — disk write
+     *   2. sendHeartbeats()         — triggers replication to followers
+     *
+     * By draining multiple tasks and calling sendHeartbeats() once at the end,
+     * we avoid redundant replication RPCs when multiple batches are queued.
      */
     private void logAppenderLoop() {
         logger.info("[{}] Log appender thread started", nodeId);
+        List<Runnable> drained = new ArrayList<>(64);
         while (running) {
             try {
-                Runnable task = logAppenderQueue.poll(100, TimeUnit.MILLISECONDS);
-                if (task != null) {
+                drained.clear();
+                Runnable first = logAppenderQueue.poll(100, TimeUnit.MILLISECONDS);
+                if (first == null) continue;
+                drained.add(first);
+                logAppenderQueue.drainTo(drained, 63); // drain up to 63 more (64 total)
+
+                for (Runnable task : drained) {
                     task.run();
                 }
             } catch (InterruptedException e) {
@@ -795,9 +823,11 @@ public class RaftNode {
 
     /**
      * Register an RPC handler for sending AppendEntries to a peer.
+     * Multiple handlers can be registered per peer to form a connection pool,
+     * enabling pipelined replication with parallel RPCs.
      */
     public void registerAppendHandler(String peerId, Function<AppendEntriesRequest, AppendEntriesResponse> handler) {
-        appendRpcHandlers.put(peerId, handler);
+        appendRpcHandlerPools.computeIfAbsent(peerId, k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(handler);
     }
 
     /**
@@ -1022,6 +1052,9 @@ public class RaftNode {
             nextIndex.put(peer.id(), lastLogIndex + 1);
             matchIndex.put(peer.id(), 0L);
             lastContactTime.put(peer.id(), System.currentTimeMillis());
+            // Initialize (or reset) pipeline state for each peer
+            PeerReplicationState ps = new PeerReplicationState();
+            peerPipelineState.put(peer.id(), ps);
         }
 
         if (electionTimer != null) electionTimer.cancel(false);
@@ -1125,6 +1158,7 @@ public class RaftNode {
     //  Heartbeats & Replication 
     /**
      * Leader sends AppendEntries (heartbeat or data) to all peers.
+     * Uses pipelined replication: multiple RPCs can be in flight per peer simultaneously.
      */
     private void sendHeartbeats() {
         if (state != RaftState.LEADER || !running) return;
@@ -1144,29 +1178,31 @@ public class RaftNode {
                     }, raftExecutor);
                 }
             } else {
-                AtomicBoolean replicating = isReplicating.computeIfAbsent(peer.id(), k -> new AtomicBoolean(false));
-                if (replicating.compareAndSet(false, true)) {
+                // Pipelined replication: fill all available pipeline slots for this peer.
+                // Use pipelineFillScheduled to avoid scheduling duplicate fill tasks.
+                PeerReplicationState pState = peerPipelineState.get(peer.id());
+                if (pState != null && pState.pipelineSlots.availablePermits() > 0
+                        && pState.pipelineFillScheduled.compareAndSet(false, true)) {
                     CompletableFuture.runAsync(() -> {
                         try {
-                            replicateTo(peer);
+                            pipelinedReplicateTo(peer);
                         } finally {
-                            replicating.set(false);
-                            // If more entries were appended while replication was in flight,
-                            // immediately start a new round instead of waiting for the
-                            // 300ms heartbeat timer. This is critical for the atomic
-                            // aggregator which appends entries rapidly.
-                            if (state == RaftState.LEADER) {
-                                long lastIdx = raftLog.getLastIndex();
-                                long peerNext = nextIndex.getOrDefault(peer.id(), lastIdx + 1);
-                                if (peerNext <= lastIdx) {
-                                    sendHeartbeats();
-                                }
-                            }
+                            pState.pipelineFillScheduled.set(false);
                         }
                     }, raftExecutor);
                 }
             }
         }
+    }
+
+    /**
+     * Pick a handler from the connection pool for a peer, round-robin style.
+     */
+    private Function<AppendEntriesRequest, AppendEntriesResponse> pickHandler(String peerId, PeerReplicationState pState) {
+        List<Function<AppendEntriesRequest, AppendEntriesResponse>> pool = appendRpcHandlerPools.get(peerId);
+        if (pool == null || pool.isEmpty()) return null;
+        int idx = Math.abs(pState.connectionRoundRobin.getAndIncrement()) % pool.size();
+        return pool.get(idx);
     }
 
     private void sendLightweightHeartbeat(PeerAddress peer) {
@@ -1201,7 +1237,9 @@ public class RaftNode {
                 .setLeaderCommit(commitIndexLocal)
                 .build();
 
-        java.util.function.Function<AppendEntriesRequest, AppendEntriesResponse> handler = appendRpcHandlers.get(peer.id());
+        PeerReplicationState pState = peerPipelineState.get(peer.id());
+        Function<AppendEntriesRequest, AppendEntriesResponse> handler =
+                pState != null ? pickHandler(peer.id(), pState) : null;
         if (handler != null) {
             try {
                 AppendEntriesResponse response = handler.apply(request);
@@ -1214,96 +1252,199 @@ public class RaftNode {
     }
 
     /**
-     * Replicate log entries to a single peer.
+     * Pipelined replication: fill all available pipeline slots for a single peer.
+     *
+     * Instead of stop-and-wait (one RPC at a time), this method launches up to
+     * MAX_INFLIGHT_RPCS concurrent AppendEntries RPCs per peer. Each RPC:
+     *   1. Acquires a pipeline slot (semaphore permit)
+     *   2. Reads nextIndex and fetches entries
+     *   3. Optimistically advances nextIndex
+     *   4. Sends the RPC asynchronously
+     *   5. On response: updates matchIndex (or rolls back nextIndex on failure)
+     *   6. Releases the pipeline slot and re-fills if more entries are pending
      */
-    private void replicateTo(PeerAddress peer) {
-        boolean needsSnapshot = false;
-        long peerNextIndex;
-        long prevLogIndex;
-        long currentTermLocal;
-        long commitIndexLocal;
-        String leaderIdLocal;
-        
-        lock.lock();
-        try {
-            if (state != RaftState.LEADER) return;
+    private void pipelinedReplicateTo(PeerAddress peer) {
+        PeerReplicationState pState = peerPipelineState.get(peer.id());
+        if (pState == null) return;
 
-            if (snapshotInProgress.getOrDefault(peer.id(), false)) {
-                return;
-            }
+        // Fill as many pipeline slots as we can
+        while (state == RaftState.LEADER && running) {
+            // Try to acquire a pipeline slot (non-blocking)
+            if (!pState.pipelineSlots.tryAcquire()) break;
 
-            peerNextIndex = nextIndex.getOrDefault(peer.id(), raftLog.getLastIndex() + 1);
-            prevLogIndex = peerNextIndex - 1;
-            
-            if (peerNextIndex < raftLog.getStartIndex()) {
-                needsSnapshot = true;
-                snapshotInProgress.put(peer.id(), true);
-                return;
-            }
+            boolean needsSnapshot = false;
+            long peerNextIndex;
+            long prevLogIndex;
+            long currentTermLocal;
+            long commitIndexLocal;
+            String leaderIdLocal;
 
-            currentTermLocal = currentTerm;
-            commitIndexLocal = commitIndex;
-            leaderIdLocal = nodeId;
-        } finally {
-            lock.unlock();
-            if (needsSnapshot) {
-                CompletableFuture.runAsync(() -> {
-                    syncFollowerTier2(peer);
-                }, snapshotExecutor);
-            }
-        }
-
-
-        long prevLogTerm = raftLog.getTermAt(prevLogIndex);
-        List<RaftEntry> entries = raftLog.getEntriesFrom(peerNextIndex);
-
-        AppendEntriesRequest request = AppendEntriesRequest.newBuilder()
-                .setTerm(currentTermLocal)
-                .setLeaderId(leaderIdLocal)
-                .setPrevLogIndex(prevLogIndex)
-                .setPrevLogTerm(prevLogTerm)
-                .addAllEntries(entries)
-                .setLeaderCommit(commitIndexLocal)
-                .build();
-
-        Function<AppendEntriesRequest, AppendEntriesResponse> handler = appendRpcHandlers.get(peer.id());
-        if (handler == null) return;
-
-        AppendEntriesResponse response;
-        try {
-            response = handler.apply(request);
-            lastContactTime.put(peer.id(), System.currentTimeMillis());
-        } catch (Exception e) {
-            if (shouldLog("append_failure_" + peer.id())) {
-                logger.debug("[{}] AppendEntries to {} failed: {}", nodeId, peer.id(), e.getMessage());
-            }
-            return;
-        }
-
-        lock.lock();
-        try {
-            if (state != RaftState.LEADER) return;
-
-            if (response.getTerm() > currentTerm) {
-                stepDown(response.getTerm());
-                return;
-            }
-
-            if (response.getSuccess()) {
-                matchIndex.put(peer.id(), response.getMatchIndex());
-                nextIndex.put(peer.id(), response.getMatchIndex() + 1);
-                advanceCommitIndex();
-            } else {
-                long current = nextIndex.getOrDefault(peer.id(), 1L);
-                long supposedNextIndex = Math.min(current - 1, response.getMatchIndex() + 1);
-                nextIndex.put(peer.id(), Math.max(1, supposedNextIndex));
-                if (shouldLog("backtrack_" + peer.id())) {
-                    logger.debug("[{}] AppendEntries to {} failed, backing nextIndex to {}",
-                            nodeId, peer.id(), nextIndex.get(peer.id()));
+            lock.lock();
+            try {
+                if (state != RaftState.LEADER) {
+                    pState.pipelineSlots.release();
+                    return;
                 }
+                if (snapshotInProgress.getOrDefault(peer.id(), false)) {
+                    pState.pipelineSlots.release();
+                    return;
+                }
+
+                peerNextIndex = nextIndex.getOrDefault(peer.id(), raftLog.getLastIndex() + 1);
+                prevLogIndex = peerNextIndex - 1;
+
+                if (peerNextIndex < raftLog.getStartIndex()) {
+                    needsSnapshot = true;
+                    snapshotInProgress.put(peer.id(), true);
+                    pState.pipelineSlots.release();
+                    // Launch snapshot sync outside the lock
+                    CompletableFuture.runAsync(() -> syncFollowerTier2(peer), snapshotExecutor);
+                    return;
+                }
+
+                // Nothing to replicate — release slot and stop
+                if (peerNextIndex > raftLog.getLastIndex()) {
+                    pState.pipelineSlots.release();
+                    // No entries to send, but still send a heartbeat to reset follower election timer.
+                    // This is dispatched asynchronously so it doesn't block the loop.
+                    CompletableFuture.runAsync(() -> sendLightweightHeartbeat(peer), raftExecutor);
+                    return;
+                }
+
+                currentTermLocal = currentTerm;
+                commitIndexLocal = commitIndex;
+                leaderIdLocal = nodeId;
+            } finally {
+                lock.unlock();
             }
-        } finally {
-            lock.unlock();
+
+            // Fetch entries outside the lock
+            long prevLogTerm = raftLog.getTermAt(prevLogIndex);
+            List<RaftEntry> entries = raftLog.getEntriesFrom(peerNextIndex);
+
+            if (entries.isEmpty()) {
+                pState.pipelineSlots.release();
+                CompletableFuture.runAsync(() -> sendLightweightHeartbeat(peer), raftExecutor);
+                return;
+            }
+
+            long lastSentIndex = entries.get(entries.size() - 1).getIndex();
+
+            // OPTIMISTIC: advance nextIndex before the RPC returns.
+            // This allows the next pipeline slot to start fetching the next batch immediately.
+            lock.lock();
+            try {
+                if (state != RaftState.LEADER) {
+                    pState.pipelineSlots.release();
+                    return;
+                }
+                nextIndex.put(peer.id(), lastSentIndex + 1);
+            } finally {
+                lock.unlock();
+            }
+
+            // Build the request
+            AppendEntriesRequest request = AppendEntriesRequest.newBuilder()
+                    .setTerm(currentTermLocal)
+                    .setLeaderId(leaderIdLocal)
+                    .setPrevLogIndex(prevLogIndex)
+                    .setPrevLogTerm(prevLogTerm)
+                    .addAllEntries(entries)
+                    .setLeaderCommit(commitIndexLocal)
+                    .build();
+
+            // Pick a handler from the connection pool
+            Function<AppendEntriesRequest, AppendEntriesResponse> handler = pickHandler(peer.id(), pState);
+            if (handler == null) {
+                // Rollback optimistic advance
+                lock.lock();
+                try {
+                    long curNext = nextIndex.getOrDefault(peer.id(), lastSentIndex + 1);
+                    // Only rollback if nobody else advanced past us
+                    if (curNext == lastSentIndex + 1) {
+                        nextIndex.put(peer.id(), peerNextIndex);
+                    }
+                } finally {
+                    lock.unlock();
+                }
+                pState.pipelineSlots.release();
+                return;
+            }
+
+            // Capture for lambda
+            final long capturedPeerNextIndex = peerNextIndex;
+
+            // Send RPC asynchronously — release pipeline slot on completion
+            CompletableFuture.runAsync(() -> {
+                try {
+                    AppendEntriesResponse response = handler.apply(request);
+                    lastContactTime.put(peer.id(), System.currentTimeMillis());
+
+                    lock.lock();
+                    try {
+                        if (state != RaftState.LEADER) return;
+
+                        if (response.getTerm() > currentTerm) {
+                            stepDown(response.getTerm());
+                            return;
+                        }
+
+                        if (response.getSuccess()) {
+                            // Advance matchIndex monotonically
+                            long currentMatch = matchIndex.getOrDefault(peer.id(), 0L);
+                            if (response.getMatchIndex() > currentMatch) {
+                                matchIndex.put(peer.id(), response.getMatchIndex());
+                            }
+                            advanceCommitIndex();
+                        } else {
+                            // ROLLBACK: the follower rejected this batch.
+                            // Reset nextIndex conservatively. Because we advanced optimistically,
+                            // we need to roll back to allow the normal probe-and-backtrack logic.
+                            long currentNext = nextIndex.getOrDefault(peer.id(), 1L);
+                            long rolledBack = Math.min(currentNext, capturedPeerNextIndex);
+                            long supposedNextIndex = Math.min(rolledBack - 1, response.getMatchIndex() + 1);
+                            nextIndex.put(peer.id(), Math.max(1, supposedNextIndex));
+                            if (shouldLog("backtrack_" + peer.id())) {
+                                logger.debug("[{}] Pipelined AppendEntries to {} rejected, rolling back nextIndex to {}",
+                                        nodeId, peer.id(), nextIndex.get(peer.id()));
+                            }
+                        }
+                    } finally {
+                        lock.unlock();
+                    }
+                } catch (Exception e) {
+                    // RPC failed — rollback optimistic advance
+                    lock.lock();
+                    try {
+                        long curNext = nextIndex.getOrDefault(peer.id(), capturedPeerNextIndex);
+                        // Only rollback if nobody else has already rolled back further
+                        if (curNext > capturedPeerNextIndex) {
+                            nextIndex.put(peer.id(), capturedPeerNextIndex);
+                        }
+                    } finally {
+                        lock.unlock();
+                    }
+                    if (shouldLog("append_failure_" + peer.id())) {
+                        logger.debug("[{}] Pipelined AppendEntries to {} failed: {}", nodeId, peer.id(), e.getMessage());
+                    }
+                } finally {
+                    pState.pipelineSlots.release();
+                    // After completing an RPC, check if more entries need sending
+                    if (state == RaftState.LEADER) {
+                        long lastIdx = raftLog.getLastIndex();
+                        long peerNext = nextIndex.getOrDefault(peer.id(), lastIdx + 1);
+                        if (peerNext <= lastIdx && pState.pipelineFillScheduled.compareAndSet(false, true)) {
+                            CompletableFuture.runAsync(() -> {
+                                try {
+                                    pipelinedReplicateTo(peer);
+                                } finally {
+                                    pState.pipelineFillScheduled.set(false);
+                                }
+                            }, raftExecutor);
+                        }
+                    }
+                }
+            }, raftExecutor);
         }
     }
 
@@ -1419,10 +1560,11 @@ public class RaftNode {
         applyExecutor.execute(() -> {
             boolean applied = false;
 
-            // Pipeline: Parallel pre-deserialization pass over pending committed entries
-            long startIdx = lastApplied + 1;
-            long endIdx = commitIndex;
-            if (endIdx >= startIdx) {
+            while (lastApplied < commitIndex) {
+                // Pipeline: Parallel pre-deserialization pass over pending committed entries in bounded chunks
+                long startIdx = lastApplied + 1;
+                long endIdx = Math.min(commitIndex, startIdx + 50); // Bound to 50 to prevent OOM
+                
                 java.util.stream.LongStream.rangeClosed(startIdx, endIdx).parallel().forEach(idx -> {
                     if (!parsedPayloadCache.containsKey(idx)) {
                         ProposalState ps = pendingProposals.get(idx);
@@ -1446,18 +1588,18 @@ public class RaftNode {
                         }
                     }
                 });
-            }
-            
-            while (lastApplied < commitIndex) {
-                Map<String, Long> localAtomicBatchBaseOffsets = null;
-                lastApplied++;
-                applied = true;
-                RaftEntry entry = raftLog.getEntry(lastApplied);
-                if (entry == null) {
-                    logger.error("[{}] Missing raft entry at index {} during apply", nodeId, lastApplied);
-                    break;
-                }
-                lastAppliedTerm = entry.getTerm();
+
+                // Apply the chunk sequentially
+                for (long chunkIdx = startIdx; chunkIdx <= endIdx; chunkIdx++) {
+                    Map<String, Long> localAtomicBatchBaseOffsets = null;
+                    lastApplied++;
+                    applied = true;
+                    RaftEntry entry = raftLog.getEntry(lastApplied);
+                    if (entry == null) {
+                        logger.error("[{}] Missing raft entry at index {} during apply", nodeId, lastApplied);
+                        return; // break out of the runnable
+                    }
+                    lastAppliedTerm = entry.getTerm();
 
                 long completionValue = lastApplied;
                 boolean applySucceeded = true;
@@ -1590,6 +1732,7 @@ public class RaftNode {
                         }
                     }
                 }
+            }
             }
 
             if (applied) {

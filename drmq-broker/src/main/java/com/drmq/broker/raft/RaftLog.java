@@ -387,7 +387,9 @@ public class RaftLog {
         while (true) {
             int currentSize;
             int addedCount;
-            byte[] addedData = null;
+            long startReadPos;
+            long currentLogicalFileSize;
+            java.nio.MappedByteBuffer readerBuffer;
 
             synchronized(this) {
                 if (entries.size() < initialSize) {
@@ -426,27 +428,25 @@ public class RaftLog {
                     return;
                 }
 
-                int dataLengthToRead = (int) (logicalFileSize - filePositions.get(initialSize));
-                addedData = new byte[dataLengthToRead];
-                int originalPos = mappedBuffer.position();
-                mappedBuffer.position((int) (long) filePositions.get(initialSize));
-                mappedBuffer.get(addedData);
-                mappedBuffer.position(originalPos);
+                startReadPos = filePositions.get(initialSize);
+                currentLogicalFileSize = logicalFileSize;
+                readerBuffer = (java.nio.MappedByteBuffer) mappedBuffer.duplicate();
             }
 
             try (FileChannel tempChannel = FileChannel.open(tempFile.toPath(), StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
-                long mapSize = Math.max(newLogicalFileSize + addedData.length, INITIAL_MAPPED_SIZE);
+                long dataLengthToRead = currentLogicalFileSize - startReadPos;
+                long mapSize = Math.max(newLogicalFileSize + dataLengthToRead, INITIAL_MAPPED_SIZE);
                 MappedByteBuffer tempMapped = tempChannel.map(FileChannel.MapMode.READ_WRITE, 0, mapSize);
                 tempMapped.position((int) newLogicalFileSize);
 
-                java.nio.ByteBuffer addedBuf = java.nio.ByteBuffer.wrap(addedData);
+                readerBuffer.position((int) startReadPos);
                 for (int i = 0; i < addedCount; i++) {
                     newPositions.add((long) tempMapped.position());
-                    int length = addedBuf.getInt();
+                    int length = readerBuffer.getInt();
                     tempMapped.putInt(length);
 
                     byte[] data = new byte[length];
-                    addedBuf.get(data);
+                    readerBuffer.get(data);
                     tempMapped.put(data);
                 }
 

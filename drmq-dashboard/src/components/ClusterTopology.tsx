@@ -121,18 +121,32 @@ function DataParticle({ path, color, delay, duration, reverse }: any) {
 }
 
 /* ── Connection ──────────────────────────────────────────────────────── */
-function Connection({ x1, y1, x2, y2, produceRate, consumeRate, latencyMs }: any) {
+/**
+ * replicationDirection controls the flow of replication particles:
+ *   'forward'  = particles travel from (x1,y1) → (x2,y2)  (default)
+ *   'reverse'  = particles travel from (x2,y2) → (x1,y1)
+ *   'none'     = no replication particles shown (follower↔follower link)
+ */
+function Connection({ x1, y1, x2, y2, produceRate, consumeRate, latencyMs,
+  replicationDirection = 'forward' }: any) {
   const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
   const dx = x2 - x1, dy = y2 - y1;
   const len = Math.sqrt(dx * dx + dy * dy);
   const nx = -dy / len, ny = dx / len;
   const cx = mx + nx * 30, cy = my + ny * 30;
-  const path = `M ${x1} ${y1} Q ${cx} ${cy} ${x2} ${y2}`;
+  // Visual path is always drawn x1→x2 for the line itself
+  const displayPath = `M ${x1} ${y1} Q ${cx} ${cy} ${x2} ${y2}`;
+  // Replication particle path: if direction is 'reverse', swap endpoints
+  // so particles visually travel from x2→x1 (i.e. from the leader end)
+  const rcx = mx - nx * 30, rcy = my - ny * 30; // mirror control point
+  const replicationPath = replicationDirection === 'reverse'
+    ? `M ${x2} ${y2} Q ${rcx} ${rcy} ${x1} ${y1}`
+    : displayPath;
 
   return (
     <g>
-      <path d={path} fill="none" stroke="url(#connection-grad)" strokeWidth="1" opacity="0.2" />
-      <path d={path} fill="none" stroke="url(#connection-grad)" strokeWidth="1"
+      <path d={displayPath} fill="none" stroke="url(#connection-grad)" strokeWidth="1" opacity="0.2" />
+      <path d={displayPath} fill="none" stroke="url(#connection-grad)" strokeWidth="1"
         strokeDasharray="3 8" opacity="0.15" />
 
       {/* Latency label on edge */}
@@ -145,14 +159,14 @@ function Connection({ x1, y1, x2, y2, produceRate, consumeRate, latencyMs }: any
         </g>
       )}
 
-      {produceRate > 0 && (
+      {produceRate > 0 && replicationDirection !== 'none' && (
         <>
-          <DataParticle path={path} color="#06b6d4" delay={0} duration={2.5} />
-          <DataParticle path={path} color="#06b6d4" delay={1.2} duration={2.5} />
+          <DataParticle path={replicationPath} color="#06b6d4" delay={0} duration={2.5} />
+          <DataParticle path={replicationPath} color="#06b6d4" delay={1.2} duration={2.5} />
         </>
       )}
-      {consumeRate > 0 && (
-        <DataParticle path={path} color="#a855f7" delay={0.6} duration={2.8} reverse />
+      {consumeRate > 0 && replicationDirection !== 'none' && (
+        <DataParticle path={replicationPath} color="#a855f7" delay={0.6} duration={2.8} reverse />
       )}
     </g>
   );
@@ -381,25 +395,48 @@ export default function ClusterTopology({ nodes, metrics, latencies }: any) {
 
         {/* Dynamic connections */}
         {(() => {
-          const isDead = (n: any) => n?.status === 'OFFLINE' || (n?.replicationLag !== undefined && (n.replicationLag < 0 || n.replicationLag > 10));
-          const shouldBlock = (na: any, nb: any) => isDead(na) || isDead(nb);
+          // A node is truly dead only if OFFLINE or explicitly unreachable (lag=-1)
+          const isDead = (n: any) => !n || n.status === 'OFFLINE' || (n.replicationLag !== undefined && n.replicationLag < 0);
+
+          /**
+           * Determine replication direction for a connection between two nodes.
+           * Replication flows LEADER → FOLLOWER. If neither node is the leader,
+           * no replication particles are shown (follower↔follower link).
+           *
+           * Returns:
+           *   'forward'  – n_a is leader, particles flow x1→x2
+           *   'reverse'  – n_b is leader, particles flow x2→x1
+           *   'none'     – neither is leader, no replication particles
+           */
+          const getReplicationDirection = (na: any, nb: any): 'forward' | 'reverse' | 'none' => {
+            if (isDead(na) || isDead(nb)) return 'none';
+            if (na?.status === 'LEADER') return 'forward';
+            if (nb?.status === 'LEADER') return 'reverse';
+            return 'none'; // follower ↔ follower
+          };
+
+          const hasActiveLeader = (na: any, nb: any) =>
+            (na?.status === 'LEADER' || nb?.status === 'LEADER') && !isDead(na) && !isDead(nb);
 
           return (
             <>
               {n1 && n2 && <Connection x1={positions[0].x} y1={positions[0].y}
                 x2={positions[1].x} y2={positions[1].y}
-                produceRate={shouldBlock(n1, n2) ? 0 : metrics?.produceRate || 0}
-                consumeRate={shouldBlock(n1, n2) ? 0 : metrics?.consumeRate || 0}
+                produceRate={hasActiveLeader(n1, n2) ? metrics?.produceRate || 0 : 0}
+                consumeRate={hasActiveLeader(n1, n2) ? metrics?.consumeRate || 0 : 0}
+                replicationDirection={getReplicationDirection(n1, n2)}
                 latencyMs={latencyValues[0]} />}
               {n2 && n3 && <Connection x1={positions[1].x} y1={positions[1].y}
                 x2={positions[2].x} y2={positions[2].y}
-                produceRate={shouldBlock(n2, n3) ? 0 : metrics?.produceRate || 0}
-                consumeRate={shouldBlock(n2, n3) ? 0 : metrics?.consumeRate || 0}
+                produceRate={hasActiveLeader(n2, n3) ? metrics?.produceRate || 0 : 0}
+                consumeRate={hasActiveLeader(n2, n3) ? metrics?.consumeRate || 0 : 0}
+                replicationDirection={getReplicationDirection(n2, n3)}
                 latencyMs={latencyValues[1]} />}
               {n1 && n3 && <Connection x1={positions[0].x} y1={positions[0].y}
                 x2={positions[2].x} y2={positions[2].y}
-                produceRate={shouldBlock(n1, n3) ? 0 : metrics?.produceRate || 0}
-                consumeRate={shouldBlock(n1, n3) ? 0 : metrics?.consumeRate || 0}
+                produceRate={hasActiveLeader(n1, n3) ? metrics?.produceRate || 0 : 0}
+                consumeRate={hasActiveLeader(n1, n3) ? metrics?.consumeRate || 0 : 0}
+                replicationDirection={getReplicationDirection(n1, n3)}
                 latencyMs={latencyValues[2]} />}
             </>
           );

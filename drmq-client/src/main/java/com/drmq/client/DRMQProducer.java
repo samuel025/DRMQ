@@ -226,24 +226,53 @@ public class DRMQProducer implements AutoCloseable {
                 
                 if (firstMsg == null) continue;
 
-                List<PendingMessage> currentBatch = new ArrayList<>();
+                List<PendingMessage> currentBatch = new ArrayList<>(1024);
                 currentBatch.add(firstMsg);
                 int currentBytes = firstMsg.payload.length;
-                long firstMsgTime = System.currentTimeMillis();
                 String currentTopic = firstMsg.topic;
 
-                while (currentBytes < batchSizeBytes) {
-                    long remaining = lingerMs - (System.currentTimeMillis() - firstMsgTime);
-                    if (remaining <= 0) break;
-
-                    PendingMessage msg = accumulator.poll(remaining, TimeUnit.MILLISECONDS);
-                    if (msg == null) break;
-                    if (!currentTopic.equals(msg.topic)) {
-                        leftoverMsg = msg;
-                        break;
+                // Fast path: bulk-drain whatever is already in the accumulator
+                if (currentBytes < batchSizeBytes) {
+                    List<PendingMessage> bulk = new ArrayList<>(1024);
+                    accumulator.drainTo(bulk, 1024);
+                    for (PendingMessage msg : bulk) {
+                        if (!currentTopic.equals(msg.topic)) {
+                            leftoverMsg = msg;
+                            // Put remaining back (different topic or overflow)
+                            for (int ri = bulk.indexOf(msg) + 1; ri < bulk.size(); ri++) {
+                                accumulator.offer(bulk.get(ri));
+                            }
+                            break;
+                        }
+                        currentBatch.add(msg);
+                        currentBytes += msg.payload.length;
+                        if (currentBytes >= batchSizeBytes) {
+                            // Put remaining back
+                            for (int ri = bulk.indexOf(msg) + 1; ri < bulk.size(); ri++) {
+                                accumulator.offer(bulk.get(ri));
+                            }
+                            break;
+                        }
                     }
-                    currentBatch.add(msg);
-                    currentBytes += msg.payload.length;
+                }
+
+                // Slow path: if batch is still small after drain, linger-wait for more
+                if (currentBytes < batchSizeBytes && leftoverMsg == null) {
+                    long firstMsgTime = System.currentTimeMillis();
+                    while (currentBytes < batchSizeBytes) {
+                        long remaining = lingerMs - (System.currentTimeMillis() - firstMsgTime);
+                        if (remaining <= 0) break;
+
+                        PendingMessage msg = accumulator.poll(remaining, TimeUnit.MILLISECONDS);
+                        if (msg == null) break;
+                        if (!currentTopic.equals(msg.topic)) {
+                            leftoverMsg = msg;
+                            break;
+                        }
+                        currentBatch.add(msg);
+                        currentBytes += msg.payload.length;
+                        if (currentBytes >= batchSizeBytes) break;
+                    }
                 }
 
                 if (!currentBatch.isEmpty()) {
