@@ -49,8 +49,6 @@ public class InfinityLogResolver {
                 .prefix(prefix)
                 .build();
                 
-            ListObjectsV2Response listRes = s3Client.listObjectsV2(listReq);
-            
             long bestBaseOffset = -1;
             String bestKey = null;
 
@@ -78,10 +76,10 @@ public class InfinityLogResolver {
                     }
                 }
                 
-                if (done || !listRes.isTruncated()) {
+                if (done || !listResp.isTruncated()) {
                     break;
                 }
-                listReq = listReq.toBuilder().continuationToken(listRes.nextContinuationToken()).build();
+                listReq = listReq.toBuilder().continuationToken(listResp.nextContinuationToken()).build();
             }
 
             if (bestKey != null) {

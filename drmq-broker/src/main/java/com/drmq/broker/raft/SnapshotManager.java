@@ -60,6 +60,7 @@ public class SnapshotManager {
                     .setLeaderId(nodeId)
                     .setLastIncludedIndex(snapshotIndex)
                     .setLastIncludedTerm(snapshotTerm)
+                    .putAllOffsetManagerState(offsetManager != null ? offsetManager.getAllOffsets() : java.util.Collections.emptyMap())
                     .build();
 
             com.drmq.protocol.IncrementalSnapshotDoneResponse doneResp = doneHandler.apply(doneReq);

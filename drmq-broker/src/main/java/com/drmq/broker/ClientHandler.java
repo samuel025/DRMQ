@@ -61,32 +61,53 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, io.netty.buffer.ByteBuf msg) throws Exception {
-        java.nio.ByteBuffer nioBuffer = msg.nioBuffer();
-        com.google.protobuf.CodedInputStream input = com.google.protobuf.CodedInputStream.newInstance(nioBuffer);
-        MessageEnvelope envelope = MessageEnvelope.parseFrom(input);
-        long correlationId = envelope.getCorrelationId();
-        
-        handleMessage(envelope).thenAccept(response -> {
-            // Echo the correlation_id so the client can match pipelined responses
-            MessageEnvelope tagged = correlationId != 0
-                    ? response.toBuilder().setCorrelationId(correlationId).build()
-                    : response;
-            int size = tagged.getSerializedSize();
+        try {
+            java.nio.ByteBuffer nioBuffer = msg.nioBuffer();
+            com.google.protobuf.CodedInputStream input = com.google.protobuf.CodedInputStream.newInstance(nioBuffer);
+            MessageEnvelope envelope = MessageEnvelope.parseFrom(input);
+            long correlationId = envelope.getCorrelationId();
+            
+            handleMessage(envelope).thenAccept(response -> {
+                // Echo the correlation_id so the client can match pipelined responses
+                MessageEnvelope tagged = correlationId != 0
+                        ? response.toBuilder().setCorrelationId(correlationId).build()
+                        : response;
+                int size = tagged.getSerializedSize();
+                io.netty.buffer.ByteBuf outBuf = ctx.alloc().directBuffer(size);
+                try {
+                    com.google.protobuf.CodedOutputStream output = com.google.protobuf.CodedOutputStream.newInstance(outBuf.nioBuffer(0, size));
+                    tagged.writeTo(output);
+                    output.flush();
+                    outBuf.writerIndex(size);
+                    ctx.writeAndFlush(outBuf);
+                } catch (Exception e) {
+                    outBuf.release();
+                    logger.error("Failed to serialize response", e);
+                }
+            }).exceptionally(e -> {
+                logger.error("Unhandled error processing request", e);
+                return null;
+            });
+        } catch (Exception e) {
+            logger.error("Uncaught exception in channelRead0", e);
+            MessageEnvelope errorEnv = createErrorResponse("Server error: " + e.getMessage());
+            int size = errorEnv.getSerializedSize();
             io.netty.buffer.ByteBuf outBuf = ctx.alloc().directBuffer(size);
             try {
                 com.google.protobuf.CodedOutputStream output = com.google.protobuf.CodedOutputStream.newInstance(outBuf.nioBuffer(0, size));
-                tagged.writeTo(output);
+                errorEnv.writeTo(output);
                 output.flush();
                 outBuf.writerIndex(size);
                 ctx.writeAndFlush(outBuf);
-            } catch (Exception e) {
+            } catch (Exception ex) {
                 outBuf.release();
-                logger.error("Failed to serialize response", e);
+                logger.error("Failed to serialize error response", ex);
             }
-        }).exceptionally(e -> {
-            logger.error("Unhandled error processing request", e);
-            return null;
-        });
+        }
+    }
+
+    private boolean isValidTopic(String topic) {
+        return topic != null && topic.matches("^[a-zA-Z0-9._-]+$");
     }
 
     @Override
@@ -125,8 +146,16 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
             ProduceRequest request = ProduceRequest.parseFrom(envelope.getPayload());
 
             String topic = request.getTopic();
+            if (!isValidTopic(topic)) {
+                return java.util.concurrent.CompletableFuture.completedFuture(createProduceErrorResponse("Invalid topic name", ErrorCode.UNKNOWN_ERROR));
+            }
             com.google.protobuf.ByteString payload = request.getPayload();
             long finalPayloadBytes = payload.size();
+            
+            if (finalPayloadBytes > MAX_PAYLOAD_BYTES) {
+                return java.util.concurrent.CompletableFuture.completedFuture(createProduceErrorResponse("Payload exceeds maximum size of " + MAX_PAYLOAD_BYTES + " bytes", ErrorCode.UNKNOWN_ERROR));
+            }
+            
             String key = request.hasKey() ? request.getKey() : null;
             long timestamp = request.getTimestamp();
 
@@ -180,6 +209,9 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
             ProduceBatchRequest request = ProduceBatchRequest.parseFrom(envelope.getPayload());
 
             String topic = request.getTopic();
+            if (!isValidTopic(topic)) {
+                return java.util.concurrent.CompletableFuture.completedFuture(createProduceBatchErrorResponse("Invalid topic name", ErrorCode.UNKNOWN_ERROR));
+            }
             count = request.getEntriesCount();
             final int finalBatchCount = count;
 

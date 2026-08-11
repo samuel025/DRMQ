@@ -120,6 +120,18 @@ public class OffsetManager implements Closeable {
         }
     }
 
+    public void applySnapshot(Map<String, Long> state) throws IOException {
+        persistLock.lock();
+        try {
+            offsets.clear();
+            offsets.putAll(state);
+            persist();
+            isDirty.set(false);
+        } finally {
+            persistLock.unlock();
+        }
+    }
+
     private void backgroundPersist() {
         if (!isDirty.getAndSet(false)) return;
 
@@ -157,6 +169,7 @@ public class OffsetManager implements Closeable {
         Properties props = new Properties();
         offsets.forEach((k, v) -> props.setProperty(k, String.valueOf(v)));
 
+        Files.createDirectories(offsetsFile.getParent());
         Path tmp = offsetsFile.resolveSibling(OFFSETS_FILE + ".tmp");
         try (OutputStream out = Files.newOutputStream(tmp,
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {

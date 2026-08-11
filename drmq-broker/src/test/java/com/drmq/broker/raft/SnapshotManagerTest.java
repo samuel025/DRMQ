@@ -47,9 +47,7 @@ class SnapshotManagerTest {
         messageStore.append("test-topic", "dummy-message-data".getBytes(), null, System.currentTimeMillis());
         Path topicDir = tempDir.resolve("test-topic");
 
-        Path offsetsDir = tempDir.resolve("__consumer_offsets");
-        Files.createDirectories(offsetsDir);
-        Files.writeString(offsetsDir.resolve("offsets.properties"), "mygroup-mytopic-0=100");
+        offsetManager.commit("mygroup", "test-topic", 100L);
         
         java.util.Map<String, Long> followerOffsets = new java.util.HashMap<>();
         followerOffsets.put("test-topic", 0L); // Follower is at offset 0
@@ -69,6 +67,8 @@ class SnapshotManagerTest {
         java.util.function.Function<IncrementalSnapshotDoneRequest, IncrementalSnapshotDoneResponse> doneHandler = req -> {
             doneCalled.set(true);
             assertEquals(42L, req.getLastIncludedIndex());
+            assertTrue(req.getOffsetManagerStateMap().containsKey("mygroup/test-topic"));
+            assertEquals(100L, req.getOffsetManagerStateMap().get("mygroup/test-topic"));
             return IncrementalSnapshotDoneResponse.newBuilder().setSuccess(true).build();
         };
 

@@ -2310,7 +2310,7 @@ public class RaftNode {
                     try {
                         messageStore.reload();
                         if (offsetManager != null) {
-                            offsetManager.reload();
+                            offsetManager.applySnapshot(request.getOffsetManagerStateMap());
                         }
                         logger.info("[{}] Successfully applied Tier 2 sync. lastApplied={}, commitIndex={}",
                                 nodeId, snapshotIndex, commitIndex);

@@ -207,11 +207,24 @@ public class ConsumerGroupCoordinator implements Closeable {
         }
 
         if (current > state.committedOffset) {
-            state.committedOffset = current;
-            offsetManager.commit(group, topic, current);
-            logger.debug("Advanced committed offset to {} for group={}, topic={}", current, group, topic);
+            final long targetOffset = current;
             if (raftNode != null && raftNode.isLeader()) {
-                return raftNode.proposeOffsetCommitAsync(group, topic, current).thenApply(idx -> null);
+                // Issue 1.1: Submit to Raft first, then update local RAM state in callback.
+                return raftNode.proposeOffsetCommitAsync(group, topic, targetOffset).thenApply(idx -> {
+                    state.committedOffset = targetOffset;
+                    // Note: offsetManager.commit is handled by RaftNode's applyCommitted!
+                    logger.debug("Advanced committed offset to {} for group={}, topic={} via Raft", targetOffset, group, topic);
+                    return null;
+                });
+            } else if (raftNode != null) {
+                // Not leader anymore, fail the commit
+                return java.util.concurrent.CompletableFuture.failedFuture(new RuntimeException("NOT_LEADER:" + (raftNode.getLeaderAddress() != null ? raftNode.getLeaderAddress() : "UNKNOWN")));
+            } else {
+                // Standalone mode
+                state.committedOffset = targetOffset;
+                offsetManager.commit(group, topic, targetOffset);
+                logger.debug("Advanced committed offset to {} for group={}, topic={} (Standalone)", targetOffset, group, topic);
+                return java.util.concurrent.CompletableFuture.completedFuture(null);
             }
         }
         return java.util.concurrent.CompletableFuture.completedFuture(null);
@@ -359,6 +372,13 @@ public class ConsumerGroupCoordinator implements Closeable {
      */
     private void routeToDlq(GroupTopicState state, String group, String topic, long badOffset) {
         String dlqTopic = dlqTopicPrefix + group + "." + topic;
+        
+        // Issue 1.3: Synchronously advance dispatchOffset so no one else picks it up while routing
+        long nextOffset = badOffset + 1;
+        if (state.dispatchOffset <= badOffset) {
+            state.dispatchOffset = nextOffset;
+        }
+
         java.util.concurrent.CompletableFuture.runAsync(() -> {
             try {
                 List<StoredMessage> messages = messageStore.getMessages(topic, badOffset, 1);
@@ -367,31 +387,53 @@ public class ConsumerGroupCoordinator implements Closeable {
                     com.google.protobuf.ByteString payload = original.getPayload();
                     String key = original.hasKey() ? original.getKey() : null;
 
+                    java.util.concurrent.CompletableFuture<Long> produceFuture;
                     if (raftNode != null && raftNode.isLeader()) {
-                        raftNode.propose(dlqTopic, payload, key, original.getTimestamp());
+                        produceFuture = raftNode.proposeAsync(dlqTopic, payload, key, original.getTimestamp());
+                    } else if (raftNode != null) {
+                        logger.error("Failed to route poison message to DLQ: Not Leader");
+                        produceFuture = java.util.concurrent.CompletableFuture.failedFuture(new RuntimeException("NOT_LEADER"));
                     } else {
-                        messageStore.append(dlqTopic, payload, key, original.getTimestamp());
+                        produceFuture = java.util.concurrent.CompletableFuture.completedFuture(
+                            messageStore.append(dlqTopic, payload, key, original.getTimestamp())
+                        );
                     }
 
-                    logger.warn("Routed poison message to DLQ: offset={} from topic={} -> {}",
-                            badOffset, topic, dlqTopic);
+                    produceFuture.whenComplete((offset, ex) -> {
+                        if (ex == null) {
+                            logger.warn("Routed poison message to DLQ: offset={} from topic={} -> {}",
+                                    badOffset, topic, dlqTopic);
+                            
+                            // Issue 1.3: Only advance the offset after the DLQ append is durably committed
+                            state.lock.lock();
+                            try {
+                                state.committedRanges.add(new CommittedRange(badOffset, nextOffset));
+                                advanceCommittedOffset(state, group, topic);
+                                state.deliveryCounts.remove(badOffset);
+                            } finally {
+                                state.lock.unlock();
+                            }
+                        } else {
+                            logger.error("Failed to route poison message to DLQ: topic={}, offset={}", topic, badOffset, ex);
+                            // On failure, rewind dispatchOffset so it gets redelivered and retried
+                            state.lock.lock();
+                            try {
+                                if (state.dispatchOffset == nextOffset) {
+                                    state.dispatchOffset = badOffset;
+                                }
+                            } finally {
+                                state.lock.unlock();
+                            }
+                        }
+                    });
                 } else {
                     logger.error("Failed to fetch poison message for DLQ routing: topic={}, offset={}",
                             topic, badOffset);
                 }
-            } catch (IOException e) {
+            } catch (Exception e) {
                 logger.error("Failed to route message to DLQ topic {}: {}", dlqTopic, e.getMessage(), e);
             }
         });
-
-        long nextOffset = badOffset + 1;
-        state.committedRanges.add(new CommittedRange(badOffset, nextOffset));
-        advanceCommittedOffset(state, group, topic);
-        if (state.dispatchOffset <= badOffset) {
-            state.dispatchOffset = nextOffset;
-        }
-
-        state.deliveryCounts.remove(badOffset);
     }
 
     /**

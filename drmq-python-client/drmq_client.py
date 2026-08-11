@@ -27,6 +27,7 @@ class DRMQClient:
         self.port = int(self.bootstrap_servers[self.current_server_index][1])
         self.sock: Optional[socket.socket] = None
         self.max_retries = 5
+        self.sock_lock = threading.RLock()
 
     def connect(self):
         self._ensure_connected()
@@ -91,32 +92,33 @@ class DRMQClient:
 
     def _send_envelope(self, msg_type: int, payload_bytes: bytes) -> bytes:
         """Wraps a payload in an envelope, frames it, and sends it, returning the raw response bytes."""
-        self._ensure_connected()
-
-        # 1. Create the MessageEnvelope
-        envelope = pb.MessageEnvelope()
-        envelope.type = msg_type
-        envelope.payload = payload_bytes
-        envelope_bytes = envelope.SerializeToString()
-
-        # 2. Add the 4-byte Big-Endian length prefix
-        length_prefix = struct.pack('>I', len(envelope_bytes))
-        
-        # Send Length + Data
-        self.sock.sendall(length_prefix + envelope_bytes)
-
-        # 3. Read the response length prefix (4 bytes)
-        resp_len_bytes = self._recv_exactly(4)
-        if not resp_len_bytes:
-            raise ConnectionError("Broker closed connection")
-        resp_len = struct.unpack('>I', resp_len_bytes)[0]
-
-        # 4. Read the response envelope
-        resp_envelope_bytes = self._recv_exactly(resp_len)
-        resp_envelope = pb.MessageEnvelope()
-        resp_envelope.ParseFromString(resp_envelope_bytes)
-        
-        return resp_envelope.payload
+        with self.sock_lock:
+            self._ensure_connected()
+    
+            # 1. Create the MessageEnvelope
+            envelope = pb.MessageEnvelope()
+            envelope.type = msg_type
+            envelope.payload = payload_bytes
+            envelope_bytes = envelope.SerializeToString()
+    
+            # 2. Add the 4-byte Big-Endian length prefix
+            length_prefix = struct.pack('>I', len(envelope_bytes))
+            
+            # Send Length + Data
+            self.sock.sendall(length_prefix + envelope_bytes)
+    
+            # 3. Read the response length prefix (4 bytes)
+            resp_len_bytes = self._recv_exactly(4)
+            if not resp_len_bytes:
+                raise ConnectionError("Broker closed connection")
+            resp_len = struct.unpack('>I', resp_len_bytes)[0]
+    
+            # 4. Read the response envelope
+            resp_envelope_bytes = self._recv_exactly(resp_len)
+            resp_envelope = pb.MessageEnvelope()
+            resp_envelope.ParseFromString(resp_envelope_bytes)
+            
+            return resp_envelope.payload
 
     def _recv_exactly(self, n: int) -> bytes:
         """Helper to read exactly n bytes from the TCP stream."""

@@ -54,15 +54,13 @@ public class MessageStore implements Closeable {
     // In-memory cache for recent messages (Topic -> BoundedMessageCache)
     private final ConcurrentHashMap<String, BoundedMessageCache> messageCache = new ConcurrentHashMap<>();
     
-    // Per-topic write locks to make segment-check + rollover + append atomic
-    private final ConcurrentHashMap<String, Object> topicWriteLocks = new ConcurrentHashMap<>();
+    // Per-topic locks for append synchronization
+    private final ConcurrentHashMap<String, java.util.concurrent.locks.ReentrantLock> topicLocks = new ConcurrentHashMap<>();
     
     private static final int MAX_CACHE_SIZE_PER_TOPIC = 1000;
     private static final int INDEX_INTERVAL = 1000;
     private static final int MAX_INDEX_ENTRIES = 10000;
 
-    // Global lock to pause appends during snapshot generation
-    private final ReentrantReadWriteLock globalLock = new ReentrantReadWriteLock();
 
     private final Object messageMonitor = new Object();
     private final AtomicLong messageSignal = new AtomicLong(0);
@@ -95,12 +93,7 @@ public class MessageStore implements Closeable {
      * Recovery: Rebuild the index from log files on disk.
      */
     public void recover() throws IOException {
-        globalLock.writeLock().lock();
-        try {
-            recoverInternal();
-        } finally {
-            globalLock.writeLock().unlock();
-        }
+        recoverInternal();
     }
 
     private void recoverInternal() throws IOException {
@@ -158,21 +151,21 @@ public class MessageStore implements Closeable {
      * Used after installing a Raft snapshot.
      */
     public void reload() throws IOException {
-        globalLock.writeLock().lock();
-        try {
+        lockForSnapshot(() -> {
             logger.info("Reloading MessageStore state from disk...");
             topicIndex.clear();
             topicMessageCounts.clear();
             topicHeadOffsets.clear();
             messageCache.clear();
-            topicWriteLocks.clear();
+            topicLocks.clear();
             
-            logManager.close();
-            
-            recoverInternal();
-        } finally {
-            globalLock.writeLock().unlock();
-        }
+            try {
+                logManager.close();
+                recoverInternal();
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
     }
 
     private void indexMessage(String topic, long offset, long position) {
@@ -214,21 +207,18 @@ public class MessageStore implements Closeable {
 
         StoredMessage message = builder.build();
 
-        globalLock.readLock().lock();
+        java.util.concurrent.locks.ReentrantLock lock = topicLocks.computeIfAbsent(topic, k -> new java.util.concurrent.locks.ReentrantLock());
+        lock.lock();
         try {
-            Object topicLock = topicWriteLocks.computeIfAbsent(topic, k -> new Object());
             long position;
-            LogSegment segment;
-            synchronized (topicLock) {
-                segment = logManager.getOrCreateActiveSegment(topic);
-                
-                // Check if we need to roll over
-                if (segment.getSize() >= config.getLogSegmentBytes()) {
-                    segment = logManager.rollNewSegment(topic, offset);
-                }
-                
-                position = segment.append(message);
+            LogSegment segment = logManager.getOrCreateActiveSegment(topic);
+            
+            // Check if we need to roll over
+            if (segment.getSize() >= config.getLogSegmentBytes()) {
+                segment = logManager.rollNewSegment(topic, offset);
             }
+            
+            position = segment.append(message);
 
             indexMessage(topic, offset, position);
 
@@ -247,7 +237,7 @@ public class MessageStore implements Closeable {
             logger.error("Failed to persist message for topic {}", topic, e);
             throw new RuntimeException("Failed to persist message", e);
         } finally {
-            globalLock.readLock().unlock();
+            lock.unlock();
         }
 
         // 4. Wake any long-polling consumers waiting for new messages
@@ -294,19 +284,17 @@ public class MessageStore implements Closeable {
             messages.add(builder.build());
         }
 
-        globalLock.readLock().lock();
+        java.util.concurrent.locks.ReentrantLock lock = topicLocks.computeIfAbsent(topic, k -> new java.util.concurrent.locks.ReentrantLock());
+        lock.lock();
         try {
-            Object topicLock = topicWriteLocks.computeIfAbsent(topic, k -> new Object());
             List<Long> positions;
-            synchronized (topicLock) {
-                LogSegment segment = logManager.getOrCreateActiveSegment(topic);
+            LogSegment segment = logManager.getOrCreateActiveSegment(topic);
 
-                if (segment.getSize() >= config.getLogSegmentBytes()) {
-                    segment = logManager.rollNewSegment(topic, baseOffset);
-                }
-
-                positions = segment.appendBatch(messages);
+            if (segment.getSize() >= config.getLogSegmentBytes()) {
+                segment = logManager.rollNewSegment(topic, baseOffset);
             }
+
+            positions = segment.appendBatch(messages);
 
             AtomicLong counter = topicMessageCounts.computeIfAbsent(topic, k -> new AtomicLong());
             AtomicLong head = topicHeadOffsets.computeIfAbsent(topic, k -> new AtomicLong(-1));
@@ -326,7 +314,7 @@ public class MessageStore implements Closeable {
             logger.error("Failed to persist batch for topic {}", topic, e);
             throw new RuntimeException("Failed to persist batch", e);
         } finally {
-            globalLock.readLock().unlock();
+            lock.unlock();
         }
 
         synchronized (messageMonitor) {
@@ -362,9 +350,9 @@ public class MessageStore implements Closeable {
         for (var slice : slices) {
             String topic = slice.getTopic();
             long topicBase = currentOffset;
-            topicBaseOffsets.put(topic, topicBase);
+            topicBaseOffsets.putIfAbsent(topic, topicBase);
 
-            List<StoredMessage> messages = new ArrayList<>(slice.getEntriesCount());
+            List<StoredMessage> messages = topicMessages.computeIfAbsent(topic, k -> new ArrayList<>());
             for (var entry : slice.getEntriesList()) {
                 StoredMessage.Builder builder = StoredMessage.newBuilder()
                         .setOffset(currentOffset++)
@@ -378,24 +366,29 @@ public class MessageStore implements Closeable {
                 }
                 messages.add(builder.build());
             }
-            topicMessages.put(topic, messages);
         }
 
-        globalLock.readLock().lock();
+        // Lock all affected topics to ensure atomicity
+        List<String> sortedTopics = new ArrayList<>(topicMessages.keySet());
+        Collections.sort(sortedTopics);
+        List<java.util.concurrent.locks.ReentrantLock> acquiredLocks = new ArrayList<>();
+        for (String t : sortedTopics) {
+            java.util.concurrent.locks.ReentrantLock tLock = topicLocks.computeIfAbsent(t, k -> new java.util.concurrent.locks.ReentrantLock());
+            tLock.lock();
+            acquiredLocks.add(tLock);
+        }
+
         try {
             for (var entry : topicMessages.entrySet()) {
                 String topic = entry.getKey();
                 List<StoredMessage> messages = entry.getValue();
                 
-                Object topicLock = topicWriteLocks.computeIfAbsent(topic, k -> new Object());
                 List<Long> positions;
-                synchronized (topicLock) {
-                    LogSegment segment = logManager.getOrCreateActiveSegment(topic);
-                    if (segment.getSize() >= config.getLogSegmentBytes()) {
-                        segment = logManager.rollNewSegment(topic, topicBaseOffsets.get(topic));
-                    }
-                    positions = segment.appendBatch(messages);
+                LogSegment segment = logManager.getOrCreateActiveSegment(topic);
+                if (segment.getSize() >= config.getLogSegmentBytes()) {
+                    segment = logManager.rollNewSegment(topic, topicBaseOffsets.get(topic));
                 }
+                positions = segment.appendBatch(messages);
 
                 AtomicLong counter = topicMessageCounts.computeIfAbsent(topic, k -> new AtomicLong());
                 AtomicLong head = topicHeadOffsets.computeIfAbsent(topic, k -> new AtomicLong(-1));
@@ -414,7 +407,9 @@ public class MessageStore implements Closeable {
             logger.error("Failed to persist atomic batch", e);
             throw new RuntimeException("Failed to persist atomic batch", e);
         } finally {
-            globalLock.readLock().unlock();
+            for (int i = acquiredLocks.size() - 1; i >= 0; i--) {
+                acquiredLocks.get(i).unlock();
+            }
         }
 
         synchronized (messageMonitor) {
@@ -429,11 +424,24 @@ public class MessageStore implements Closeable {
      * Lock the store exclusively to safely take a snapshot of the log segments.
      */
     public void lockForSnapshot(Runnable task) {
-        globalLock.writeLock().lock();
+        List<String> sortedTopics = new ArrayList<>(topicLocks.keySet());
+        Collections.sort(sortedTopics);
+        
+        List<java.util.concurrent.locks.ReentrantLock> acquired = new ArrayList<>();
+        for (String t : sortedTopics) {
+            java.util.concurrent.locks.ReentrantLock lock = topicLocks.get(t);
+            if (lock != null) {
+                lock.lock();
+                acquired.add(lock);
+            }
+        }
+        
         try {
             task.run();
         } finally {
-            globalLock.writeLock().unlock();
+            for (int i = acquired.size() - 1; i >= 0; i--) {
+                acquired.get(i).unlock();
+            }
         }
     }
 

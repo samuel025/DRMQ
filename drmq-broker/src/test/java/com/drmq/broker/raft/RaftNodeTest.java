@@ -534,10 +534,16 @@ class RaftNodeTest {
         // checkQuorum every 900ms. The quorum window is 900ms.
         // Need: staleness > 900ms, i.e., we need at least one full check cycle
         // AFTER the contacts go stale. With generous buffer for scheduling jitter.
-        Thread.sleep(14000);
+        boolean steppedDown = false;
+        for (int i = 0; i < 40; i++) {
+            Thread.sleep(500);
+            if (raftNode.getState() != RaftState.LEADER) {
+                steppedDown = true;
+                break;
+            }
+        }
 
-        assertNotEquals(RaftState.LEADER, raftNode.getState(),
-                "Leader should step down after losing quorum");
+        assertTrue(steppedDown, "Leader should step down after losing quorum");
     }
 
     // ===========================
