@@ -609,9 +609,10 @@ public class MessageStore implements Closeable {
             return Collections.emptyList();
         }
         
+        List<StoredMessage> cachedMessages = Collections.emptyList();
         BoundedMessageCache cache = messageCache.get(topic);
         if (cache != null) {
-            List<StoredMessage> cachedMessages = cache.getMessagesFrom(fromOffset, maxCount);
+            cachedMessages = cache.getMessagesFrom(fromOffset, maxCount);
             if (cachedMessages.size() >= maxCount) {
                 return cachedMessages;
             }
@@ -619,11 +620,11 @@ public class MessageStore implements Closeable {
         
         ConcurrentSkipListMap<Long, Long> index = topicIndex.get(topic);
         
-        List<StoredMessage> result = new ArrayList<>();
+        List<StoredMessage> diskResult = new ArrayList<>();
         long currentOffset = fromOffset;
         LogSegment lastSegment = null;
         
-        while (result.size() < maxCount) {
+        while (diskResult.size() < maxCount) {
             LogSegment segment = logManager.getSegmentForOffset(topic, currentOffset);
             
             if (segment != null && segment == lastSegment) {
@@ -663,10 +664,10 @@ public class MessageStore implements Closeable {
                 long segmentSize = segment.getSize();
                 long position = startPosition;
                 
-                while (position < segmentSize && result.size() < maxCount) {
+                while (position < segmentSize && diskResult.size() < maxCount) {
                     StoredMessage message = segment.read(position);
                     if (message.getOffset() >= currentOffset) {
-                        result.add(message);
+                        diskResult.add(message);
                         currentOffset = message.getOffset() + 1;
                     }
                     position += 4 + message.getSerializedSize();
@@ -679,6 +680,23 @@ public class MessageStore implements Closeable {
             }
         }
         
+        if (cachedMessages.isEmpty()) {
+            return diskResult;
+        }
+        
+        // Merge disk and cache results with offset-aware deduplication
+        Map<Long, StoredMessage> merged = new java.util.TreeMap<>();
+        for (StoredMessage msg : diskResult) {
+            merged.put(msg.getOffset(), msg);
+        }
+        for (StoredMessage msg : cachedMessages) {
+            merged.put(msg.getOffset(), msg);
+        }
+        
+        List<StoredMessage> result = new ArrayList<>(merged.values());
+        if (result.size() > maxCount) {
+            return result.subList(0, maxCount);
+        }
         return result;
     }
 

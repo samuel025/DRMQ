@@ -144,4 +144,72 @@ public class FailureInjectionIntegrationTest {
             throw new RuntimeException(e);
         }
     }
+
+    /**
+     * Prove that an empty follower can completely reconstruct its physical segments, 
+     * MessageStore topics, and OffsetManager state from a streamed snapshot.
+     */
+    @Test
+    void testEmptyFollowerReconstructionFromSnapshot() throws IOException {
+        // 1. Follower starts completely empty
+        assertTrue(messageStore.getTopics().isEmpty());
+        
+        // Helper: Generate a valid segment file to stream
+        Path dummyDir = tempDir.resolve("dummy");
+        LogManager dummyLogManager = new LogManager(dummyDir.toString());
+        BrokerConfig dummyConfig = new BrokerConfig(9093, dummyDir.toString());
+        MessageStore dummyStore = new MessageStore(dummyLogManager, dummyConfig);
+        dummyStore.append("new-topic", "binary-message-data".getBytes(), null, System.currentTimeMillis());
+        Path dummySegment = dummyDir.resolve("new-topic").resolve("00000000000000000000.log");
+        byte[] segmentBytes = Files.readAllBytes(dummySegment);
+        long segmentLength = Files.size(dummySegment);
+        dummyLogManager.close();
+
+        // 2. Simulate Leader sending a snapshot chunk for a new topic
+        IncrementalSnapshotChunk chunk = IncrementalSnapshotChunk.newBuilder()
+                .setTerm(2)
+                .setLeaderId("node2")
+                .setTopic("new-topic")
+                .setFileName("00000000000000000000.log")
+                .setFileOffset(0)
+                .setData(com.google.protobuf.ByteString.copyFrom(segmentBytes))
+                .setIsLastChunkForFile(true)
+                .build();
+                
+        IncrementalSnapshotChunkResponse chunkResp = raftNode.handleIncrementalSnapshotChunk(chunk);
+        assertTrue(chunkResp.getSuccess());
+        
+        // 3. Simulate Leader sending the Done request
+        IncrementalSnapshotDoneRequest doneReq = IncrementalSnapshotDoneRequest.newBuilder()
+                .setTerm(2)
+                .setLeaderId("node2")
+                .setLastIncludedIndex(100)
+                .setLastIncludedTerm(2)
+                .putFileManifest("new-topic/00000000000000000000.log", segmentLength)
+                .putOffsetManagerState("group1/new-topic", 50L)
+                .build();
+                
+        IncrementalSnapshotDoneResponse doneResp = raftNode.handleIncrementalSnapshotDone(doneReq);
+        assertTrue(doneResp.getSuccess());
+        
+        // 4. Verify reconstruction
+        // The RaftNode should have updated its indices (note: reflection to read lastApplied if no getter)
+        try {
+            java.lang.reflect.Field appliedField = RaftNode.class.getDeclaredField("lastApplied");
+            appliedField.setAccessible(true);
+            long applied = (long) appliedField.get(raftNode);
+            assertEquals(100L, applied);
+        } catch (Exception e) {
+            fail(e);
+        }
+        
+        // The MessageStore should have loaded the new topic
+        assertTrue(messageStore.getTopics().contains("new-topic"));
+        
+        // The OffsetManager should have the offset
+        assertEquals(50L, offsetManager.getAllOffsets().get("group1/new-topic"));
+        
+        // The temp snapshot dir should be cleaned up
+        assertFalse(Files.exists(tempDir.resolve(".snapshot-tmp")));
+    }
 }

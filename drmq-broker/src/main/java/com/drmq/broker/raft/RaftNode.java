@@ -194,6 +194,8 @@ public class RaftNode {
     private long expectedSnapshotIndex = -1;
 
     private final Map<String, AtomicBoolean> isHeartbeatInFlight = new ConcurrentHashMap<>();
+    private final Map<String, AtomicBoolean> isVoteInFlight = new ConcurrentHashMap<>();
+    private final Map<String, AtomicBoolean> isPreVoteInFlight = new ConcurrentHashMap<>();
 
     /**
      * Per-peer pipeline state for pipelined AppendEntries replication.
@@ -915,13 +917,19 @@ public class RaftNode {
 
 
         for (PeerAddress peer : peers) {
+            AtomicBoolean preVoteInFlight = isPreVoteInFlight.computeIfAbsent(peer.id(), k -> new AtomicBoolean(false));
+            if (!preVoteInFlight.compareAndSet(false, true)) {
+                continue;
+            }
             CompletableFuture.supplyAsync(() -> {
-                Function<PreVoteRequest, PreVoteResponse> handler = preVoteRpcHandlers.get(peer.id());
-                if (handler == null) return null;
                 try {
+                    Function<PreVoteRequest, PreVoteResponse> handler = preVoteRpcHandlers.get(peer.id());
+                    if (handler == null) return null;
                     return handler.apply(request);
                 } catch (Exception e) {
                     return null;
+                } finally {
+                    preVoteInFlight.set(false);
                 }
             }, raftExecutor).thenAcceptAsync(response -> {
                 if (response == null) return;
@@ -1005,13 +1013,19 @@ public class RaftNode {
 
 
         for (PeerAddress peer : peers) {
+            AtomicBoolean voteInFlight = isVoteInFlight.computeIfAbsent(peer.id(), k -> new AtomicBoolean(false));
+            if (!voteInFlight.compareAndSet(false, true)) {
+                continue;
+            }
             CompletableFuture.supplyAsync(() -> {
-                Function<RequestVoteRequest, RequestVoteResponse> handler = voteRpcHandlers.get(peer.id());
-                if (handler == null) return null;
                 try {
+                    Function<RequestVoteRequest, RequestVoteResponse> handler = voteRpcHandlers.get(peer.id());
+                    if (handler == null) return null;
                     return handler.apply(request);
                 } catch (Exception e) {
                     return null;
+                } finally {
+                    voteInFlight.set(false);
                 }
             }, raftExecutor).thenAcceptAsync(response -> {
                 if (response == null) return;
@@ -1665,8 +1679,13 @@ public class RaftNode {
                     applyException = e;
                     logger.error("FATAL: [{}] Failed to apply entry {} (type={}) to MessageStore. Panicking to avoid becoming a zombie node!",
                             nodeId, lastApplied, entry.getCommandType(), e);
-                    running = false;
-                    throw new IllegalStateException("Failed to apply entry " + lastApplied + " to MessageStore", e);
+                    
+                    if (System.getProperty("drmq.test.mode") != null) {
+                        running = false;
+                        throw new IllegalStateException("Simulated panic", e);
+                    } else {
+                        System.exit(1);
+                    }
                 }
 
                         // Complete futures — handle simple, aggregated, and atomic-aggregated proposals
