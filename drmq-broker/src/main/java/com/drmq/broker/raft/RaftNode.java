@@ -827,7 +827,10 @@ public class RaftNode {
      * enabling pipelined replication with parallel RPCs.
      */
     public void registerAppendHandler(String peerId, Function<AppendEntriesRequest, AppendEntriesResponse> handler) {
-        appendRpcHandlerPools.computeIfAbsent(peerId, k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(handler);
+        java.util.List<Function<AppendEntriesRequest, AppendEntriesResponse>> pool = 
+            appendRpcHandlerPools.computeIfAbsent(peerId, k -> new java.util.concurrent.CopyOnWriteArrayList<>());
+        pool.clear();
+        pool.add(handler);
     }
 
     /**
@@ -2232,7 +2235,8 @@ public class RaftNode {
 
             String topic = request.getTopic();
             String fileName = request.getFileName();
-            Path topicDir = dataDir.resolve(topic);
+            Path tempSnapshotDir = dataDir.resolve(".snapshot-tmp");
+            Path topicDir = tempSnapshotDir.resolve(topic);
             Files.createDirectories(topicDir);
             Path filePath = topicDir.resolve(fileName);
             
@@ -2307,6 +2311,34 @@ public class RaftNode {
                 commitIndex = Math.max(commitIndex, snapshotIndex);
                 lock.unlock();
                 try {
+                    Path tempSnapshotDir = dataDir.resolve(".snapshot-tmp");
+                    if (Files.exists(tempSnapshotDir)) {
+                        try (java.util.stream.Stream<Path> tempDirs = Files.list(tempSnapshotDir)) {
+                            tempDirs.forEach(topicDir -> {
+                                try {
+                                    Path targetTopicDir = dataDir.resolve(topicDir.getFileName().toString());
+                                    Files.createDirectories(targetTopicDir);
+                                    try (java.util.stream.Stream<Path> files = Files.list(topicDir)) {
+                                        files.forEach(file -> {
+                                            try {
+                                                Files.move(file, targetTopicDir.resolve(file.getFileName().toString()), 
+                                                    java.nio.file.StandardCopyOption.ATOMIC_MOVE, 
+                                                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                                            } catch (IOException e) {
+                                                logger.error("Failed to move snapshot file {}", file, e);
+                                            }
+                                        });
+                                    }
+                                } catch (IOException e) {
+                                    logger.error("Error processing temp snapshot dir {}", topicDir, e);
+                                }
+                            });
+                        }
+                        try (java.util.stream.Stream<Path> walk = Files.walk(tempSnapshotDir)) {
+                            walk.sorted(java.util.Comparator.reverseOrder()).map(Path::toFile).forEach(java.io.File::delete);
+                        }
+                    }
+
                     if (request.getFileManifestCount() > 0) {
                         messageStore.reconcileWithManifest(request.getFileManifestMap());
                     }

@@ -40,7 +40,7 @@ public class InfinityLogResolver {
             return null; // InfinityLog not configured
         }
 
-        String prefix = "archive/" + config.getNodeId() + "/" + topic + "/";
+        String prefix = "archive/shared/" + topic + "/";
         
         try {
             // List all archived segments for this topic

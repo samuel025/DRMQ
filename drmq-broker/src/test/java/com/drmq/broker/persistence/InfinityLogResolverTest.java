@@ -60,9 +60,9 @@ class InfinityLogResolverTest {
             @Override
             public ListObjectsV2Response listObjectsV2(ListObjectsV2Request request) {
                 List<S3Object> contents = new ArrayList<>();
-                contents.add(S3Object.builder().key("archive/node-1/test-topic/00000000000000000000.log").build());
-                contents.add(S3Object.builder().key("archive/node-1/test-topic/00000000000000001000.log").build());
-                contents.add(S3Object.builder().key("archive/node-1/test-topic/00000000000000002000.log").build());
+                contents.add(S3Object.builder().key("archive/shared/test-topic/00000000000000000000.log").build());
+                contents.add(S3Object.builder().key("archive/shared/test-topic/00000000000000001000.log").build());
+                contents.add(S3Object.builder().key("archive/shared/test-topic/00000000000000002000.log").build());
 
                 return ListObjectsV2Response.builder()
                         .contents(contents)

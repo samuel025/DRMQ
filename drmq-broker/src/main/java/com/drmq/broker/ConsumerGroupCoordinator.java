@@ -192,6 +192,7 @@ public class ConsumerGroupCoordinator implements Closeable {
         state.committedRanges.sort(Comparator.comparingLong(r -> r.fromOffset));
 
         long current = state.committedOffset;
+        List<CommittedRange> inFlightRanges = new ArrayList<>();
         Iterator<CommittedRange> it = state.committedRanges.iterator();
 
         while (it.hasNext()) {
@@ -200,6 +201,7 @@ public class ConsumerGroupCoordinator implements Closeable {
                 if (range.toOffset > current) {
                     current = range.toOffset;
                 }
+                inFlightRanges.add(range);
                 it.remove(); 
             } else {
                 break;
@@ -209,15 +211,26 @@ public class ConsumerGroupCoordinator implements Closeable {
         if (current > state.committedOffset) {
             final long targetOffset = current;
             if (raftNode != null && raftNode.isLeader()) {
-                // Issue 1.1: Submit to Raft first, then update local RAM state in callback.
-                return raftNode.proposeOffsetCommitAsync(group, topic, targetOffset).thenApply(idx -> {
-                    state.committedOffset = targetOffset;
-                    // Note: offsetManager.commit is handled by RaftNode's applyCommitted!
-                    logger.debug("Advanced committed offset to {} for group={}, topic={} via Raft", targetOffset, group, topic);
+                // Submit to Raft first. If it fails, restore the in-flight ranges so they can be retried.
+                return raftNode.proposeOffsetCommitAsync(group, topic, targetOffset).handle((idx, ex) -> {
+                    state.lock.lock();
+                    try {
+                        if (ex != null) {
+                            state.committedRanges.addAll(inFlightRanges);
+                            logger.warn("Failed to commit offset to Raft. Restored pending ranges for retry.", ex);
+                            throw new java.util.concurrent.CompletionException(ex);
+                        } else {
+                            state.committedOffset = Math.max(state.committedOffset, targetOffset);
+                            logger.debug("Advanced committed offset to {} for group={}, topic={} via Raft", targetOffset, group, topic);
+                        }
+                    } finally {
+                        state.lock.unlock();
+                    }
                     return null;
                 });
             } else if (raftNode != null) {
-                // Not leader anymore, fail the commit
+                // Not leader anymore, fail the commit and restore ranges
+                state.committedRanges.addAll(inFlightRanges);
                 return java.util.concurrent.CompletableFuture.failedFuture(new RuntimeException("NOT_LEADER:" + (raftNode.getLeaderAddress() != null ? raftNode.getLeaderAddress() : "UNKNOWN")));
             } else {
                 // Standalone mode

@@ -775,7 +775,7 @@ public class MessageStore implements Closeable {
                 if (segment != null) {
                     try {
                         if (s3Client != null) {
-                            String key = "archive/" + config.getNodeId() + "/" + topic + "/" + segment.getFilePath().getFileName().toString();
+                            String key = "archive/shared/" + topic + "/" + segment.getFilePath().getFileName().toString();
                             logger.info("Uploading segment {} to S3 bucket {}", segment.getFilePath(), config.getS3ArchiveBucket());
                             s3Client.putObject(
                                 PutObjectRequest.builder()
