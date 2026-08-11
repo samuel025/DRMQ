@@ -191,7 +191,7 @@ public class LogManager implements AutoCloseable {
         try (Stream<Path> topicDirs = Files.list(dataDir)) {
             topicDirs.filter(Files::isDirectory).forEach(topicDir -> {
                 String topic = topicDir.getFileName().toString();
-                if (topic.equals("raft") || topic.equals("__consumer_offsets")) {
+                if (topic.equals("raft") || topic.equals("__consumer_offsets") || topic.endsWith(".old") || topic.equals(".snapshot-tmp") || topic.equals(".snapshot-activate")) {
                     return;
                 }
                 List<Path> segmentPaths = new ArrayList<>();
@@ -238,7 +238,7 @@ public class LogManager implements AutoCloseable {
         try (Stream<Path> topicDirs = Files.list(dataDir)) {
             topicDirs.filter(Files::isDirectory).forEach(topicDir -> {
                 String topic = topicDir.getFileName().toString();
-                if (topic.equals("raft") || topic.equals("__consumer_offsets")) return;
+                if (topic.equals("raft") || topic.equals("__consumer_offsets") || topic.endsWith(".old") || topic.equals(".snapshot-tmp") || topic.equals(".snapshot-activate")) return;
                 
                 try (Stream<Path> files = Files.list(topicDir)) {
                     files.filter(p -> p.toString().endsWith(LOG_FILE_SUFFIX)).forEach(logPath -> {

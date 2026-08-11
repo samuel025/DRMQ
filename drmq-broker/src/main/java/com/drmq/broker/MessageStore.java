@@ -142,6 +142,66 @@ public class MessageStore implements Closeable {
             }
         }
 
+        // Recover partial atomic batch from WAL (intent file) if present
+        java.nio.file.Path intentFile = java.nio.file.Paths.get(config.getDataDir()).resolve(".atomic-intent");
+        if (java.nio.file.Files.exists(intentFile)) {
+            logger.info("Found .atomic-intent file. Recovering partial atomic batch...");
+            try (java.io.DataInputStream dis = new java.io.DataInputStream(new java.io.FileInputStream(intentFile.toFile()))) {
+                int numTopics = dis.readInt();
+                for (int i = 0; i < numTopics; i++) {
+                    String topic = dis.readUTF();
+                    int numMsgs = dis.readInt();
+                    List<StoredMessage> msgs = new ArrayList<>(numMsgs);
+                    for (int j = 0; j < numMsgs; j++) {
+                        int len = dis.readInt();
+                        byte[] msgBytes = new byte[len];
+                        dis.readFully(msgBytes);
+                        msgs.add(StoredMessage.parseFrom(msgBytes));
+                    }
+
+                    long currentHeadOffset = topicHeadOffsets.containsKey(topic) ? topicHeadOffsets.get(topic).get() : -1;
+                    List<StoredMessage> missingMsgs = new ArrayList<>();
+                    for (StoredMessage m : msgs) {
+                        if (m.getOffset() > currentHeadOffset) {
+                            missingMsgs.add(m);
+                        }
+                    }
+
+                    if (!missingMsgs.isEmpty()) {
+                        logger.info("Recovering {} missing messages for topic {}", missingMsgs.size(), topic);
+                        LogSegment segment = logManager.getOrCreateActiveSegment(topic);
+                        if (segment.getSize() >= config.getLogSegmentBytes()) {
+                            segment = logManager.rollNewSegment(topic, missingMsgs.get(0).getOffset());
+                        }
+                        List<Long> positions = segment.appendBatch(missingMsgs);
+                        
+                        AtomicLong counter = topicMessageCounts.computeIfAbsent(topic, k -> new AtomicLong());
+                        AtomicLong head = topicHeadOffsets.computeIfAbsent(topic, k -> new AtomicLong(-1));
+                        
+                        for (int j = 0; j < missingMsgs.size(); j++) {
+                            StoredMessage m = missingMsgs.get(j);
+                            indexMessage(topic, m.getOffset(), positions.get(j));
+                            addToCache(topic, m);
+                            counter.incrementAndGet();
+                            if (m.getOffset() > head.get()) {
+                                head.set(m.getOffset());
+                            }
+                            if (m.getOffset() > maxOffset) {
+                                maxOffset = m.getOffset();
+                            }
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                logger.error("Failed to recover atomic intent file", e);
+            }
+            try {
+                java.nio.file.Files.deleteIfExists(intentFile);
+            } catch (IOException e) {
+                logger.warn("Failed to delete atomic intent file after recovery", e);
+            }
+        }
+
         globalOffset.set(maxOffset + 1);
         logger.info("Recovery complete. Global offset set to {}", globalOffset.get());
     }
@@ -378,7 +438,29 @@ public class MessageStore implements Closeable {
             }
         }
 
-        // Lock all affected topics to ensure atomicity
+        // 1. Write the Atomic Intent to disk (WAL)
+        java.nio.file.Path intentFile = java.nio.file.Paths.get(config.getDataDir()).resolve(".atomic-intent");
+        try (java.io.FileOutputStream fos = new java.io.FileOutputStream(intentFile.toFile());
+             java.io.DataOutputStream dos = new java.io.DataOutputStream(fos)) {
+            dos.writeInt(topicMessages.size());
+            for (var entry : topicMessages.entrySet()) {
+                dos.writeUTF(entry.getKey());
+                List<StoredMessage> msgs = entry.getValue();
+                dos.writeInt(msgs.size());
+                for (StoredMessage msg : msgs) {
+                    byte[] msgBytes = msg.toByteArray();
+                    dos.writeInt(msgBytes.length);
+                    dos.write(msgBytes);
+                }
+            }
+            dos.flush();
+            fos.getFD().sync();
+        } catch (IOException e) {
+            logger.error("Failed to write atomic intent file", e);
+            throw new RuntimeException("Failed to write atomic intent file", e);
+        }
+
+        // 2. Lock all affected topics to ensure atomicity
         List<String> sortedTopics = new ArrayList<>(topicMessages.keySet());
         Collections.sort(sortedTopics);
         List<java.util.concurrent.locks.ReentrantLock> acquiredLocks = new ArrayList<>();
@@ -420,6 +502,13 @@ public class MessageStore implements Closeable {
             for (int i = acquiredLocks.size() - 1; i >= 0; i--) {
                 acquiredLocks.get(i).unlock();
             }
+        }
+
+        // 3. Delete intent file now that everything is fully flushed to segments
+        try {
+            java.nio.file.Files.deleteIfExists(intentFile);
+        } catch (IOException e) {
+            logger.warn("Failed to delete atomic intent file", e);
         }
 
         synchronized (messageMonitor) {

@@ -58,6 +58,10 @@ public class BrokerServer {
 
     public BrokerServer(BrokerConfig config) throws IOException {
         this.config = config;
+
+        // Automatically recover and activate any pending Tier-2 snapshots if the broker crashed during activation
+        com.drmq.broker.raft.SnapshotManager.activateSnapshot(Paths.get(config.getDataDir()));
+
         this.logManager = new LogManager(config);
         this.messageStore = new MessageStore(logManager, config);
         this.offsetManager = new OffsetManager(config.getDataDir());

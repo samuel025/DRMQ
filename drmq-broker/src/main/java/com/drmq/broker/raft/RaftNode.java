@@ -1452,14 +1452,10 @@ public class RaftNode {
     }
 
     private void syncFollowerTier2(PeerAddress peer) {
-        long snapshotIndex;
-        long snapshotTerm;
         long term;
         lock.lock();
         try {
             if (state != RaftState.LEADER) return;
-            snapshotIndex = lastApplied;
-            snapshotTerm = lastAppliedTerm;
             term = currentTerm;
         } finally {
             lock.unlock();
@@ -1493,10 +1489,20 @@ public class RaftNode {
 
             if (chunkHandler == null || doneHandler == null) return;
 
+            // Freeze state on the apply thread to ensure exact point-in-time atomicity
+            java.util.concurrent.CompletableFuture<SnapshotManager.SnapshotManifest> manifestFuture = new java.util.concurrent.CompletableFuture<>();
+            applyExecutor.execute(() -> {
+                try {
+                    SnapshotManager.SnapshotManifest manifest = snapshotManager.freezeSnapshot(lastApplied, lastAppliedTerm, followerOffsets);
+                    manifestFuture.complete(manifest);
+                } catch (Exception e) {
+                    manifestFuture.completeExceptionally(e);
+                }
+            });
+            SnapshotManager.SnapshotManifest manifest = manifestFuture.join();
+
             snapshotManager.streamIncrementalSegments(
-                    followerOffsets,
-                    snapshotIndex,
-                    snapshotTerm,
+                    manifest,
                     nodeId,
                     peer,
                     chunkHandler,
@@ -1512,11 +1518,10 @@ public class RaftNode {
             try {
                 if (state == RaftState.LEADER) {
                     long logStart = raftLog.getStartIndex();
-                    long newNextIndex = Math.max(snapshotIndex + 1, logStart);
+                    long newNextIndex = Math.max(manifest.snapshotIndex + 1, logStart);
                     nextIndex.put(peer.id(), newNextIndex);
-                    matchIndex.put(peer.id(), newNextIndex - 1);
-                    logger.info("[{}] Tier 2 Sync to {} succeeded. NextIndex set to {} (snapshotIndex={}, logStart={})",
-                            nodeId, peer.id(), newNextIndex, snapshotIndex, logStart);
+                    matchIndex.put(peer.id(), manifest.snapshotIndex);
+                    logger.info("[{}] Set nextIndex for {} to {} after successful Tier 2 sync", nodeId, peer.id(), newNextIndex);
                     ClusterEventBuffer.emitSnapshot(String.format("Broker-%s installed Tier 2 sync successfully", peer.id()), peer.id());
                 }
             } finally {
@@ -2297,48 +2302,12 @@ public class RaftNode {
             if (snapshotIndex > lastApplied) {
                 logger.info("[{}] Received IncrementalSnapshotDone. Advancing state up to index {}", nodeId, snapshotIndex);
                 
-                if (raftLog.getLastIndex() > 0) {
-                    try {
-                        long compactUpTo = Math.min(snapshotIndex, raftLog.getLastIndex());
-                        raftLog.compact(compactUpTo);
-                    } catch (IOException e) {
-                        logger.error("Failed to compact Raft log during Incremental Sync", e);
-                    }
-                }
-                raftLog.setStartIndex(snapshotIndex + 1);
-                lastApplied = snapshotIndex;
-                lastAppliedTerm = request.getLastIncludedTerm();
-                commitIndex = Math.max(commitIndex, snapshotIndex);
                 lock.unlock();
                 try {
-                    Path tempSnapshotDir = dataDir.resolve(".snapshot-tmp");
-                    if (Files.exists(tempSnapshotDir)) {
-                        try (java.util.stream.Stream<Path> tempDirs = Files.list(tempSnapshotDir)) {
-                            tempDirs.forEach(topicDir -> {
-                                try {
-                                    Path targetTopicDir = dataDir.resolve(topicDir.getFileName().toString());
-                                    Files.createDirectories(targetTopicDir);
-                                    try (java.util.stream.Stream<Path> files = Files.list(topicDir)) {
-                                        files.forEach(file -> {
-                                            try {
-                                                Files.move(file, targetTopicDir.resolve(file.getFileName().toString()), 
-                                                    java.nio.file.StandardCopyOption.ATOMIC_MOVE, 
-                                                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-                                            } catch (IOException e) {
-                                                logger.error("Failed to move snapshot file {}", file, e);
-                                            }
-                                        });
-                                    }
-                                } catch (IOException e) {
-                                    logger.error("Error processing temp snapshot dir {}", topicDir, e);
-                                }
-                            });
-                        }
-                        try (java.util.stream.Stream<Path> walk = Files.walk(tempSnapshotDir)) {
-                            walk.sorted(java.util.Comparator.reverseOrder()).map(Path::toFile).forEach(java.io.File::delete);
-                        }
-                    }
+                    // 1. Activate snapshot (atomic swap)
+                    SnapshotManager.activateSnapshot(dataDir);
 
+                    // 2. Reconcile and reload physical state
                     if (request.getFileManifestCount() > 0) {
                         messageStore.reconcileWithManifest(request.getFileManifestMap());
                     }
@@ -2346,8 +2315,27 @@ public class RaftNode {
                     if (offsetManager != null) {
                         offsetManager.applySnapshot(request.getOffsetManagerStateMap());
                     }
-                    logger.info("[{}] Successfully applied Tier 2 sync. lastApplied={}, commitIndex={}",
-                            nodeId, snapshotIndex, commitIndex);
+
+                    // 3. ONLY NOW advance logical Raft state
+                    lock.lock();
+                    try {
+                        if (raftLog.getLastIndex() > 0) {
+                            try {
+                                long compactUpTo = Math.min(snapshotIndex, raftLog.getLastIndex());
+                                raftLog.compact(compactUpTo);
+                            } catch (IOException e) {
+                                logger.error("Failed to compact Raft log during Incremental Sync", e);
+                            }
+                        }
+                        raftLog.setStartIndex(snapshotIndex + 1);
+                        lastApplied = snapshotIndex;
+                        lastAppliedTerm = request.getLastIncludedTerm();
+                        commitIndex = Math.max(commitIndex, snapshotIndex);
+                        logger.info("[{}] Successfully applied Tier 2 sync. lastApplied={}, commitIndex={}",
+                                nodeId, snapshotIndex, commitIndex);
+                    } finally {
+                        lock.unlock();
+                    }
                 } catch (IOException e) {
                     logger.error("FATAL: Failed to apply Tier 2 Sync. Panicking!", e);
                     running = false;

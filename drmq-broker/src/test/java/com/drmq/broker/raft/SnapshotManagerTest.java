@@ -72,11 +72,12 @@ class SnapshotManagerTest {
             return IncrementalSnapshotDoneResponse.newBuilder().setSuccess(true).build();
         };
 
+        // Freeze state
+        SnapshotManager.SnapshotManifest manifest = snapshotManager.freezeSnapshot(42L, 1L, followerOffsets);
+
         // Stream the segments
         snapshotManager.streamIncrementalSegments(
-                followerOffsets,
-                42L,
-                1L,
+                manifest,
                 "node1",
                 dummyPeer,
                 chunkHandler,
