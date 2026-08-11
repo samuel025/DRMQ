@@ -2357,8 +2357,12 @@ public class RaftNode {
                     }
                 } catch (IOException e) {
                     logger.error("FATAL: Failed to apply Tier 2 Sync. Panicking!", e);
-                    running = false;
-                    throw new IllegalStateException("Failed to apply Tier 2 Sync", e);
+                    if (System.getProperty("drmq.test.mode") != null) {
+                        running = false;
+                        throw new IllegalStateException("Failed to apply Tier 2 Sync", e);
+                    } else {
+                        System.exit(1);
+                    }
                 } finally {
                     lock.lock();
                 }

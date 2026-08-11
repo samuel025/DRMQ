@@ -239,17 +239,44 @@ public class LogManager implements AutoCloseable {
             topicDirs.filter(Files::isDirectory).forEach(topicDir -> {
                 String topic = topicDir.getFileName().toString();
                 if (topic.equals("raft") || topic.equals("__consumer_offsets") || topic.endsWith(".old") || topic.equals(".snapshot-tmp") || topic.equals(".snapshot-activate")) return;
+                // Find the minimum base offset in the manifest for this topic to establish the snapshot boundary
+                long minManifestOffset = Long.MAX_VALUE;
+                for (String manifestKey : fileManifest.keySet()) {
+                    if (manifestKey.startsWith(topic + "/")) {
+                        String filename = manifestKey.substring(topic.length() + 1);
+                        if (filename.endsWith(LOG_FILE_SUFFIX)) {
+                            try {
+                                long baseOffset = Long.parseLong(filename.substring(0, filename.length() - LOG_FILE_SUFFIX.length()));
+                                minManifestOffset = Math.min(minManifestOffset, baseOffset);
+                            } catch (NumberFormatException ignored) {}
+                        }
+                    }
+                }
+                
+                final long finalMinManifestOffset = minManifestOffset;
                 
                 try (Stream<Path> files = Files.list(topicDir)) {
                     files.filter(p -> p.toString().endsWith(LOG_FILE_SUFFIX)).forEach(logPath -> {
-                        String manifestKey = topic + "/" + logPath.getFileName().toString();
+                        String filename = logPath.getFileName().toString();
+                        long localBaseOffset = -1;
+                        try {
+                            localBaseOffset = Long.parseLong(filename.substring(0, filename.length() - LOG_FILE_SUFFIX.length()));
+                        } catch (NumberFormatException ignored) {
+                            return;
+                        }
+                        
+                        String manifestKey = topic + "/" + filename;
                         Long expectedSize = fileManifest.get(manifestKey);
                         if (expectedSize == null) {
-                            try {
-                                Files.delete(logPath);
-                                logger.info("Deleted stale segment during snapshot reconciliation: {}", logPath);
-                            } catch (IOException e) {
-                                logger.error("Failed to delete stale segment {}", logPath, e);
+                            // Only delete if the segment is at or above the snapshot boundary.
+                            // If it's below the boundary, it was intentionally excluded by the leader's followerOffset filter.
+                            if (localBaseOffset >= finalMinManifestOffset) {
+                                try {
+                                    Files.delete(logPath);
+                                    logger.info("Deleted stale segment during snapshot reconciliation: {}", logPath);
+                                } catch (IOException e) {
+                                    logger.error("Failed to delete stale segment {}", logPath, e);
+                                }
                             }
                         } else {
                             try {

@@ -56,18 +56,21 @@ public class SnapshotManager {
                     try {
                         String topicName = topicDir.getFileName().toString();
                         Path targetTopicDir = dataDir.resolve(topicName);
-                        Path oldTopicDir = dataDir.resolve(topicName + ".old");
-
-                        // 1. Rename existing target out of the way
-                        if (Files.exists(targetTopicDir) && !Files.exists(oldTopicDir)) {
-                            Files.move(targetTopicDir, oldTopicDir, StandardCopyOption.ATOMIC_MOVE);
+                        if (!Files.exists(targetTopicDir)) {
+                            Files.createDirectories(targetTopicDir);
                         }
 
-                        // 2. Move new topic dir into place
-                        if (Files.exists(topicDir)) {
-                            Files.move(topicDir, targetTopicDir, StandardCopyOption.ATOMIC_MOVE);
+                        // Move individual segment files from .snapshot-tmp/topic into active topic dir
+                        try (java.util.stream.Stream<Path> chunkFiles = Files.list(topicDir)) {
+                            chunkFiles.forEach(chunkFile -> {
+                                try {
+                                    Path targetFile = targetTopicDir.resolve(chunkFile.getFileName().toString());
+                                    Files.move(chunkFile, targetFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                                } catch (IOException e) {
+                                    throw new UncheckedIOException(e);
+                                }
+                            });
                         }
-
                     } catch (IOException e) {
                         logger.error("Error activating snapshot for topic {}", topicDir, e);
                         throw new UncheckedIOException(e);
@@ -76,20 +79,14 @@ public class SnapshotManager {
             }
         }
 
-        // 3. Cleanup .old directories
-        try (java.util.stream.Stream<Path> dataDirs = Files.list(dataDir)) {
-            dataDirs.filter(p -> p.getFileName().toString().endsWith(".old"))
-                    .forEach(oldDir -> {
-                        try (java.util.stream.Stream<Path> walk = Files.walk(oldDir)) {
-                            walk.sorted(java.util.Comparator.reverseOrder()).map(Path::toFile).forEach(java.io.File::delete);
-                        } catch (IOException e) {
-                            logger.warn("Failed to delete old snapshot backup {}", oldDir, e);
-                        }
-                    });
-        }
-
-        // 4. Cleanup temp dir and marker
+        // 3. Cleanup temp dir and marker
         if (Files.exists(tempSnapshotDir)) {
+            // Delete now empty topic subdirs
+            try (java.util.stream.Stream<Path> tempDirs = Files.list(tempSnapshotDir)) {
+                tempDirs.forEach(d -> {
+                    try { Files.delete(d); } catch (Exception ignored) {}
+                });
+            }
             Files.delete(tempSnapshotDir);
         }
         Files.deleteIfExists(markerFile);
