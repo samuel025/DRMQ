@@ -168,6 +168,16 @@ public class MessageStore implements Closeable {
         });
     }
 
+    public void reconcileWithManifest(Map<String, Long> fileManifest) throws IOException {
+        lockForSnapshot(() -> {
+            try {
+                logManager.reconcileWithManifest(fileManifest);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
+    }
+
     private void indexMessage(String topic, long offset, long position) {
         if (offset % INDEX_INTERVAL == 0) {
             ConcurrentSkipListMap<Long, Long> index = topicIndex.computeIfAbsent(topic, k -> new ConcurrentSkipListMap<>());

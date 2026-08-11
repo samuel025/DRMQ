@@ -2305,21 +2305,24 @@ public class RaftNode {
                 lastApplied = snapshotIndex;
                 lastAppliedTerm = request.getLastIncludedTerm();
                 commitIndex = Math.max(commitIndex, snapshotIndex);
-                
-                applyExecutor.execute(() -> {
-                    try {
-                        messageStore.reload();
-                        if (offsetManager != null) {
-                            offsetManager.applySnapshot(request.getOffsetManagerStateMap());
-                        }
-                        logger.info("[{}] Successfully applied Tier 2 sync. lastApplied={}, commitIndex={}",
-                                nodeId, snapshotIndex, commitIndex);
-                    } catch (IOException e) {
-                        logger.error("FATAL: Failed to reload MessageStore after Tier 2 Sync. Panicking!", e);
-                        running = false;
-                        throw new IllegalStateException("Failed to reload MessageStore after Tier 2 Sync", e);
+                lock.unlock();
+                try {
+                    if (request.getFileManifestCount() > 0) {
+                        messageStore.reconcileWithManifest(request.getFileManifestMap());
                     }
-                });
+                    messageStore.reload();
+                    if (offsetManager != null) {
+                        offsetManager.applySnapshot(request.getOffsetManagerStateMap());
+                    }
+                    logger.info("[{}] Successfully applied Tier 2 sync. lastApplied={}, commitIndex={}",
+                            nodeId, snapshotIndex, commitIndex);
+                } catch (IOException e) {
+                    logger.error("FATAL: Failed to apply Tier 2 Sync. Panicking!", e);
+                    running = false;
+                    throw new IllegalStateException("Failed to apply Tier 2 Sync", e);
+                } finally {
+                    lock.lock();
+                }
             }
 
             return IncrementalSnapshotDoneResponse.newBuilder()

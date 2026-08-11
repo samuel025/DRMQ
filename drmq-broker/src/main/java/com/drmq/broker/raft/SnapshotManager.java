@@ -45,22 +45,40 @@ public class SnapshotManager {
         logger.info("[{}] Starting Tier 2 Incremental Sync for peer {} at Raft index {}", nodeId, peer.id(), snapshotIndex);
 
         try {
-            for (String topic : messageStore.getTopics()) {
-                long followerOffset = followerOffsets.getOrDefault(topic, -1L);
-                java.util.List<Path> segmentsToStream = messageStore.getSegmentsForSync(topic, followerOffset);
+            java.util.Map<String, Long> fileManifest = new java.util.HashMap<>();
+            java.util.List<Path> allSegmentsToStream = new java.util.ArrayList<>();
+            java.util.Map<Path, String> pathToTopic = new java.util.HashMap<>();
 
-                for (Path segmentPath : segmentsToStream) {
-                    streamFile(segmentPath, topic, snapshotTerm, nodeId, chunkHandler);
+            messageStore.lockForSnapshot(() -> {
+                try {
+                    for (String topic : messageStore.getTopics()) {
+                        long followerOffset = followerOffsets.getOrDefault(topic, -1L);
+                        java.util.List<Path> segments = messageStore.getSegmentsForSync(topic, followerOffset);
+                        for (Path segmentPath : segments) {
+                            allSegmentsToStream.add(segmentPath);
+                            pathToTopic.put(segmentPath, topic);
+                            fileManifest.put(topic + "/" + segmentPath.getFileName().toString(), Files.size(segmentPath));
+                        }
+                    }
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
                 }
+            });
+
+            for (Path segmentPath : allSegmentsToStream) {
+                String topic = pathToTopic.get(segmentPath);
+                long exactLength = fileManifest.get(topic + "/" + segmentPath.getFileName().toString());
+                streamFile(segmentPath, topic, snapshotTerm, nodeId, exactLength, chunkHandler);
             }
 
-            // After all topic files are streamed, send the Done request
+            // After all topic files are streamed, send the Done request with the manifest
             com.drmq.protocol.IncrementalSnapshotDoneRequest doneReq = com.drmq.protocol.IncrementalSnapshotDoneRequest.newBuilder()
                     .setTerm(snapshotTerm)
                     .setLeaderId(nodeId)
                     .setLastIncludedIndex(snapshotIndex)
                     .setLastIncludedTerm(snapshotTerm)
                     .putAllOffsetManagerState(offsetManager != null ? offsetManager.getAllOffsets() : java.util.Collections.emptyMap())
+                    .putAllFileManifest(fileManifest)
                     .build();
 
             com.drmq.protocol.IncrementalSnapshotDoneResponse doneResp = doneHandler.apply(doneReq);
@@ -75,14 +93,14 @@ public class SnapshotManager {
         }
     }
 
-    private void streamFile(Path filePath, String topic, long term, String leaderId,
+    private void streamFile(Path filePath, String topic, long term, String leaderId, long exactLength,
                             java.util.function.Function<com.drmq.protocol.IncrementalSnapshotChunk, com.drmq.protocol.IncrementalSnapshotChunkResponse> chunkHandler) throws IOException {
         
-        if (!Files.exists(filePath)) return;
+        if (!Files.exists(filePath) || exactLength <= 0) return;
         
         String fileName = filePath.getFileName().toString();
         try (java.nio.channels.FileChannel channel = java.nio.channels.FileChannel.open(filePath, StandardOpenOption.READ)) {
-            long totalBytes = channel.size();
+            long totalBytes = exactLength; // Limit streaming to the exact point-in-time boundary length
             long offset = 0;
             long chunkSize = 2 * 1024 * 1024; // 2MB
 

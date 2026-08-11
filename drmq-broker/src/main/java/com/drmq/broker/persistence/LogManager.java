@@ -233,6 +233,45 @@ public class LogManager implements AutoCloseable {
         }
     }
 
+    public void reconcileWithManifest(Map<String, Long> fileManifest) throws IOException {
+        if (!Files.exists(dataDir)) return;
+        try (Stream<Path> topicDirs = Files.list(dataDir)) {
+            topicDirs.filter(Files::isDirectory).forEach(topicDir -> {
+                String topic = topicDir.getFileName().toString();
+                if (topic.equals("raft") || topic.equals("__consumer_offsets")) return;
+                
+                try (Stream<Path> files = Files.list(topicDir)) {
+                    files.filter(p -> p.toString().endsWith(LOG_FILE_SUFFIX)).forEach(logPath -> {
+                        String manifestKey = topic + "/" + logPath.getFileName().toString();
+                        Long expectedSize = fileManifest.get(manifestKey);
+                        if (expectedSize == null) {
+                            try {
+                                Files.delete(logPath);
+                                logger.info("Deleted stale segment during snapshot reconciliation: {}", logPath);
+                            } catch (IOException e) {
+                                logger.error("Failed to delete stale segment {}", logPath, e);
+                            }
+                        } else {
+                            try {
+                                long currentSize = Files.size(logPath);
+                                if (currentSize > expectedSize) {
+                                    try (java.nio.channels.FileChannel channel = java.nio.channels.FileChannel.open(logPath, java.nio.file.StandardOpenOption.WRITE)) {
+                                        channel.truncate(expectedSize);
+                                        logger.info("Truncated segment {} from {} to {} during snapshot reconciliation", logPath, currentSize, expectedSize);
+                                    }
+                                }
+                            } catch (IOException e) {
+                                logger.error("Failed to truncate segment {}", logPath, e);
+                            }
+                        }
+                    });
+                } catch (IOException e) {
+                    logger.error("Error reconciling segments for topic {}", topic, e);
+                }
+            });
+        }
+    }
+
     public void close() throws IOException {
         IOException primaryException = null;
         

@@ -221,6 +221,7 @@ message IncrementalSnapshotDoneRequest {
     int64 last_included_index = 3; 
     int64 last_included_term = 4;
     map<string, int64> offset_manager_state = 5;
+    map<string, int64> file_manifest = 6; // Key: topic/filename, Value: exact byte size
 }
 
 message IncrementalSnapshotDoneResponse {

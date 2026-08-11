@@ -35,8 +35,8 @@ export class DRMQClient {
   protected host: string;
   protected port: number;
   protected socket: net.Socket | null = null;
-  private responseQueue: Map<number, (data: Buffer) => void> = new Map();
-  private nextCorrelationId: number = 1;
+  private responseQueue: Map<string, (data: Buffer) => void> = new Map();
+  private nextCorrelationId: bigint = 1n;
   private receiveBuffer: Buffer = Buffer.alloc(0);
   protected maxRetries = 5;
 
@@ -156,10 +156,10 @@ export class DRMQClient {
         
         try {
           const respEnvelope = MessageEnvelope.decode(frameData);
-          const correlationId = Number(respEnvelope.correlationId);
-          const resolve = this.responseQueue.get(correlationId);
+          const correlationIdStr = respEnvelope.correlationId.toString();
+          const resolve = this.responseQueue.get(correlationIdStr);
           if (resolve) {
-            this.responseQueue.delete(correlationId);
+            this.responseQueue.delete(correlationIdStr);
             resolve(frameData);
           }
         } catch (e) {
@@ -175,11 +175,13 @@ export class DRMQClient {
     await this.ensureConnected();
 
     const correlationId = this.nextCorrelationId++;
+    const correlationIdStr = correlationId.toString();
 
     const envelope = MessageEnvelope.create({
       type: msgType,
       payload: Buffer.from(payload),
-      correlationId: correlationId
+      // protobufjs accepts Long, string, or number for int64. We pass string.
+      correlationId: correlationIdStr as any
     });
     const envelopeBytes = MessageEnvelope.encode(envelope).finish();
 
@@ -189,7 +191,7 @@ export class DRMQClient {
     return new Promise((resolve, reject) => {
       if (!this.socket) return reject(new Error('Socket disconnected'));
       
-      this.responseQueue.set(correlationId, (frameData: Buffer) => {
+      this.responseQueue.set(correlationIdStr, (frameData: Buffer) => {
         if (frameData.length === 0) {
           reject(new Error("Connection closed while waiting for response"));
           return;
@@ -203,7 +205,10 @@ export class DRMQClient {
       });
 
       this.socket.write(Buffer.concat([lengthPrefix, envelopeBytes]), (err) => {
-        if (err) reject(err);
+        if (err) {
+          this.responseQueue.delete(correlationIdStr);
+          reject(err);
+        }
       });
     });
   }

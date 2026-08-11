@@ -294,6 +294,9 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
             com.drmq.protocol.AtomicProduceRequest request = com.drmq.protocol.AtomicProduceRequest.parseFrom(envelope.getPayload());
 
             for (var slice : request.getSlicesList()) {
+                if (!isValidTopic(slice.getTopic())) {
+                    return java.util.concurrent.CompletableFuture.completedFuture(createAtomicProduceErrorResponse("Invalid topic name: " + slice.getTopic(), ErrorCode.UNKNOWN_ERROR));
+                }
                 count += slice.getEntriesCount();
                 for (var entry : slice.getEntriesList()) {
                     payloadBytes += entry.getPayload().size();
