@@ -192,13 +192,20 @@ public class MessageStore implements Closeable {
                         }
                     }
                 }
+                
+                // Only delete if recovery completely succeeded
+                try {
+                    java.nio.file.Files.deleteIfExists(intentFile);
+                } catch (IOException e) {
+                    logger.warn("Failed to delete atomic intent file after successful recovery", e);
+                }
             } catch (Exception e) {
-                logger.error("Failed to recover atomic intent file", e);
-            }
-            try {
-                java.nio.file.Files.deleteIfExists(intentFile);
-            } catch (IOException e) {
-                logger.warn("Failed to delete atomic intent file after recovery", e);
+                logger.error("FATAL: Failed to recover atomic intent file. Panicking to prevent dataloss!", e);
+                if (System.getProperty("drmq.test.mode") != null) {
+                    throw new RuntimeException("Simulated panic during atomic intent recovery", e);
+                } else {
+                    System.exit(1);
+                }
             }
         }
 
