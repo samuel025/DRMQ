@@ -514,9 +514,11 @@ public class RaftNode {
                             proposalTerm = currentTerm;
                             long index = uncommittedNextIndex;
                             try {
+                                long baseOffset = (messageStore != null) ? messageStore.reserveOffsets(cd.totalEntries) : -1L;
                                 RaftEntry entry = cd.entryBuilder
                                         .setTerm(proposalTerm)
                                         .setIndex(index)
+                                        .setBaseOffset(baseOffset)
                                         .build();
 
                                 pendingProposals.put(index, new AggregatedProposalState(proposalTerm, cd.requests, cd.batchRequest));
@@ -677,9 +679,12 @@ public class RaftNode {
                             proposalTerm = currentTerm;
                             long index = uncommittedNextIndex;
                             try {
+                                int totalMessages = mergedSlices.stream().mapToInt(AtomicBatchTopicSlice::getEntriesCount).sum();
+                                long baseOffset = (messageStore != null) ? messageStore.reserveOffsets(totalMessages) : -1L;
                                 RaftEntry entry = entryBuilder
                                         .setTerm(proposalTerm)
                                         .setIndex(index)
+                                        .setBaseOffset(baseOffset)
                                         .build();
 
                                 pendingProposals.put(index,
@@ -1647,7 +1652,7 @@ public class RaftNode {
                             ProduceBatchRequest batchRequest = (cached instanceof ProduceBatchRequest pbr)
                                     ? pbr
                                     : ProduceBatchRequest.parseFrom(entry.getPayload());
-                            long baseOffset = messageStore.appendBatch(entry.getTopic(), batchRequest.getEntriesList(), lastApplied);
+                            long baseOffset = messageStore.appendBatch(entry.getTopic(), batchRequest.getEntriesList(), lastApplied, entry.getBaseOffset());
                             completionValue = baseOffset;
                             logger.debug("[{}] Applied raft batch entry {} to MessageStore (topic={}, count={})",
                                     nodeId, lastApplied, entry.getTopic(), batchRequest.getEntriesCount());
@@ -1657,7 +1662,7 @@ public class RaftNode {
                             com.drmq.protocol.AtomicBatchRequest req = (cached instanceof com.drmq.protocol.AtomicBatchRequest abr)
                                     ? abr
                                     : com.drmq.protocol.AtomicBatchRequest.parseFrom(entry.getPayload());
-                            Map<String, Long> baseOffsets = messageStore.appendAtomicBatch(req.getSlicesList(), lastApplied);
+                            Map<String, Long> baseOffsets = messageStore.appendAtomicBatch(req.getSlicesList(), lastApplied, entry.getBaseOffset());
                             localAtomicBatchBaseOffsets = baseOffsets;
                             completionValue = lastApplied;
                             logger.debug("[{}] Applied ATOMIC_BATCH entry {} to {} topics: {}",
@@ -1670,7 +1675,8 @@ public class RaftNode {
                                     entry.getPayload(),
                                     entry.hasKey() ? entry.getKey() : null,
                                     entry.getTimestamp(),
-                                    lastApplied
+                                    lastApplied,
+                                    entry.getBaseOffset()
                             );
                             completionValue = msgOffset;
                             logger.debug("[{}] Applied raft entry {} to MessageStore (topic={})",
@@ -2223,7 +2229,8 @@ public class RaftNode {
 
             // Update commitIndex
             if (request.getLeaderCommit() > commitIndex) {
-                commitIndex = Math.min(request.getLeaderCommit(), raftLog.getLastIndex());
+                long indexOfLastNewEntry = request.getPrevLogIndex() + request.getEntriesCount();
+                commitIndex = Math.min(request.getLeaderCommit(), indexOfLastNewEntry);
                 applyCommitted();
             }
 

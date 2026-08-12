@@ -279,16 +279,34 @@ public class MessageStore implements Closeable {
     public long getNextOffset() {
         return globalOffset.get();
     }
+    
+    public long reserveOffsets(int count) {
+        return globalOffset.getAndAdd(count);
+    }
+
+    private void updateGlobalOffset(long target) {
+        long current;
+        while ((current = globalOffset.get()) < target) {
+            globalOffset.compareAndSet(current, target);
+        }
+    }
 
     public long append(String topic, byte[] payload, String key, long clientTimestamp, long raftIndex) {
-        return append(topic, com.google.protobuf.ByteString.copyFrom(payload), key, clientTimestamp, raftIndex);
+        return append(topic, com.google.protobuf.ByteString.copyFrom(payload), key, clientTimestamp, raftIndex, -1L);
+    }
+
+    public long append(String topic, com.google.protobuf.ByteString payload, String key, long clientTimestamp, long raftIndex) {
+        return append(topic, payload, key, clientTimestamp, raftIndex, -1L);
     }
 
     /**
      * Append a message to the specified topic.
      */
-    public long append(String topic, com.google.protobuf.ByteString payload, String key, long clientTimestamp, long raftIndex) {
-        long offset = globalOffset.getAndIncrement();
+    public long append(String topic, com.google.protobuf.ByteString payload, String key, long clientTimestamp, long raftIndex, long predefinedBaseOffset) {
+        long offset = predefinedBaseOffset >= 0 ? predefinedBaseOffset : globalOffset.getAndIncrement();
+        if (predefinedBaseOffset >= 0) {
+            updateGlobalOffset(predefinedBaseOffset + 1);
+        }
         long storedAt = System.currentTimeMillis();
 
         StoredMessage.Builder builder = StoredMessage.newBuilder()
@@ -361,12 +379,19 @@ public class MessageStore implements Closeable {
      * @return The base offset (offset of the first message in the batch)
      */
     public long appendBatch(String topic, List<ProduceBatchRequest.BatchEntry> entries, long raftIndex) {
+        return appendBatch(topic, entries, raftIndex, -1L);
+    }
+
+    public long appendBatch(String topic, List<ProduceBatchRequest.BatchEntry> entries, long raftIndex, long predefinedBaseOffset) {
         int batchSize = entries.size();
         if (batchSize == 0) {
             throw new IllegalArgumentException("Batch must contain at least one message");
         }
 
-        long baseOffset = globalOffset.getAndAdd(batchSize);
+        long baseOffset = predefinedBaseOffset >= 0 ? predefinedBaseOffset : globalOffset.getAndAdd(batchSize);
+        if (predefinedBaseOffset >= 0) {
+            updateGlobalOffset(predefinedBaseOffset + batchSize);
+        }
         long storedAt = System.currentTimeMillis();
 
         List<StoredMessage> messages = new ArrayList<>(batchSize);
@@ -438,6 +463,10 @@ public class MessageStore implements Closeable {
      * Returns a map of topic -> base offset for each slice.
      */
     public Map<String, Long> appendAtomicBatch(List<AtomicBatchTopicSlice> slices, long raftIndex) {
+        return appendAtomicBatch(slices, raftIndex, -1L);
+    }
+
+    public Map<String, Long> appendAtomicBatch(List<AtomicBatchTopicSlice> slices, long raftIndex, long predefinedBaseOffset) {
         if (slices.isEmpty()) {
             return Collections.emptyMap();
         }
@@ -447,7 +476,10 @@ public class MessageStore implements Closeable {
             return Collections.emptyMap();
         }
 
-        long baseOffset = globalOffset.getAndAdd(totalMessages);
+        long baseOffset = predefinedBaseOffset >= 0 ? predefinedBaseOffset : globalOffset.getAndAdd(totalMessages);
+        if (predefinedBaseOffset >= 0) {
+            updateGlobalOffset(predefinedBaseOffset + totalMessages);
+        }
         long storedAt = System.currentTimeMillis();
 
         Map<String, Long> topicBaseOffsets = new LinkedHashMap<>();
