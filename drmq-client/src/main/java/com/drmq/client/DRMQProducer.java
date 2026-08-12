@@ -578,6 +578,9 @@ public class DRMQProducer implements AutoCloseable {
         try { if (in != null) in.close(); } catch (IOException ignored) {}
         try { if (out != null) out.close(); } catch (IOException ignored) {}
         try { if (socket != null && !socket.isClosed()) socket.close(); } catch (IOException ignored) {}
+        in = null;
+        out = null;
+        socket = null;
     }
 
     public boolean isConnected() {
@@ -691,6 +694,10 @@ public class DRMQProducer implements AutoCloseable {
                     if (!running && inflightBatches.isEmpty()) break;
                     if (running) {
                         logger.debug("Reader: connection lost, failing inflight batches: {}", e.getMessage());
+                        synchronized (connectLock) {
+                            closeConnection();
+                            rotateToNextServer();
+                        }
                         failAllInflight(e);
                     }
                     continue;
