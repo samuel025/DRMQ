@@ -145,9 +145,11 @@ public class SingleThreadStressTestApp {
                         counter[0]++;
                     } else {
                         counter[1]++;
+                        try { Thread.sleep(10); } catch (InterruptedException ignored) {}
                     }
                 } catch (Exception e) {
                     counter[1]++;
+                    try { Thread.sleep(10); } catch (InterruptedException ignored) {}
                 }
             }
         }

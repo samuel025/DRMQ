@@ -742,7 +742,8 @@ public class DRMQProducer implements AutoCloseable {
                 ErrorCode errorCode = response.getErrorCode();
                 String errorMsg = response.getErrorMessage();
                 
-                if (errorCode == ErrorCode.NOT_LEADER && running) {
+                boolean isNotLeader = errorCode == ErrorCode.NOT_LEADER || (errorMsg != null && errorMsg.contains("NOT_LEADER"));
+                if (isNotLeader && running) {
                     // Parse leader address from error message (format: "NOT_LEADER:host:port")
                     String leaderAddr = extractLeaderAddress(errorMsg);
                     if (leaderAddr != null) {
@@ -800,7 +801,8 @@ public class DRMQProducer implements AutoCloseable {
                 ErrorCode errorCode = response.getErrorCode();
                 String errorMsg = response.getErrorMessage();
                 
-                if (errorCode == ErrorCode.NOT_LEADER && running) {
+                boolean isNotLeader = errorCode == ErrorCode.NOT_LEADER || (errorMsg != null && errorMsg.contains("NOT_LEADER"));
+                if (isNotLeader && running) {
                     // Parse leader address from error message (format: "NOT_LEADER:host:port")
                     String leaderAddr = extractLeaderAddress(errorMsg);
                     if (leaderAddr != null) {

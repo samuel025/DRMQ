@@ -190,7 +190,9 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
                 logger.error("Error processing produce request", e);
                 BrokerMetrics.get().recordRequest("produce", false,
                     System.nanoTime() - startNanos, finalPayloadBytes, 1);
-                return createProduceErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR);
+                String msg = e != null ? e.getMessage() : "Unknown error";
+                ErrorCode code = (msg != null && msg.contains("NOT_LEADER")) ? ErrorCode.NOT_LEADER : ErrorCode.UNKNOWN_ERROR;
+                return createProduceErrorResponse(msg, code);
             });
 
         } catch (Exception e) {
@@ -263,7 +265,9 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
                 logger.error("Error processing produce batch request", e);
                 BrokerMetrics.get().recordRequest("produce_batch", false,
                     System.nanoTime() - startNanos, finalPayloadBytes, finalBatchCount);
-                return createProduceBatchErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR);
+                String msg = e != null ? e.getMessage() : "Unknown error";
+                ErrorCode code = (msg != null && msg.contains("NOT_LEADER")) ? ErrorCode.NOT_LEADER : ErrorCode.UNKNOWN_ERROR;
+                return createProduceBatchErrorResponse(msg, code);
             });
 
         } catch (Exception e) {
@@ -343,7 +347,9 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
                 logger.error("Error processing atomic produce request", e);
                 BrokerMetrics.get().recordRequest("atomic_produce", false,
                     System.nanoTime() - startNanos, finalPayloadBytes, finalBatchCount);
-                return createAtomicProduceErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR);
+                String msg = e != null ? e.getMessage() : "Unknown error";
+                ErrorCode code = (msg != null && msg.contains("NOT_LEADER")) ? ErrorCode.NOT_LEADER : ErrorCode.UNKNOWN_ERROR;
+                return createAtomicProduceErrorResponse(msg, code);
             });
 
         } catch (Exception e) {
