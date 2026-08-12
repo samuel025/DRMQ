@@ -136,12 +136,7 @@ function Connection({ x1, y1, x2, y2, produceRate, consumeRate, latencyMs,
   const cx = mx + nx * 30, cy = my + ny * 30;
   // Visual path is always drawn x1→x2 for the line itself
   const displayPath = `M ${x1} ${y1} Q ${cx} ${cy} ${x2} ${y2}`;
-  // Replication particle path: if direction is 'reverse', swap endpoints
-  // so particles visually travel from x2→x1 (i.e. from the leader end)
-  const rcx = mx - nx * 30, rcy = my - ny * 30; // mirror control point
-  const replicationPath = replicationDirection === 'reverse'
-    ? `M ${x2} ${y2} Q ${rcx} ${rcy} ${x1} ${y1}`
-    : displayPath;
+  const isReverse = replicationDirection === 'reverse';
 
   return (
     <g>
@@ -161,12 +156,12 @@ function Connection({ x1, y1, x2, y2, produceRate, consumeRate, latencyMs,
 
       {produceRate > 0 && replicationDirection !== 'none' && (
         <>
-          <DataParticle path={replicationPath} color="#06b6d4" delay={0} duration={2.5} />
-          <DataParticle path={replicationPath} color="#06b6d4" delay={1.2} duration={2.5} />
+          <DataParticle path={displayPath} color="#06b6d4" delay={0} duration={2.5} reverse={isReverse} />
+          <DataParticle path={displayPath} color="#06b6d4" delay={1.2} duration={2.5} reverse={isReverse} />
         </>
       )}
       {consumeRate > 0 && replicationDirection !== 'none' && (
-        <DataParticle path={replicationPath} color="#a855f7" delay={0.6} duration={2.8} reverse />
+        <DataParticle path={displayPath} color="#a855f7" delay={0.6} duration={2.8} reverse={!isReverse} />
       )}
     </g>
   );

@@ -1,7 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { Panel } from '../components/DashboardWidgets';
 import { RefreshCw, Database } from 'lucide-react';
-import { DitherButton } from '../components/dither-kit';
 import { motion, AnimatePresence } from 'framer-motion';
 
 interface TopicData {
