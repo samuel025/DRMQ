@@ -78,6 +78,7 @@ public class RaftNode {
     private final Path dataDir;
     private final Path stateFilePath;
     private final long raftCompactThreshold;
+    private final boolean raftFsyncEnabled;
 
     private final AtomicBoolean isCompacting = new AtomicBoolean(false);
 
@@ -237,6 +238,7 @@ public class RaftNode {
         this.dataDir = dataDir;
         this.snapshotManager = new SnapshotManager(dataDir, messageStore, offsetManager);
         this.raftCompactThreshold = raftCompactThreshold;
+        this.raftFsyncEnabled = raftFsyncEnabled;
         this.raftLog = new RaftLog(dataDir, raftFsyncEnabled);
         this.state = RaftState.FOLLOWER;
         this.commitIndex = 0;
@@ -1645,7 +1647,7 @@ public class RaftNode {
                             ProduceBatchRequest batchRequest = (cached instanceof ProduceBatchRequest pbr)
                                     ? pbr
                                     : ProduceBatchRequest.parseFrom(entry.getPayload());
-                            long baseOffset = messageStore.appendBatch(entry.getTopic(), batchRequest.getEntriesList());
+                            long baseOffset = messageStore.appendBatch(entry.getTopic(), batchRequest.getEntriesList(), lastApplied);
                             completionValue = baseOffset;
                             logger.debug("[{}] Applied raft batch entry {} to MessageStore (topic={}, count={})",
                                     nodeId, lastApplied, entry.getTopic(), batchRequest.getEntriesCount());
@@ -1655,7 +1657,7 @@ public class RaftNode {
                             com.drmq.protocol.AtomicBatchRequest req = (cached instanceof com.drmq.protocol.AtomicBatchRequest abr)
                                     ? abr
                                     : com.drmq.protocol.AtomicBatchRequest.parseFrom(entry.getPayload());
-                            Map<String, Long> baseOffsets = messageStore.appendAtomicBatch(req.getSlicesList());
+                            Map<String, Long> baseOffsets = messageStore.appendAtomicBatch(req.getSlicesList(), lastApplied);
                             localAtomicBatchBaseOffsets = baseOffsets;
                             completionValue = lastApplied;
                             logger.debug("[{}] Applied ATOMIC_BATCH entry {} to {} topics: {}",
@@ -1667,7 +1669,8 @@ public class RaftNode {
                                     entry.getTopic(),
                                     entry.getPayload(),
                                     entry.hasKey() ? entry.getKey() : null,
-                                    entry.getTimestamp()
+                                    entry.getTimestamp(),
+                                    lastApplied
                             );
                             completionValue = msgOffset;
                             logger.debug("[{}] Applied raft entry {} to MessageStore (topic={})",
@@ -2240,6 +2243,7 @@ public class RaftNode {
      * Handle an incoming Tier 2 Incremental Sync chunk.
      */
     public IncrementalSnapshotChunkResponse handleIncrementalSnapshotChunk(IncrementalSnapshotChunk request) {
+        long termToReturn;
         lock.lock();
         try {
             if (request.getTerm() > currentTerm) {
@@ -2256,7 +2260,12 @@ public class RaftNode {
             resetElectionTimer();
             leaderId = request.getLeaderId();
             state = RaftState.FOLLOWER;
+            termToReturn = currentTerm;
+        } finally {
+            lock.unlock();
+        }
 
+        try {
             String topic = request.getTopic();
             String fileName = request.getFileName();
             Path tempSnapshotDir = dataDir.resolve(".snapshot-tmp");
@@ -2282,17 +2291,15 @@ public class RaftNode {
             }
 
             return IncrementalSnapshotChunkResponse.newBuilder()
-                    .setTerm(currentTerm)
+                    .setTerm(termToReturn)
                     .setSuccess(true)
                     .build();
         } catch (Exception e) {
             logger.error("Error handling IncrementalSnapshotChunk", e);
             return IncrementalSnapshotChunkResponse.newBuilder()
-                    .setTerm(currentTerm)
+                    .setTerm(termToReturn)
                     .setSuccess(false)
                     .build();
-        } finally {
-            lock.unlock();
         }
     }
 
@@ -2471,12 +2478,21 @@ public class RaftNode {
             votedFor = vf.isEmpty() ? null : vf;
             lastApplied = Long.parseLong(props.getProperty("lastApplied", "0"));
             lastAppliedTerm = Long.parseLong(props.getProperty("lastAppliedTerm", "0"));
+            
+            long msRaftIndex = messageStore != null ? messageStore.getLastAppliedRaftIndex() : -1;
+            if (msRaftIndex >= 0 && msRaftIndex != lastApplied) {
+                logger.info("[{}] Aligning lastApplied from {} to MessageStore's {} for mathematically idempotent recovery", nodeId, lastApplied, msRaftIndex);
+                lastApplied = msRaftIndex;
+                lastAppliedTerm = raftLog.getTermAt(lastApplied);
+                if (lastAppliedTerm == 0) {
+                    lastAppliedTerm = Long.parseLong(props.getProperty("lastAppliedTerm", "0"));
+                }
+            }
+            
             if (raftLog.getLastIndex() == 0 && lastApplied > 0) {
                 raftLog.setStartIndex(lastApplied + 1);
             }
             commitIndex = Math.min(raftLog.getLastIndex(), Math.max(commitIndex, lastApplied));
-            
-            
             if (raftLog.getLastIndex() - raftLog.getStartIndex() > raftCompactThreshold) {
                 long compactUpTo = lastApplied - 100;
                 if (compactUpTo > raftLog.getStartIndex()) {

@@ -168,7 +168,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
                 }
                 offsetFuture = raftNode.proposeAsync(topic, payload, key, timestamp);
             } else {
-                offsetFuture = java.util.concurrent.CompletableFuture.completedFuture(messageStore.append(topic, payload, key, timestamp));
+                offsetFuture = java.util.concurrent.CompletableFuture.completedFuture(messageStore.append(topic, payload, key, timestamp, -1));
             }
 
             return offsetFuture.thenApply(offset -> {
@@ -240,7 +240,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
                 }
                 offsetFuture = raftNode.proposeBatchAsync(topic, request.getEntriesList());
             } else {
-                offsetFuture = java.util.concurrent.CompletableFuture.completedFuture(messageStore.appendBatch(topic, request.getEntriesList()));
+                offsetFuture = java.util.concurrent.CompletableFuture.completedFuture(messageStore.appendBatch(topic, request.getEntriesList(), -1));
             }
 
             return offsetFuture.thenApply(baseOffset -> {
@@ -321,7 +321,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
                 }
                 offsetsFuture = raftNode.proposeAtomicBatchAsync(request.getSlicesList());
             } else {
-                offsetsFuture = java.util.concurrent.CompletableFuture.completedFuture(messageStore.appendAtomicBatch(request.getSlicesList()));
+                offsetsFuture = java.util.concurrent.CompletableFuture.completedFuture(messageStore.appendAtomicBatch(request.getSlicesList(), -1));
             }
 
             return offsetsFuture.thenApply(offsets -> {

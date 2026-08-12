@@ -44,7 +44,7 @@ class SnapshotManagerTest {
     @Test
     void testStreamIncrementalSegments() throws IOException {
         // 1. Create some dummy state to stream
-        messageStore.append("test-topic", "dummy-message-data".getBytes(), null, System.currentTimeMillis());
+        messageStore.append("test-topic", "dummy-message-data".getBytes(), null, System.currentTimeMillis(), -1L);
         Path topicDir = tempDir.resolve("test-topic");
 
         offsetManager.commit("mygroup", "test-topic", 100L);

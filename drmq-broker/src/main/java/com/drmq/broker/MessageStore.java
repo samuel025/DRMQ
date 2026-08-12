@@ -36,6 +36,7 @@ public class MessageStore implements Closeable {
     private static final Logger logger = LoggerFactory.getLogger(MessageStore.class);
 
     private final AtomicLong globalOffset = new AtomicLong(0);
+    private final AtomicLong lastAppliedRaftIndex = new AtomicLong(-1);
     private final LogManager logManager;
     private final BrokerConfig config;
     private final ScheduledExecutorService cleanerScheduler = Executors.newSingleThreadScheduledExecutor();
@@ -89,6 +90,10 @@ public class MessageStore implements Closeable {
         }
     }
 
+    public boolean isFsyncEnabled() {
+        return config != null && config.isLogSegmentFsync();
+    }
+
     /**
      * Recovery: Rebuild the index from log files on disk.
      */
@@ -126,6 +131,10 @@ public class MessageStore implements Closeable {
                         
                         if (offset > maxOffset) {
                             maxOffset = offset;
+                        }
+                        
+                        if (message.getRaftIndex() > lastAppliedRaftIndex.get()) {
+                            lastAppliedRaftIndex.set(message.getRaftIndex());
                         }
                         
                         position += 4 + message.getSerializedSize();
@@ -188,6 +197,9 @@ public class MessageStore implements Closeable {
                             }
                             if (m.getOffset() > maxOffset) {
                                 maxOffset = m.getOffset();
+                            }
+                            if (m.getRaftIndex() > lastAppliedRaftIndex.get()) {
+                                lastAppliedRaftIndex.set(m.getRaftIndex());
                             }
                         }
                     }
@@ -260,14 +272,22 @@ public class MessageStore implements Closeable {
                 .add(message);
     }
 
-    public long append(String topic, byte[] payload, String key, long clientTimestamp) {
-        return append(topic, com.google.protobuf.ByteString.copyFrom(payload), key, clientTimestamp);
+    public long getLastAppliedRaftIndex() {
+        return lastAppliedRaftIndex.get();
+    }
+    
+    public long getNextOffset() {
+        return globalOffset.get();
+    }
+
+    public long append(String topic, byte[] payload, String key, long clientTimestamp, long raftIndex) {
+        return append(topic, com.google.protobuf.ByteString.copyFrom(payload), key, clientTimestamp, raftIndex);
     }
 
     /**
      * Append a message to the specified topic.
      */
-    public long append(String topic, com.google.protobuf.ByteString payload, String key, long clientTimestamp) {
+    public long append(String topic, com.google.protobuf.ByteString payload, String key, long clientTimestamp, long raftIndex) {
         long offset = globalOffset.getAndIncrement();
         long storedAt = System.currentTimeMillis();
 
@@ -276,7 +296,8 @@ public class MessageStore implements Closeable {
                 .setTopic(topic)
                 .setPayload(payload)
                 .setTimestamp(clientTimestamp)
-                .setStoredAt(storedAt);
+                .setStoredAt(storedAt)
+                .setRaftIndex(raftIndex);
 
         if (key != null && !key.isEmpty()) {
             builder.setKey(key);
@@ -322,6 +343,10 @@ public class MessageStore implements Closeable {
             messageSignal.incrementAndGet();
             messageMonitor.notifyAll();
         }
+        
+        if (raftIndex > lastAppliedRaftIndex.get()) {
+            lastAppliedRaftIndex.set(raftIndex);
+        }
 
         return offset;
     }
@@ -335,7 +360,7 @@ public class MessageStore implements Closeable {
      * @param entries   The batch entries (payload, key, timestamp)
      * @return The base offset (offset of the first message in the batch)
      */
-    public long appendBatch(String topic, List<ProduceBatchRequest.BatchEntry> entries) {
+    public long appendBatch(String topic, List<ProduceBatchRequest.BatchEntry> entries, long raftIndex) {
         int batchSize = entries.size();
         if (batchSize == 0) {
             throw new IllegalArgumentException("Batch must contain at least one message");
@@ -352,7 +377,8 @@ public class MessageStore implements Closeable {
                     .setTopic(topic)
                     .setPayload(entry.getPayload())
                     .setTimestamp(entry.getClientTimestamp())
-                    .setStoredAt(storedAt);
+                    .setStoredAt(storedAt)
+                    .setRaftIndex(raftIndex);
 
             if (entry.hasKey()) {
                 builder.setKey(entry.getKey());
@@ -398,6 +424,10 @@ public class MessageStore implements Closeable {
             messageSignal.incrementAndGet();
             messageMonitor.notifyAll();
         }
+        
+        if (raftIndex > lastAppliedRaftIndex.get()) {
+            lastAppliedRaftIndex.set(raftIndex);
+        }
 
         return baseOffset;
     }
@@ -407,7 +437,7 @@ public class MessageStore implements Closeable {
      * Either all topic writes succeed, or none are visible.
      * Returns a map of topic -> base offset for each slice.
      */
-    public Map<String, Long> appendAtomicBatch(List<AtomicBatchTopicSlice> slices) {
+    public Map<String, Long> appendAtomicBatch(List<AtomicBatchTopicSlice> slices, long raftIndex) {
         if (slices.isEmpty()) {
             return Collections.emptyMap();
         }
@@ -436,7 +466,8 @@ public class MessageStore implements Closeable {
                         .setTopic(topic)
                         .setPayload(entry.getPayload())
                         .setTimestamp(entry.getClientTimestamp())
-                        .setStoredAt(storedAt);
+                        .setStoredAt(storedAt)
+                        .setRaftIndex(raftIndex);
 
                 if (entry.hasKey()) {
                     builder.setKey(entry.getKey());
@@ -521,6 +552,10 @@ public class MessageStore implements Closeable {
         synchronized (messageMonitor) {
             messageSignal.incrementAndGet();
             messageMonitor.notifyAll();
+        }
+        
+        if (raftIndex > lastAppliedRaftIndex.get()) {
+            lastAppliedRaftIndex.set(raftIndex);
         }
 
         return topicBaseOffsets;

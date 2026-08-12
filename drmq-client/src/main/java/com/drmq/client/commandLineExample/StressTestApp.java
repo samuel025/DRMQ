@@ -190,13 +190,9 @@ public class StressTestApp {
                         prod.send(topic, payloadBytes).whenComplete((result, ex) -> {
                             myPermit.release();
                             if (ex == null && result != null && result.isSuccess()) {
-                                long sentCount = messagesSent.incrementAndGet();
+                                messagesSent.incrementAndGet();
                                 if (bounded && latencies != null && capturedIdx >= 0) {
                                     latencies[(int) capturedIdx] = System.currentTimeMillis() - sendTs;
-                                }
-                                // Signal completion when the last ack arrives
-                                if (bounded && sentCount >= numRecords && doneLatch != null) {
-                                    doneLatch.countDown();
                                 }
                             } else {
                                 long currentErrors = errors.incrementAndGet();
@@ -204,10 +200,11 @@ public class StressTestApp {
                                     System.err.println("Message failed: " + (ex != null ? ex.getMessage() : "Unknown error"));
                                     if (ex != null) ex.printStackTrace();
                                 }
-                                // Still signal done if errors pushed us past the target
-                                if (bounded && (messagesSent.get() + errors.get()) >= numRecords && doneLatch != null) {
-                                    doneLatch.countDown();
-                                }
+                            }
+                            
+                            // Check completion condition regardless of success/error
+                            if (bounded && (messagesSent.get() + errors.get()) >= numRecords && doneLatch != null) {
+                                doneLatch.countDown();
                             }
                         });
                     }

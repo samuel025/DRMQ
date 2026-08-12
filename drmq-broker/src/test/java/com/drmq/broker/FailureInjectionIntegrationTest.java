@@ -67,7 +67,7 @@ public class FailureInjectionIntegrationTest {
         }
         
         // Append a message so acquireMessages actually creates a lease
-        messageStore.append("test-topic", "data".getBytes(), null, System.currentTimeMillis());
+        messageStore.append("test-topic", "data".getBytes(), null, System.currentTimeMillis(), -1L);
         
         // Consumer acquires messages to create a lease
         coordinator.acquireMessages("test-group", "test-topic", "consumer-1", 10, 0);
@@ -159,7 +159,7 @@ public class FailureInjectionIntegrationTest {
         LogManager dummyLogManager = new LogManager(dummyDir.toString());
         BrokerConfig dummyConfig = new BrokerConfig(9093, dummyDir.toString());
         MessageStore dummyStore = new MessageStore(dummyLogManager, dummyConfig);
-        dummyStore.append("new-topic", "binary-message-data".getBytes(), null, System.currentTimeMillis());
+        dummyStore.append("new-topic", "binary-message-data".getBytes(), null, System.currentTimeMillis(), -1L);
         Path dummySegment = dummyDir.resolve("new-topic").resolve("00000000000000000000.log");
         byte[] segmentBytes = Files.readAllBytes(dummySegment);
         long segmentLength = Files.size(dummySegment);
@@ -170,7 +170,7 @@ public class FailureInjectionIntegrationTest {
         assertEquals(dummySegment.toAbsolutePath(), segmentsForSync.get(0).toAbsolutePath());
         
         // Also verify the leader ignores older segments
-        dummyStore.append("new-topic", "msg2".getBytes(), null, System.currentTimeMillis());
+        dummyStore.append("new-topic", "msg2".getBytes(), null, System.currentTimeMillis(), -1L);
         // Since both messages are in the same segment here, it still returns 1 segment, but testing the API
         
         dummyLogManager.close();

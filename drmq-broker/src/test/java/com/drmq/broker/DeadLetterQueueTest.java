@@ -57,13 +57,13 @@ class DeadLetterQueueTest {
 
     private void produceMessages(int count) {
         for (int i = 0; i < count; i++) {
-            messageStore.append(TOPIC, ("msg-" + i).getBytes(), null, System.currentTimeMillis());
+            messageStore.append(TOPIC, ("msg-" + i).getBytes(), null, System.currentTimeMillis(), -1L);
         }
     }
 
     private void produceMessages(String topic, int count) {
         for (int i = 0; i < count; i++) {
-            messageStore.append(topic, ("msg-" + i).getBytes(), null, System.currentTimeMillis());
+            messageStore.append(topic, ("msg-" + i).getBytes(), null, System.currentTimeMillis(), -1L);
         }
     }
 
@@ -195,7 +195,7 @@ class DeadLetterQueueTest {
     @Test
     void dlqPreservesMessageKeyAndPayload() {
         // Produce a message WITH a key
-        messageStore.append(TOPIC, "important-payload".getBytes(), "routing-key-42", System.currentTimeMillis());
+        messageStore.append(TOPIC, "important-payload".getBytes(), "routing-key-42", System.currentTimeMillis(), -1L);
 
         String dlqTopic = coordinator.getDlqTopicName(GROUP, TOPIC);
 

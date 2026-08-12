@@ -282,7 +282,10 @@ public final class BrokerMetrics implements AutoCloseable {
         appendJsonField(json, "raft_last_applied", gaugeValue("drmq.broker.raft.last_applied"), true);
 
         json.append("\"requests\":{");
-        appendJsonMetricObject(json, "produce", "drmq.broker.request.total", Tags.of("type", "produce", "outcome", "success"));
+        double produceSuccess = counterValue("drmq.broker.request.total", Tags.of("type", "produce", "outcome", "success"))
+                              + counterValue("drmq.broker.request.total", Tags.of("type", "produce_batch", "outcome", "success"))
+                              + counterValue("drmq.broker.request.total", Tags.of("type", "atomic_produce", "outcome", "success"));
+        json.append("\"produce\":{\"success_total\":").append(produceSuccess).append("}");
         json.append(',');
         appendJsonMetricObject(json, "consume", "drmq.broker.request.total", Tags.of("type", "consume", "outcome", "success"));
         json.append(',');
@@ -293,10 +296,13 @@ public final class BrokerMetrics implements AutoCloseable {
 
         double elapsedSeconds = elapsedSeconds();
         json.append(",\"throughput\":{");
-        appendJsonThroughput(json, "produce",
-            counterValue("drmq.broker.request.bytes", Tags.of("type", "produce")),
-            counterValue("drmq.broker.request.records", Tags.of("type", "produce")),
-            elapsedSeconds);
+        double produceBytes = counterValue("drmq.broker.request.bytes", Tags.of("type", "produce"))
+                            + counterValue("drmq.broker.request.bytes", Tags.of("type", "produce_batch"))
+                            + counterValue("drmq.broker.request.bytes", Tags.of("type", "atomic_produce"));
+        double produceRecords = counterValue("drmq.broker.request.records", Tags.of("type", "produce"))
+                              + counterValue("drmq.broker.request.records", Tags.of("type", "produce_batch"))
+                              + counterValue("drmq.broker.request.records", Tags.of("type", "atomic_produce"));
+        appendJsonThroughput(json, "produce", produceBytes, produceRecords, elapsedSeconds);
         json.append(',');
         appendJsonThroughput(json, "consume",
             counterValue("drmq.broker.request.bytes", Tags.of("type", "consume")),
@@ -305,7 +311,10 @@ public final class BrokerMetrics implements AutoCloseable {
         json.append('}');
 
         json.append(",\"latency\":{");
-        appendJsonLatency(json, "produce", timerMeanSeconds("drmq.broker.request.latency", Tags.of("type", "produce")));
+        double singleLat = timerMeanSeconds("drmq.broker.request.latency", Tags.of("type", "produce"));
+        double batchLat = timerMeanSeconds("drmq.broker.request.latency", Tags.of("type", "produce_batch"));
+        double atomicLat = timerMeanSeconds("drmq.broker.request.latency", Tags.of("type", "atomic_produce"));
+        appendJsonLatency(json, "produce", Math.max(Math.max(singleLat, batchLat), atomicLat));
         json.append(',');
         appendJsonLatency(json, "consume", timerMeanSeconds("drmq.broker.request.latency", Tags.of("type", "consume")));
         json.append('}');

@@ -46,7 +46,7 @@ class ConsumerGroupCoordinatorTest {
 
     private void produceMessages(int count) {
         for (int i = 0; i < count; i++) {
-            messageStore.append(TOPIC, ("msg-" + i).getBytes(), null, System.currentTimeMillis());
+            messageStore.append(TOPIC, ("msg-" + i).getBytes(), null, System.currentTimeMillis(), -1L);
         }
     }
 

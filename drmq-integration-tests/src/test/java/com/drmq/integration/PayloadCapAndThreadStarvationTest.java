@@ -29,6 +29,7 @@ public class PayloadCapAndThreadStarvationTest {
 
     @Test
     void testPayloadCapExceeded() throws Exception {
+        System.setProperty("drmq.test.mode", "true");
         System.out.println("=================================================");
         System.out.println("RUNNING PAYLOAD CAP REPRODUCTION TEST (Section 4.6.2)");
         System.out.println("=================================================");

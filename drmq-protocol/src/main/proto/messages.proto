@@ -63,6 +63,7 @@ message StoredMessage {
     optional string key = 4;
     int64 timestamp = 5;     
     int64 stored_at = 6;     
+    int64 raft_index = 7;
 }
 
 message ConsumeRequest {

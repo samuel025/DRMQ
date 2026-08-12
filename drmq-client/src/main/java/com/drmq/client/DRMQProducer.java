@@ -56,6 +56,9 @@ public class DRMQProducer implements AutoCloseable {
     private final Thread senderThread;
     private final Thread atomicSenderThread;
     private Thread readerThread;
+    private Thread reaperThread;
+    
+    private static final long ACK_TIMEOUT_MS = 10_000;
 
     public DRMQProducer(String host, int port) {
         List<String[]> parsed = host != null && host.contains(",") ? parseBootstrapServers(host) : List.of();
@@ -78,6 +81,9 @@ public class DRMQProducer implements AutoCloseable {
         readerThread = new Thread(this::readerLoop, "drmq-producer-reader");
         readerThread.setDaemon(true);
         readerThread.start();
+        reaperThread = new Thread(this::reaperLoop, "drmq-producer-reaper");
+        reaperThread.setDaemon(true);
+        reaperThread.start();
     }
 
     public DRMQProducer(String bootstrapServersStr) {
@@ -96,6 +102,9 @@ public class DRMQProducer implements AutoCloseable {
         readerThread = new Thread(this::readerLoop, "drmq-producer-reader");
         readerThread.setDaemon(true);
         readerThread.start();
+        reaperThread = new Thread(this::reaperLoop, "drmq-producer-reaper");
+        reaperThread.setDaemon(true);
+        reaperThread.start();
     }
 
     private static List<String[]> parseBootstrapServers(String bootstrapServersStr) {
@@ -603,9 +612,46 @@ public class DRMQProducer implements AutoCloseable {
                 Thread.currentThread().interrupt();
             }
         }
+        if (reaperThread != null && reaperThread.isAlive()) {
+            reaperThread.interrupt();
+            try {
+                reaperThread.join(3000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
         // Fail any remaining inflight batches
         failAllInflight(new IOException("Producer closing"));
         logger.info("Disconnected from broker");
+    }
+
+    private void reaperLoop() {
+        while (running) {
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+            if (!connected) continue;
+
+            long now = System.currentTimeMillis();
+            boolean hasStuckBatch = false;
+            for (InflightBatch batch : inflightBatches.values()) {
+                if (now - batch.sentAtMs > ACK_TIMEOUT_MS) {
+                    hasStuckBatch = true;
+                    break;
+                }
+            }
+
+            if (hasStuckBatch) {
+                logger.warn("Inflight batch timed out after {} ms. Force closing connection to trigger retry.", ACK_TIMEOUT_MS);
+                synchronized (connectLock) {
+                    closeConnection();
+                    rotateToNextServer();
+                }
+            }
+        }
     }
 
     // ==================== Reader Thread (Async Response Processing) ====================

@@ -135,13 +135,16 @@ public class TelemetryWebSocketServer extends WebSocketServer {
 
 
         double produceBytes   = bm.getCounterValueByType("drmq.broker.request.bytes",   "produce")
-                              + bm.getCounterValueByType("drmq.broker.request.bytes",   "produce_batch");
+                              + bm.getCounterValueByType("drmq.broker.request.bytes",   "produce_batch")
+                              + bm.getCounterValueByType("drmq.broker.request.bytes",   "atomic_produce");
         double consumeBytes   = bm.getCounterValueByType("drmq.broker.request.bytes",   "consume");
         double produceRecords = bm.getCounterValueByType("drmq.broker.request.records", "produce")
-                              + bm.getCounterValueByType("drmq.broker.request.records", "produce_batch");
+                              + bm.getCounterValueByType("drmq.broker.request.records", "produce_batch")
+                              + bm.getCounterValueByType("drmq.broker.request.records", "atomic_produce");
         double consumeRecords = bm.getCounterValueByType("drmq.broker.request.records", "consume");
         double errors         = bm.getCounterValueByType("drmq.broker.request.errors",  "produce")
                               + bm.getCounterValueByType("drmq.broker.request.errors",  "produce_batch")
+                              + bm.getCounterValueByType("drmq.broker.request.errors",  "atomic_produce")
                               + bm.getCounterValueByType("drmq.broker.request.errors",  "consume");
 
         currentProduceMBps      = Math.max(0, (produceBytes   - lastProduceBytes)   / (1024.0 * 1024.0));
@@ -195,7 +198,8 @@ public class TelemetryWebSocketServer extends WebSocketServer {
         if (bm != null && bm.isEnabled()) {
             double singleLatency = bm.getTimerMeanMs("drmq.broker.request.latency", "produce");
             double batchLatency  = bm.getTimerMeanMs("drmq.broker.request.latency", "produce_batch");
-            produceLatencyMs = Math.max(singleLatency, batchLatency); // use whichever path is active
+            double atomicLatency = bm.getTimerMeanMs("drmq.broker.request.latency", "atomic_produce");
+            produceLatencyMs = Math.max(Math.max(singleLatency, batchLatency), atomicLatency); // use whichever path is active
             consumeLatencyMs = bm.getTimerMeanMs("drmq.broker.request.latency", "consume");
         }
         metrics.addProperty("produceLatencyMs", round4(produceLatencyMs));

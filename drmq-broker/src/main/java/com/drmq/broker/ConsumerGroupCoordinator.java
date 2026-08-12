@@ -408,7 +408,7 @@ public class ConsumerGroupCoordinator implements Closeable {
                         produceFuture = java.util.concurrent.CompletableFuture.failedFuture(new RuntimeException("NOT_LEADER"));
                     } else {
                         produceFuture = java.util.concurrent.CompletableFuture.completedFuture(
-                            messageStore.append(dlqTopic, payload, key, original.getTimestamp())
+                            messageStore.append(dlqTopic, payload, key, original.getTimestamp(), -1)
                         );
                     }
 

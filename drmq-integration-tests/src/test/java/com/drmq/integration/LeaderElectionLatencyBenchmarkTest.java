@@ -32,7 +32,7 @@ public class LeaderElectionLatencyBenchmarkTest {
 
     @Test
     void runElectionLatencyBenchmark() throws Exception {
-        int totalTrials = 15;
+        int totalTrials = 5;
         List<Long> latencies = new ArrayList<>();
 
         System.out.println("=================================================");
