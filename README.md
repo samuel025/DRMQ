@@ -13,19 +13,21 @@ The project is structured as a multi-module Maven build, separating the core bro
 ## Key Features
 
 - **Scalable Consumer Groups:** Scale your consumers dynamically without the complexity of partitions. Simply start multiple consumers with the same group name, and the broker will automatically distribute messages among them. Messages are load-balanced across consumers in a group with at-least-once delivery; a lease-based protocol ensures that uncommitted messages are redelivered if a consumer fails. Need to replay or read specific messages? Switch to single mode for full manual offset control.
+- **Cross-Topic Atomic Transactions:** Produce messages to multiple distinct topics in a single, atomic operation. Guaranteed to commit or fail as a single unit at the Raft consensus level, avoiding the overhead of external two-phase commit coordinators (like Kafka's transaction API). Supported natively in Java, Python, and TypeScript clients.
+- **Advanced Raft Consensus:** Full implementation of the Raft protocol with robust stability extensions:
+  - **Pre-Vote:** Prevents returning partitioned followers with artificially inflated terms from disrupting a healthy leader.
+  - **Quorum-Loss Stepdown:** Detects network partitions and immediately demotes isolated leaders, preventing split-brain scenarios and ensuring clients aren't writing to dead-end nodes.
+- **Incremental State Reconstruction:** Instead of relying on monolithic snapshots that pause the cluster, DRMQ seamlessly catches up lagging followers using bounded, per-topic segment transfers. This ensures rapid recovery without OOM errors.
 - **Dead-Letter Queues (DLQ):** Gracefully handle poison pill messages. Consumers can explicitly `nack()` unprocessable messages. After a configurable threshold of delivery failures, the broker automatically routes the message to an isolated DLQ topic and advances the consumer group, preventing blockages.
-- **Raft Consensus Integration:** Full implementation of the Raft protocol for distributed state replication, leader election, and high availability. Features **Quorum-Loss Stepdown** to detect network partitions and demote isolated leaders, preventing split-brain/ghost leadership data loss.
-- **Persistent Storage:** Custom Write-Ahead Log (WAL) and segment-based message storage ensure messages are durably persisted to disk. Features thread-safe, atomic consumer offset management with bounds locking designed to minimize data loss during concurrent background writes and handle shutdowns gracefully.
+- **Persistent Storage:** Custom Write-Ahead Log (WAL) and segment-based message storage ensure messages are durably persisted to disk. Features thread-safe, atomic consumer offset management with `.atomic-intent` crash safety designed to minimize data loss during concurrent background writes.
 - **InfinityLog (Tiered Storage):** Seamlessly archive old log segments to Amazon S3 (or MinIO) to decouple storage costs from compute. Consumers requesting historical offsets transparently trigger the broker to download and resolve missing segments from the cloud, with built-in pagination and atomic concurrent recovery.
 - **Time-based Message Lookup:** Clients can precisely rewind consumers to the earliest message at or after a specific UNIX timestamp (`seekByTime`), enabling accurate historical replay without knowing exact offsets.
-- **Graceful Teardown Coordination:** Orchestrated, safe termination of Netty EventLoops, RPC executors, and disk storage guaranteeing state integrity without resource leaks during node shutdowns.
 - **High Performance:**
-  - **Client-Side Batching:** Producers feature high-throughput, latency-optimized message batching via a configurable `linger.ms` window. This groups thousands of messages into a single network round-trip and Raft log flush, massively increasing throughput.
-  - **Configurable Disk Durability:** By default, DRMQ guarantees strict flush-before-ack durability (`fsync`). However, administrators can explicitly disable this (`--log-segment-fsync false`) for extreme throughput scenarios where hardware page-cache flushing is acceptable.
+  - **Client-Side Batching:** Producers feature high-throughput, latency-optimized message batching via a configurable `linger.ms` window. This groups thousands of messages into a single network round-trip and Raft log flush.
+  - **Configurable Disk Durability:** By default, DRMQ guarantees strict flush-before-ack durability (`fsync`). However, administrators can explicitly disable this for extreme throughput scenarios where hardware page-cache flushing is acceptable.
   - **Follower-based Reads:** Scalable read operations allowing consumers to fetch messages from follower nodes, distributing the load across the cluster.
-  - **Dedicated Thread Pools:** Separated executor services for Raft tasks and client handling prevent thread starvation and ensure consistent performance. Independent scheduler threads prevent I/O blocking from stunting cluster heartbeats.
 - **Robust Client Ecosystem:** Includes Java, Python, and TypeScript SDKs featuring automatic reconnects, randomized bootstrap load balancing, typed Error Code handling, and seamless leader failovers.
-- **Metrics & Observability:** Integrated with Micrometer and Prometheus to provide deep visibility into broker health, log replication lag, and throughput metrics.
+- **Real-Time Telemetry Dashboard:** Integrated React/Vite dashboard connecting to the broker via WebSockets, providing real-time metrics on Raft status, throughput, offset lag, and system health.
 
 ## Architecture & Modules
 
@@ -34,7 +36,8 @@ The repository is divided into several Maven modules:
 - `drmq-protocol`: Defines the Protocol Buffers (protobuf) messages used for client-broker and inter-broker communication.
 - `drmq-broker`: The core server implementation containing the Raft node logic, TCP server, message storage engine, and offset management.
 - `drmq-client`: Java client library providing high-level `Producer` and `Consumer` APIs.
-- `drmq-integration-tests`
+- `drmq-integration-tests`: Rigorous end-to-end benchmark and latency testing suites.
+- `drmq-dashboard`: React/Vite web application for real-time cluster telemetry visualization.
 
 ## Prerequisites
 
@@ -64,19 +67,16 @@ To run a standalone broker (useful for testing and development):
 To run a fault-tolerant cluster, you must start multiple broker instances and provide them with the addresses of their peers.
 
 **Node 1:**
-
 ```bash
 ./mvnw -pl drmq-broker exec:java -Dexec.args="--node-id 1 --port 9092 --data-dir ./data-1 --peers 2:localhost:9093,3:localhost:9094"
 ```
 
 **Node 2:**
-
 ```bash
 ./mvnw -pl drmq-broker exec:java -Dexec.args="--node-id 2 --port 9093 --data-dir ./data-2 --peers 1:localhost:9092,3:localhost:9094"
 ```
 
 **Node 3:**
-
 ```bash
 ./mvnw -pl drmq-broker exec:java -Dexec.args="--node-id 3 --port 9094 --data-dir ./data-3 --peers 1:localhost:9092,2:localhost:9093"
 ```
@@ -110,33 +110,35 @@ Then run the broker:
 
 ## Usage Example
 
-### Producer
+### Java Producer (Standard & Atomic Batch)
 
 ```java
 try (DRMQProducer producer = new DRMQProducer("localhost:9092,localhost:9093")) {
     producer.connect();
-    DRMQProducer.SendResult result = producer.send("my-topic", "Hello, DRMQ!");
+    
+    // 1. Standard Produce (Buffered automatically by linger.ms)
+    CompletableFuture<DRMQProducer.SendResult> future = producer.send("my-topic", "Hello, DRMQ!");
+    future.thenAccept(res -> System.out.println("Sent at offset: " + res.getOffset()));
+    
+    // 2. Cross-Topic Atomic Produce
+    Map<String, byte[]> atomicBatch = new HashMap<>();
+    atomicBatch.put("orders", "order-123".getBytes());
+    atomicBatch.put("inventory", "reserve-sku-456".getBytes());
+    
+    CompletableFuture<Map<String, Long>> atomicFuture = producer.sendAtomic(atomicBatch);
+    atomicFuture.thenAccept(offsets -> System.out.println("Atomic commit successful! Offsets: " + offsets));
 
-    if (result.isSuccess()) {
-        System.out.println("Message sent at offset " + result.getOffset());
-    } else {
-        System.err.println("Send failed: " + result.getErrorMessage());
-    }
 } catch (IOException e) {
     e.printStackTrace();
 }
 ```
 
-### Consumer
+### Java Consumer
 
-DRMQ supports two modes of consumption: **Group Mode** (for scalable, load-balanced processing) and **Single Consumer Mode** (for precise manual control and replay).
-
-#### 1. Group Mode (Default - Auto Load Balancing)
-
-By default, the broker coordinates message delivery. If you start multiple consumers with the same group name, the broker will automatically split the workload among them. Messages are load-balanced across consumers in a group with at-least-once delivery semantics — consumers should be idempotent to handle potential redelivery of uncommitted messages. No partitions required!
+DRMQ supports **Group Mode** (load-balanced) and **Single Consumer Mode** (manual offset control).
 
 ```java
-// Consumer 1
+// Group Mode Example (Automatic Load Balancing)
 DRMQConsumer c1 = new DRMQConsumer("localhost:9092,localhost:9093", "order-processors");
 c1.setAutoCommit(true);
 c1.connect();
@@ -147,9 +149,6 @@ DRMQConsumer c2 = new DRMQConsumer("localhost:9092,localhost:9093", "order-proce
 c2.setAutoCommit(true);
 c2.connect();
 c2.subscribe("orders");
-
-// The broker ensures c1 and c2 receive different messages.
-// A different group (e.g., "analytics") would receive its own full copy of all messages.
 
 while (true) {
     List<DRMQConsumer.ConsumedMessage> messages = c1.poll(100, 1000);
@@ -222,17 +221,25 @@ try (DRMQConsumer consumer = new DRMQConsumer("localhost:9092", "order-processor
 
 ### Python Client (SDK)
 
-DRMQ supports cross-language communication via raw TCP and Protocol Buffers. A Python client implementation is provided in `drmq-python-client`. 
-The SDK features automatic leader failover, transparent retries, and offset auto-commit functionality identical to the Java client.
+The Python client features automatic leader failover, pipelined batching, cross-topic atomicity, and offset auto-commit functionality.
 
-**Producer Example:**
+**Producer & Atomic Example:**
 ```python
 from drmq_client import DRMQProducer
 
 producer = DRMQProducer("localhost:9092,localhost:9093")
 producer.connect()
-res = producer.send("python-topic", b"Hello from Python!")
-print(f"Sent at offset {res.offset}")
+
+# Standard
+res = producer.send("python-topic", b"Hello from Python!").result()
+
+# Cross-Topic Atomic
+batch = {
+    "topic-A": b"Event A",
+    "topic-B": b"Event B"
+}
+offsets = producer.send_atomic(batch).result()
+print(f"Atomic commit successful: {offsets}")
 ```
 
 **Consumer Example:**
@@ -251,18 +258,24 @@ for msg in messages:
 
 ### TypeScript Client (SDK)
 
-A native Node.js/TypeScript client is provided in `drmq-ts-client`. Like the Python SDK, it natively supports cluster failovers and leader redirects.
+A native Node.js/TypeScript client natively supporting cluster failovers and leader redirects.
 
-**Producer Example:**
+**Producer & Atomic Example:**
 ```typescript
 import { DRMQProducer } from './client';
 
 const producer = new DRMQProducer("localhost:9092,localhost:9093");
 await producer.connect();
 
-const payload = Buffer.from("Hello from TypeScript!");
-const res = await producer.send("ts-topic", payload);
-console.log(`Sent at offset ${res.offset}`);
+// Standard
+await producer.send("ts-topic", Buffer.from("Hello from TypeScript!"));
+
+// Cross-Topic Atomic
+const offsets = await producer.sendAtomic({
+  "topic-A": Buffer.from("Event A"),
+  "topic-B": Buffer.from("Event B")
+});
+console.log("Atomic success:", offsets);
 ```
 
 **Consumer Example:**
@@ -285,28 +298,22 @@ for (const msg of messages) {
 DRMQ provides an interactive command-line interface for both the producer and consumer. This is great for testing and debugging.
 
 **Run the Producer CLI:**
-
 ```bash
 cd drmq-client
 mvn exec:java -Dexec.mainClass="com.drmq.client.commandLineExample.ProducerApp" -Dexec.args="localhost:9092,localhost:9093"
 ```
-
 _Commands:_ `send <topic> <message>`
 
 **Run the Consumer CLI:**
-
 ```bash
 cd drmq-client
 mvn exec:java -Dexec.mainClass="com.drmq.client.commandLineExample.ConsumerApp" -Dexec.args="localhost:9092,localhost:9093 my-consumer-group"
 ```
-
-Run multiple instances with the same group name in separate terminals to see messages load-balanced across consumers.
-
 _Commands:_ `subscribe <topic> [offset]`, `seek <topic> <timestamp>`, `poll`, `stream`, `commit`, `mode group|single`, `status`
 
 ## Monitoring
 
-The broker exposes Prometheus metrics. When integrated with a Prometheus server, you can monitor key metrics such as:
+The broker exposes Prometheus metrics and real-time WebSocket telemetry. When integrated with a Prometheus server, you can monitor key metrics such as:
 
 - `drmq_messages_produced_total`
 - `drmq_messages_consumed_total`

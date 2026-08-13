@@ -89,6 +89,7 @@ public class RaftNode {
     private final Map<String, Function<RequestTopicOffsetsRequest, RequestTopicOffsetsResponse>> requestTopicOffsetsRpcHandlers = new ConcurrentHashMap<>();
     private final Map<String, Function<IncrementalSnapshotChunk, IncrementalSnapshotChunkResponse>> incrementalSnapshotChunkRpcHandlers = new ConcurrentHashMap<>();
     private final Map<String, Function<IncrementalSnapshotDoneRequest, IncrementalSnapshotDoneResponse>> incrementalSnapshotDoneRpcHandlers = new ConcurrentHashMap<>();
+    private final Map<String, Function<AppendEntriesRequest, AppendEntriesResponse>> heartbeatRpcHandlers = new ConcurrentHashMap<>();
     private final ReentrantLock lock = new ReentrantLock();
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
     private final ExecutorService raftExecutor;
@@ -821,7 +822,6 @@ public class RaftNode {
     public void registerAppendHandler(String peerId, Function<AppendEntriesRequest, AppendEntriesResponse> handler) {
         java.util.List<Function<AppendEntriesRequest, AppendEntriesResponse>> pool = 
             appendRpcHandlerPools.computeIfAbsent(peerId, k -> new java.util.concurrent.CopyOnWriteArrayList<>());
-        pool.clear();
         pool.add(handler);
     }
 
@@ -844,8 +844,9 @@ public class RaftNode {
         incrementalSnapshotDoneRpcHandlers.put(peerId, handler);
     }
 
-    
-    
+    public void registerHeartbeatHandler(String peerId, Function<AppendEntriesRequest, AppendEntriesResponse> handler) {
+        heartbeatRpcHandlers.put(peerId, handler);
+    }
     //  Election 
 
     /**
@@ -1269,9 +1270,7 @@ public class RaftNode {
                 .setLeaderCommit(commitIndexLocal)
                 .build();
 
-        PeerReplicationState pState = peerPipelineState.get(peer.id());
-        Function<AppendEntriesRequest, AppendEntriesResponse> handler =
-                pState != null ? pickHandler(peer.id(), pState) : null;
+        Function<AppendEntriesRequest, AppendEntriesResponse> handler = heartbeatRpcHandlers.get(peer.id());
         if (handler != null) {
             try {
                 AppendEntriesResponse response = handler.apply(request);

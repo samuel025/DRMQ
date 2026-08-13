@@ -150,7 +150,7 @@ public class SnapshotManager {
             java.util.function.Function<IncrementalSnapshotChunk,IncrementalSnapshotChunkResponse> chunkHandler,
             java.util.function.Function<IncrementalSnapshotDoneRequest, IncrementalSnapshotDoneResponse> doneHandler) {
 
-        logger.info("[{}] Starting Tier 2 Incremental Sync for peer {} at Raft index {}", nodeId, peer.id(), manifest.snapshotIndex);
+        logger.info("[{}] Starting Incremental State Sync for peer {} at Raft index {}", nodeId, peer.id(), manifest.snapshotIndex);
 
         try {
 
@@ -174,10 +174,10 @@ public class SnapshotManager {
             if (doneResp == null || !doneResp.getSuccess()) {
                 throw new IOException("Follower " + peer.id() + " rejected IncrementalSnapshotDoneRequest");
             }
-            logger.info("[{}] Tier 2 Incremental Sync completed successfully for peer {}", nodeId, peer.id());
+            logger.info("[{}] Incremental State Sync completed successfully for peer {}", nodeId, peer.id());
 
         } catch (Exception e) {
-            logger.error("[{}] Tier 2 Incremental Sync failed for peer {}", nodeId, peer.id(), e);
+            logger.error("[{}] Incremental State Sync failed for peer {}", nodeId, peer.id(), e);
             throw new RuntimeException(e);
         }
     }

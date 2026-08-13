@@ -106,6 +106,7 @@ public class BrokerServer {
                 raftNode.registerRequestTopicOffsetsHandler(peer.id(), raftPeer::sendRequestTopicOffsets);
                 raftNode.registerIncrementalSnapshotChunkHandler(peer.id(), raftPeer::sendIncrementalSnapshotChunk);
                 raftNode.registerIncrementalSnapshotDoneHandler(peer.id(), raftPeer::sendIncrementalSnapshotDone);
+                raftNode.registerHeartbeatHandler(peer.id(), raftPeer::sendAppendEntries);
 
                 // Create a pool of connections for pipelined AppendEntries RPCs.
                 // Each connection has its own TCP socket, so parallel RPCs don't
