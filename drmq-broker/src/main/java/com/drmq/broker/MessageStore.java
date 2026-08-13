@@ -36,6 +36,7 @@ public class MessageStore implements Closeable {
     private static final Logger logger = LoggerFactory.getLogger(MessageStore.class);
 
     private final AtomicLong globalOffset = new AtomicLong(0);
+    private final AtomicLong lastAppliedRaftIndex = new AtomicLong(-1);
     private final LogManager logManager;
     private final BrokerConfig config;
     private final ScheduledExecutorService cleanerScheduler = Executors.newSingleThreadScheduledExecutor();
@@ -54,15 +55,13 @@ public class MessageStore implements Closeable {
     // In-memory cache for recent messages (Topic -> BoundedMessageCache)
     private final ConcurrentHashMap<String, BoundedMessageCache> messageCache = new ConcurrentHashMap<>();
     
-    // Per-topic write locks to make segment-check + rollover + append atomic
-    private final ConcurrentHashMap<String, Object> topicWriteLocks = new ConcurrentHashMap<>();
+    // Per-topic locks for append synchronization
+    private final ConcurrentHashMap<String, java.util.concurrent.locks.ReentrantLock> topicLocks = new ConcurrentHashMap<>();
     
     private static final int MAX_CACHE_SIZE_PER_TOPIC = 1000;
     private static final int INDEX_INTERVAL = 1000;
     private static final int MAX_INDEX_ENTRIES = 10000;
 
-    // Global lock to pause appends during snapshot generation
-    private final ReentrantReadWriteLock globalLock = new ReentrantReadWriteLock();
 
     private final Object messageMonitor = new Object();
     private final AtomicLong messageSignal = new AtomicLong(0);
@@ -91,16 +90,15 @@ public class MessageStore implements Closeable {
         }
     }
 
+    public boolean isFsyncEnabled() {
+        return config != null && config.isLogSegmentFsync();
+    }
+
     /**
      * Recovery: Rebuild the index from log files on disk.
      */
     public void recover() throws IOException {
-        globalLock.writeLock().lock();
-        try {
-            recoverInternal();
-        } finally {
-            globalLock.writeLock().unlock();
-        }
+        recoverInternal();
     }
 
     private void recoverInternal() throws IOException {
@@ -135,6 +133,10 @@ public class MessageStore implements Closeable {
                             maxOffset = offset;
                         }
                         
+                        if (message.getRaftIndex() > lastAppliedRaftIndex.get()) {
+                            lastAppliedRaftIndex.set(message.getRaftIndex());
+                        }
+                        
                         position += 4 + message.getSerializedSize();
                     }
                 } catch (CorruptRecordException cre) {
@@ -149,6 +151,76 @@ public class MessageStore implements Closeable {
             }
         }
 
+        // Recover partial atomic batch from WAL (intent file) if present
+        java.nio.file.Path intentFile = java.nio.file.Paths.get(config.getDataDir()).resolve(".atomic-intent");
+        if (java.nio.file.Files.exists(intentFile)) {
+            logger.info("Found .atomic-intent file. Recovering partial atomic batch...");
+            try (java.io.DataInputStream dis = new java.io.DataInputStream(new java.io.FileInputStream(intentFile.toFile()))) {
+                int numTopics = dis.readInt();
+                for (int i = 0; i < numTopics; i++) {
+                    String topic = dis.readUTF();
+                    int numMsgs = dis.readInt();
+                    List<StoredMessage> msgs = new ArrayList<>(numMsgs);
+                    for (int j = 0; j < numMsgs; j++) {
+                        int len = dis.readInt();
+                        byte[] msgBytes = new byte[len];
+                        dis.readFully(msgBytes);
+                        msgs.add(StoredMessage.parseFrom(msgBytes));
+                    }
+
+                    long currentHeadOffset = topicHeadOffsets.containsKey(topic) ? topicHeadOffsets.get(topic).get() : -1;
+                    List<StoredMessage> missingMsgs = new ArrayList<>();
+                    for (StoredMessage m : msgs) {
+                        if (m.getOffset() > currentHeadOffset) {
+                            missingMsgs.add(m);
+                        }
+                    }
+
+                    if (!missingMsgs.isEmpty()) {
+                        logger.info("Recovering {} missing messages for topic {}", missingMsgs.size(), topic);
+                        LogSegment segment = logManager.getOrCreateActiveSegment(topic);
+                        if (segment.getSize() >= config.getLogSegmentBytes()) {
+                            segment = logManager.rollNewSegment(topic, missingMsgs.get(0).getOffset());
+                        }
+                        List<Long> positions = segment.appendBatch(missingMsgs);
+                        
+                        AtomicLong counter = topicMessageCounts.computeIfAbsent(topic, k -> new AtomicLong());
+                        AtomicLong head = topicHeadOffsets.computeIfAbsent(topic, k -> new AtomicLong(-1));
+                        
+                        for (int j = 0; j < missingMsgs.size(); j++) {
+                            StoredMessage m = missingMsgs.get(j);
+                            indexMessage(topic, m.getOffset(), positions.get(j));
+                            addToCache(topic, m);
+                            counter.incrementAndGet();
+                            if (m.getOffset() > head.get()) {
+                                head.set(m.getOffset());
+                            }
+                            if (m.getOffset() > maxOffset) {
+                                maxOffset = m.getOffset();
+                            }
+                            if (m.getRaftIndex() > lastAppliedRaftIndex.get()) {
+                                lastAppliedRaftIndex.set(m.getRaftIndex());
+                            }
+                        }
+                    }
+                }
+                
+                // Only delete if recovery completely succeeded
+                try {
+                    java.nio.file.Files.deleteIfExists(intentFile);
+                } catch (IOException e) {
+                    logger.warn("Failed to delete atomic intent file after successful recovery", e);
+                }
+            } catch (Exception e) {
+                logger.error("FATAL: Failed to recover atomic intent file. Panicking to prevent dataloss!", e);
+                if (System.getProperty("drmq.test.mode") != null) {
+                    throw new RuntimeException("Simulated panic during atomic intent recovery", e);
+                } else {
+                    System.exit(1);
+                }
+            }
+        }
+
         globalOffset.set(maxOffset + 1);
         logger.info("Recovery complete. Global offset set to {}", globalOffset.get());
     }
@@ -158,21 +230,31 @@ public class MessageStore implements Closeable {
      * Used after installing a Raft snapshot.
      */
     public void reload() throws IOException {
-        globalLock.writeLock().lock();
-        try {
+        lockForSnapshot(() -> {
             logger.info("Reloading MessageStore state from disk...");
             topicIndex.clear();
             topicMessageCounts.clear();
             topicHeadOffsets.clear();
             messageCache.clear();
-            topicWriteLocks.clear();
+            topicLocks.clear();
             
-            logManager.close();
-            
-            recoverInternal();
-        } finally {
-            globalLock.writeLock().unlock();
-        }
+            try {
+                logManager.close();
+                recoverInternal();
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
+    }
+
+    public void reconcileWithManifest(Map<String, Long> fileManifest) throws IOException {
+        lockForSnapshot(() -> {
+            try {
+                logManager.reconcileWithManifest(fileManifest);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
     }
 
     private void indexMessage(String topic, long offset, long position) {
@@ -190,15 +272,41 @@ public class MessageStore implements Closeable {
                 .add(message);
     }
 
-    public long append(String topic, byte[] payload, String key, long clientTimestamp) {
-        return append(topic, com.google.protobuf.ByteString.copyFrom(payload), key, clientTimestamp);
+    public long getLastAppliedRaftIndex() {
+        return lastAppliedRaftIndex.get();
+    }
+    
+    public long getNextOffset() {
+        return globalOffset.get();
+    }
+    
+    public long reserveOffsets(int count) {
+        return globalOffset.getAndAdd(count);
+    }
+
+    public void updateGlobalOffset(long target) {
+        long current;
+        while ((current = globalOffset.get()) < target) {
+            globalOffset.compareAndSet(current, target);
+        }
+    }
+
+    public long append(String topic, byte[] payload, String key, long clientTimestamp, long raftIndex) {
+        return append(topic, com.google.protobuf.ByteString.copyFrom(payload), key, clientTimestamp, raftIndex, -1L);
+    }
+
+    public long append(String topic, com.google.protobuf.ByteString payload, String key, long clientTimestamp, long raftIndex) {
+        return append(topic, payload, key, clientTimestamp, raftIndex, -1L);
     }
 
     /**
      * Append a message to the specified topic.
      */
-    public long append(String topic, com.google.protobuf.ByteString payload, String key, long clientTimestamp) {
-        long offset = globalOffset.getAndIncrement();
+    public long append(String topic, com.google.protobuf.ByteString payload, String key, long clientTimestamp, long raftIndex, long predefinedBaseOffset) {
+        long offset = predefinedBaseOffset >= 0 ? predefinedBaseOffset : globalOffset.getAndIncrement();
+        if (predefinedBaseOffset >= 0) {
+            updateGlobalOffset(predefinedBaseOffset + 1);
+        }
         long storedAt = System.currentTimeMillis();
 
         StoredMessage.Builder builder = StoredMessage.newBuilder()
@@ -206,7 +314,8 @@ public class MessageStore implements Closeable {
                 .setTopic(topic)
                 .setPayload(payload)
                 .setTimestamp(clientTimestamp)
-                .setStoredAt(storedAt);
+                .setStoredAt(storedAt)
+                .setRaftIndex(raftIndex);
 
         if (key != null && !key.isEmpty()) {
             builder.setKey(key);
@@ -214,21 +323,18 @@ public class MessageStore implements Closeable {
 
         StoredMessage message = builder.build();
 
-        globalLock.readLock().lock();
+        java.util.concurrent.locks.ReentrantLock lock = topicLocks.computeIfAbsent(topic, k -> new java.util.concurrent.locks.ReentrantLock());
+        lock.lock();
         try {
-            Object topicLock = topicWriteLocks.computeIfAbsent(topic, k -> new Object());
             long position;
-            LogSegment segment;
-            synchronized (topicLock) {
-                segment = logManager.getOrCreateActiveSegment(topic);
-                
-                // Check if we need to roll over
-                if (segment.getSize() >= config.getLogSegmentBytes()) {
-                    segment = logManager.rollNewSegment(topic, offset);
-                }
-                
-                position = segment.append(message);
+            LogSegment segment = logManager.getOrCreateActiveSegment(topic);
+            
+            // Check if we need to roll over
+            if (segment.getSize() >= config.getLogSegmentBytes()) {
+                segment = logManager.rollNewSegment(topic, offset);
             }
+            
+            position = segment.append(message);
 
             indexMessage(topic, offset, position);
 
@@ -247,13 +353,17 @@ public class MessageStore implements Closeable {
             logger.error("Failed to persist message for topic {}", topic, e);
             throw new RuntimeException("Failed to persist message", e);
         } finally {
-            globalLock.readLock().unlock();
+            lock.unlock();
         }
 
         // 4. Wake any long-polling consumers waiting for new messages
         synchronized (messageMonitor) {
             messageSignal.incrementAndGet();
             messageMonitor.notifyAll();
+        }
+        
+        if (raftIndex > lastAppliedRaftIndex.get()) {
+            lastAppliedRaftIndex.set(raftIndex);
         }
 
         return offset;
@@ -268,13 +378,20 @@ public class MessageStore implements Closeable {
      * @param entries   The batch entries (payload, key, timestamp)
      * @return The base offset (offset of the first message in the batch)
      */
-    public long appendBatch(String topic, List<ProduceBatchRequest.BatchEntry> entries) {
+    public long appendBatch(String topic, List<ProduceBatchRequest.BatchEntry> entries, long raftIndex) {
+        return appendBatch(topic, entries, raftIndex, -1L);
+    }
+
+    public long appendBatch(String topic, List<ProduceBatchRequest.BatchEntry> entries, long raftIndex, long predefinedBaseOffset) {
         int batchSize = entries.size();
         if (batchSize == 0) {
             throw new IllegalArgumentException("Batch must contain at least one message");
         }
 
-        long baseOffset = globalOffset.getAndAdd(batchSize);
+        long baseOffset = predefinedBaseOffset >= 0 ? predefinedBaseOffset : globalOffset.getAndAdd(batchSize);
+        if (predefinedBaseOffset >= 0) {
+            updateGlobalOffset(predefinedBaseOffset + batchSize);
+        }
         long storedAt = System.currentTimeMillis();
 
         List<StoredMessage> messages = new ArrayList<>(batchSize);
@@ -285,7 +402,8 @@ public class MessageStore implements Closeable {
                     .setTopic(topic)
                     .setPayload(entry.getPayload())
                     .setTimestamp(entry.getClientTimestamp())
-                    .setStoredAt(storedAt);
+                    .setStoredAt(storedAt)
+                    .setRaftIndex(raftIndex);
 
             if (entry.hasKey()) {
                 builder.setKey(entry.getKey());
@@ -294,19 +412,17 @@ public class MessageStore implements Closeable {
             messages.add(builder.build());
         }
 
-        globalLock.readLock().lock();
+        java.util.concurrent.locks.ReentrantLock lock = topicLocks.computeIfAbsent(topic, k -> new java.util.concurrent.locks.ReentrantLock());
+        lock.lock();
         try {
-            Object topicLock = topicWriteLocks.computeIfAbsent(topic, k -> new Object());
             List<Long> positions;
-            synchronized (topicLock) {
-                LogSegment segment = logManager.getOrCreateActiveSegment(topic);
+            LogSegment segment = logManager.getOrCreateActiveSegment(topic);
 
-                if (segment.getSize() >= config.getLogSegmentBytes()) {
-                    segment = logManager.rollNewSegment(topic, baseOffset);
-                }
-
-                positions = segment.appendBatch(messages);
+            if (segment.getSize() >= config.getLogSegmentBytes()) {
+                segment = logManager.rollNewSegment(topic, baseOffset);
             }
+
+            positions = segment.appendBatch(messages);
 
             AtomicLong counter = topicMessageCounts.computeIfAbsent(topic, k -> new AtomicLong());
             AtomicLong head = topicHeadOffsets.computeIfAbsent(topic, k -> new AtomicLong(-1));
@@ -326,12 +442,16 @@ public class MessageStore implements Closeable {
             logger.error("Failed to persist batch for topic {}", topic, e);
             throw new RuntimeException("Failed to persist batch", e);
         } finally {
-            globalLock.readLock().unlock();
+            lock.unlock();
         }
 
         synchronized (messageMonitor) {
             messageSignal.incrementAndGet();
             messageMonitor.notifyAll();
+        }
+        
+        if (raftIndex > lastAppliedRaftIndex.get()) {
+            lastAppliedRaftIndex.set(raftIndex);
         }
 
         return baseOffset;
@@ -342,7 +462,11 @@ public class MessageStore implements Closeable {
      * Either all topic writes succeed, or none are visible.
      * Returns a map of topic -> base offset for each slice.
      */
-    public Map<String, Long> appendAtomicBatch(List<AtomicBatchTopicSlice> slices) {
+    public Map<String, Long> appendAtomicBatch(List<AtomicBatchTopicSlice> slices, long raftIndex) {
+        return appendAtomicBatch(slices, raftIndex, -1L);
+    }
+
+    public Map<String, Long> appendAtomicBatch(List<AtomicBatchTopicSlice> slices, long raftIndex, long predefinedBaseOffset) {
         if (slices.isEmpty()) {
             return Collections.emptyMap();
         }
@@ -352,7 +476,10 @@ public class MessageStore implements Closeable {
             return Collections.emptyMap();
         }
 
-        long baseOffset = globalOffset.getAndAdd(totalMessages);
+        long baseOffset = predefinedBaseOffset >= 0 ? predefinedBaseOffset : globalOffset.getAndAdd(totalMessages);
+        if (predefinedBaseOffset >= 0) {
+            updateGlobalOffset(predefinedBaseOffset + totalMessages);
+        }
         long storedAt = System.currentTimeMillis();
 
         Map<String, Long> topicBaseOffsets = new LinkedHashMap<>();
@@ -362,40 +489,68 @@ public class MessageStore implements Closeable {
         for (var slice : slices) {
             String topic = slice.getTopic();
             long topicBase = currentOffset;
-            topicBaseOffsets.put(topic, topicBase);
+            topicBaseOffsets.putIfAbsent(topic, topicBase);
 
-            List<StoredMessage> messages = new ArrayList<>(slice.getEntriesCount());
+            List<StoredMessage> messages = topicMessages.computeIfAbsent(topic, k -> new ArrayList<>());
             for (var entry : slice.getEntriesList()) {
                 StoredMessage.Builder builder = StoredMessage.newBuilder()
                         .setOffset(currentOffset++)
                         .setTopic(topic)
                         .setPayload(entry.getPayload())
                         .setTimestamp(entry.getClientTimestamp())
-                        .setStoredAt(storedAt);
+                        .setStoredAt(storedAt)
+                        .setRaftIndex(raftIndex);
 
                 if (entry.hasKey()) {
                     builder.setKey(entry.getKey());
                 }
                 messages.add(builder.build());
             }
-            topicMessages.put(topic, messages);
         }
 
-        globalLock.readLock().lock();
+        // 1. Write the Atomic Intent to disk (WAL)
+        java.nio.file.Path intentFile = java.nio.file.Paths.get(config.getDataDir()).resolve(".atomic-intent");
+        try (java.io.FileOutputStream fos = new java.io.FileOutputStream(intentFile.toFile());
+             java.io.DataOutputStream dos = new java.io.DataOutputStream(fos)) {
+            dos.writeInt(topicMessages.size());
+            for (var entry : topicMessages.entrySet()) {
+                dos.writeUTF(entry.getKey());
+                List<StoredMessage> msgs = entry.getValue();
+                dos.writeInt(msgs.size());
+                for (StoredMessage msg : msgs) {
+                    byte[] msgBytes = msg.toByteArray();
+                    dos.writeInt(msgBytes.length);
+                    dos.write(msgBytes);
+                }
+            }
+            dos.flush();
+            fos.getFD().sync();
+        } catch (IOException e) {
+            logger.error("Failed to write atomic intent file", e);
+            throw new RuntimeException("Failed to write atomic intent file", e);
+        }
+
+        // 2. Lock all affected topics to ensure atomicity
+        List<String> sortedTopics = new ArrayList<>(topicMessages.keySet());
+        Collections.sort(sortedTopics);
+        List<java.util.concurrent.locks.ReentrantLock> acquiredLocks = new ArrayList<>();
+        for (String t : sortedTopics) {
+            java.util.concurrent.locks.ReentrantLock tLock = topicLocks.computeIfAbsent(t, k -> new java.util.concurrent.locks.ReentrantLock());
+            tLock.lock();
+            acquiredLocks.add(tLock);
+        }
+
         try {
             for (var entry : topicMessages.entrySet()) {
                 String topic = entry.getKey();
                 List<StoredMessage> messages = entry.getValue();
                 
-                Object topicLock = topicWriteLocks.computeIfAbsent(topic, k -> new Object());
                 List<Long> positions;
-                synchronized (topicLock) {
-                    LogSegment segment = logManager.getOrCreateActiveSegment(topic);
-                    if (segment.getSize() >= config.getLogSegmentBytes()) {
-                        segment = logManager.rollNewSegment(topic, topicBaseOffsets.get(topic));
-                    }
-                    positions = segment.appendBatch(messages);
+                LogSegment segment = logManager.getOrCreateActiveSegment(topic);
+                if (segment.getSize() >= config.getLogSegmentBytes()) {
+                    segment = logManager.rollNewSegment(topic, topicBaseOffsets.get(topic));
                 }
+                positions = segment.appendBatch(messages);
 
                 AtomicLong counter = topicMessageCounts.computeIfAbsent(topic, k -> new AtomicLong());
                 AtomicLong head = topicHeadOffsets.computeIfAbsent(topic, k -> new AtomicLong(-1));
@@ -414,12 +569,25 @@ public class MessageStore implements Closeable {
             logger.error("Failed to persist atomic batch", e);
             throw new RuntimeException("Failed to persist atomic batch", e);
         } finally {
-            globalLock.readLock().unlock();
+            for (int i = acquiredLocks.size() - 1; i >= 0; i--) {
+                acquiredLocks.get(i).unlock();
+            }
+        }
+
+        // 3. Delete intent file now that everything is fully flushed to segments
+        try {
+            java.nio.file.Files.deleteIfExists(intentFile);
+        } catch (IOException e) {
+            logger.warn("Failed to delete atomic intent file", e);
         }
 
         synchronized (messageMonitor) {
             messageSignal.incrementAndGet();
             messageMonitor.notifyAll();
+        }
+        
+        if (raftIndex > lastAppliedRaftIndex.get()) {
+            lastAppliedRaftIndex.set(raftIndex);
         }
 
         return topicBaseOffsets;
@@ -429,11 +597,24 @@ public class MessageStore implements Closeable {
      * Lock the store exclusively to safely take a snapshot of the log segments.
      */
     public void lockForSnapshot(Runnable task) {
-        globalLock.writeLock().lock();
+        List<String> sortedTopics = new ArrayList<>(topicLocks.keySet());
+        Collections.sort(sortedTopics);
+        
+        List<java.util.concurrent.locks.ReentrantLock> acquired = new ArrayList<>();
+        for (String t : sortedTopics) {
+            java.util.concurrent.locks.ReentrantLock lock = topicLocks.get(t);
+            if (lock != null) {
+                lock.lock();
+                acquired.add(lock);
+            }
+        }
+        
         try {
             task.run();
         } finally {
-            globalLock.writeLock().unlock();
+            for (int i = acquired.size() - 1; i >= 0; i--) {
+                acquired.get(i).unlock();
+            }
         }
     }
 
@@ -502,9 +683,10 @@ public class MessageStore implements Closeable {
             return Collections.emptyList();
         }
         
+        List<StoredMessage> cachedMessages = Collections.emptyList();
         BoundedMessageCache cache = messageCache.get(topic);
         if (cache != null) {
-            List<StoredMessage> cachedMessages = cache.getMessagesFrom(fromOffset, maxCount);
+            cachedMessages = cache.getMessagesFrom(fromOffset, maxCount);
             if (cachedMessages.size() >= maxCount) {
                 return cachedMessages;
             }
@@ -512,11 +694,11 @@ public class MessageStore implements Closeable {
         
         ConcurrentSkipListMap<Long, Long> index = topicIndex.get(topic);
         
-        List<StoredMessage> result = new ArrayList<>();
+        List<StoredMessage> diskResult = new ArrayList<>();
         long currentOffset = fromOffset;
         LogSegment lastSegment = null;
         
-        while (result.size() < maxCount) {
+        while (diskResult.size() < maxCount) {
             LogSegment segment = logManager.getSegmentForOffset(topic, currentOffset);
             
             if (segment != null && segment == lastSegment) {
@@ -556,10 +738,10 @@ public class MessageStore implements Closeable {
                 long segmentSize = segment.getSize();
                 long position = startPosition;
                 
-                while (position < segmentSize && result.size() < maxCount) {
+                while (position < segmentSize && diskResult.size() < maxCount) {
                     StoredMessage message = segment.read(position);
                     if (message.getOffset() >= currentOffset) {
-                        result.add(message);
+                        diskResult.add(message);
                         currentOffset = message.getOffset() + 1;
                     }
                     position += 4 + message.getSerializedSize();
@@ -572,6 +754,23 @@ public class MessageStore implements Closeable {
             }
         }
         
+        if (cachedMessages.isEmpty()) {
+            return diskResult;
+        }
+        
+        // Merge disk and cache results with offset-aware deduplication
+        Map<Long, StoredMessage> merged = new java.util.TreeMap<>();
+        for (StoredMessage msg : diskResult) {
+            merged.put(msg.getOffset(), msg);
+        }
+        for (StoredMessage msg : cachedMessages) {
+            merged.put(msg.getOffset(), msg);
+        }
+        
+        List<StoredMessage> result = new ArrayList<>(merged.values());
+        if (result.size() > maxCount) {
+            return result.subList(0, maxCount);
+        }
         return result;
     }
 
@@ -757,7 +956,7 @@ public class MessageStore implements Closeable {
                 if (segment != null) {
                     try {
                         if (s3Client != null) {
-                            String key = "archive/" + config.getNodeId() + "/" + topic + "/" + segment.getFilePath().getFileName().toString();
+                            String key = "archive/shared/" + topic + "/" + segment.getFilePath().getFileName().toString();
                             logger.info("Uploading segment {} to S3 bucket {}", segment.getFilePath(), config.getS3ArchiveBucket());
                             s3Client.putObject(
                                 PutObjectRequest.builder()

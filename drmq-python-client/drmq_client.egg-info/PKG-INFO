@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: drmq_client
+Version: 1.0.0
+Summary: Python SDK for DRMQ
+Author: DRMQ
+Requires-Dist: protobuf>=4.21.0
+Dynamic: author
+Dynamic: requires-dist
+Dynamic: summary

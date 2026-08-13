@@ -56,6 +56,7 @@ public class AdminHttpServer {
             exchange.sendResponseHeaders(204, -1);
             return;
         }
+        if (!checkAuth(exchange)) return;
 
         JsonArray topicsArray = new JsonArray();
         List<String> topics = messageStore.getTopics();
@@ -78,6 +79,7 @@ public class AdminHttpServer {
             exchange.sendResponseHeaders(204, -1);
             return;
         }
+        if (!checkAuth(exchange)) return;
 
         JsonArray groupsArray = new JsonArray();
         java.util.Map<String, Long> allOffsets = offsetManager.getAllOffsets();
@@ -128,6 +130,7 @@ public class AdminHttpServer {
             exchange.sendResponseHeaders(204, -1);
             return;
         }
+        if (!checkAuth(exchange)) return;
 
         try {
             String query = exchange.getRequestURI().getQuery();
@@ -190,9 +193,28 @@ public class AdminHttpServer {
     }
 
     private void addCorsHeaders(HttpExchange exchange) {
-        exchange.getResponseHeaders().add("Access-Control-Allow-Origin", "*");
+        String allowedOrigin = System.getProperty("drmq.admin.cors.origin", "http://localhost:3000");
+        exchange.getResponseHeaders().add("Access-Control-Allow-Origin", allowedOrigin);
         exchange.getResponseHeaders().add("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
         exchange.getResponseHeaders().add("Access-Control-Allow-Headers", "Content-Type, Authorization");
+        exchange.getResponseHeaders().add("Access-Control-Allow-Credentials", "true");
+    }
+
+    private boolean checkAuth(HttpExchange exchange) throws IOException {
+        String authHeader = exchange.getRequestHeaders().getFirst("Authorization");
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            sendJsonResponse(exchange, 401, "{\"error\":\"Unauthorized\"}");
+            return false;
+        }
+        
+        String token = authHeader.substring(7);
+        String expectedToken = System.getProperty("drmq.admin.token", "admin-secret-token");
+        if (!expectedToken.equals(token)) {
+            sendJsonResponse(exchange, 403, "{\"error\":\"Forbidden\"}");
+            return false;
+        }
+        
+        return true;
     }
 
     private void sendJsonResponse(HttpExchange exchange, int statusCode, String response) throws IOException {

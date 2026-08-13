@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { Panel } from '../components/DashboardWidgets';
 import { RefreshCw, Users, AlertCircle, CheckCircle2 } from 'lucide-react';
 import { DitherButton } from '../components/dither-kit';

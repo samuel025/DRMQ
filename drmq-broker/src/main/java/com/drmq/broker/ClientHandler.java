@@ -61,27 +61,53 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, io.netty.buffer.ByteBuf msg) throws Exception {
-        java.nio.ByteBuffer nioBuffer = msg.nioBuffer();
-        com.google.protobuf.CodedInputStream input = com.google.protobuf.CodedInputStream.newInstance(nioBuffer);
-        MessageEnvelope envelope = MessageEnvelope.parseFrom(input);
-        
-        handleMessage(envelope).thenAccept(response -> {
-            int size = response.getSerializedSize();
+        try {
+            java.nio.ByteBuffer nioBuffer = msg.nioBuffer();
+            com.google.protobuf.CodedInputStream input = com.google.protobuf.CodedInputStream.newInstance(nioBuffer);
+            MessageEnvelope envelope = MessageEnvelope.parseFrom(input);
+            long correlationId = envelope.getCorrelationId();
+            
+            handleMessage(envelope).thenAccept(response -> {
+                // Echo the correlation_id so the client can match pipelined responses
+                MessageEnvelope tagged = correlationId != 0
+                        ? response.toBuilder().setCorrelationId(correlationId).build()
+                        : response;
+                int size = tagged.getSerializedSize();
+                io.netty.buffer.ByteBuf outBuf = ctx.alloc().directBuffer(size);
+                try {
+                    com.google.protobuf.CodedOutputStream output = com.google.protobuf.CodedOutputStream.newInstance(outBuf.nioBuffer(0, size));
+                    tagged.writeTo(output);
+                    output.flush();
+                    outBuf.writerIndex(size);
+                    ctx.writeAndFlush(outBuf);
+                } catch (Exception e) {
+                    outBuf.release();
+                    logger.error("Failed to serialize response", e);
+                }
+            }).exceptionally(e -> {
+                logger.error("Unhandled error processing request", e);
+                return null;
+            });
+        } catch (Exception e) {
+            logger.error("Uncaught exception in channelRead0", e);
+            MessageEnvelope errorEnv = createErrorResponse("Server error: " + e.getMessage());
+            int size = errorEnv.getSerializedSize();
             io.netty.buffer.ByteBuf outBuf = ctx.alloc().directBuffer(size);
             try {
                 com.google.protobuf.CodedOutputStream output = com.google.protobuf.CodedOutputStream.newInstance(outBuf.nioBuffer(0, size));
-                response.writeTo(output);
+                errorEnv.writeTo(output);
                 output.flush();
                 outBuf.writerIndex(size);
                 ctx.writeAndFlush(outBuf);
-            } catch (Exception e) {
+            } catch (Exception ex) {
                 outBuf.release();
-                logger.error("Failed to serialize response", e);
+                logger.error("Failed to serialize error response", ex);
             }
-        }).exceptionally(e -> {
-            logger.error("Unhandled error processing request", e);
-            return null;
-        });
+        }
+    }
+
+    private boolean isValidTopic(String topic) {
+        return topic != null && topic.matches("^[a-zA-Z0-9._-]+$");
     }
 
     @Override
@@ -120,8 +146,16 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
             ProduceRequest request = ProduceRequest.parseFrom(envelope.getPayload());
 
             String topic = request.getTopic();
+            if (!isValidTopic(topic)) {
+                return java.util.concurrent.CompletableFuture.completedFuture(createProduceErrorResponse("Invalid topic name", ErrorCode.UNKNOWN_ERROR));
+            }
             com.google.protobuf.ByteString payload = request.getPayload();
             long finalPayloadBytes = payload.size();
+            
+            if (finalPayloadBytes > MAX_PAYLOAD_BYTES) {
+                return java.util.concurrent.CompletableFuture.completedFuture(createProduceErrorResponse("Payload exceeds maximum size of " + MAX_PAYLOAD_BYTES + " bytes", ErrorCode.UNKNOWN_ERROR));
+            }
+            
             String key = request.hasKey() ? request.getKey() : null;
             long timestamp = request.getTimestamp();
 
@@ -134,7 +168,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
                 }
                 offsetFuture = raftNode.proposeAsync(topic, payload, key, timestamp);
             } else {
-                offsetFuture = java.util.concurrent.CompletableFuture.completedFuture(messageStore.append(topic, payload, key, timestamp));
+                offsetFuture = java.util.concurrent.CompletableFuture.completedFuture(messageStore.append(topic, payload, key, timestamp, -1));
             }
 
             return offsetFuture.thenApply(offset -> {
@@ -156,7 +190,9 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
                 logger.error("Error processing produce request", e);
                 BrokerMetrics.get().recordRequest("produce", false,
                     System.nanoTime() - startNanos, finalPayloadBytes, 1);
-                return createProduceErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR);
+                String msg = e != null ? e.getMessage() : "Unknown error";
+                ErrorCode code = (msg != null && msg.contains("NOT_LEADER")) ? ErrorCode.NOT_LEADER : ErrorCode.UNKNOWN_ERROR;
+                return createProduceErrorResponse(msg, code);
             });
 
         } catch (Exception e) {
@@ -175,6 +211,9 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
             ProduceBatchRequest request = ProduceBatchRequest.parseFrom(envelope.getPayload());
 
             String topic = request.getTopic();
+            if (!isValidTopic(topic)) {
+                return java.util.concurrent.CompletableFuture.completedFuture(createProduceBatchErrorResponse("Invalid topic name", ErrorCode.UNKNOWN_ERROR));
+            }
             count = request.getEntriesCount();
             final int finalBatchCount = count;
 
@@ -203,7 +242,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
                 }
                 offsetFuture = raftNode.proposeBatchAsync(topic, request.getEntriesList());
             } else {
-                offsetFuture = java.util.concurrent.CompletableFuture.completedFuture(messageStore.appendBatch(topic, request.getEntriesList()));
+                offsetFuture = java.util.concurrent.CompletableFuture.completedFuture(messageStore.appendBatch(topic, request.getEntriesList(), -1));
             }
 
             return offsetFuture.thenApply(baseOffset -> {
@@ -226,7 +265,9 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
                 logger.error("Error processing produce batch request", e);
                 BrokerMetrics.get().recordRequest("produce_batch", false,
                     System.nanoTime() - startNanos, finalPayloadBytes, finalBatchCount);
-                return createProduceBatchErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR);
+                String msg = e != null ? e.getMessage() : "Unknown error";
+                ErrorCode code = (msg != null && msg.contains("NOT_LEADER")) ? ErrorCode.NOT_LEADER : ErrorCode.UNKNOWN_ERROR;
+                return createProduceBatchErrorResponse(msg, code);
             });
 
         } catch (Exception e) {
@@ -257,6 +298,9 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
             com.drmq.protocol.AtomicProduceRequest request = com.drmq.protocol.AtomicProduceRequest.parseFrom(envelope.getPayload());
 
             for (var slice : request.getSlicesList()) {
+                if (!isValidTopic(slice.getTopic())) {
+                    return java.util.concurrent.CompletableFuture.completedFuture(createAtomicProduceErrorResponse("Invalid topic name: " + slice.getTopic(), ErrorCode.UNKNOWN_ERROR));
+                }
                 count += slice.getEntriesCount();
                 for (var entry : slice.getEntriesList()) {
                     payloadBytes += entry.getPayload().size();
@@ -281,7 +325,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
                 }
                 offsetsFuture = raftNode.proposeAtomicBatchAsync(request.getSlicesList());
             } else {
-                offsetsFuture = java.util.concurrent.CompletableFuture.completedFuture(messageStore.appendAtomicBatch(request.getSlicesList()));
+                offsetsFuture = java.util.concurrent.CompletableFuture.completedFuture(messageStore.appendAtomicBatch(request.getSlicesList(), -1));
             }
 
             return offsetsFuture.thenApply(offsets -> {
@@ -303,7 +347,9 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
                 logger.error("Error processing atomic produce request", e);
                 BrokerMetrics.get().recordRequest("atomic_produce", false,
                     System.nanoTime() - startNanos, finalPayloadBytes, finalBatchCount);
-                return createAtomicProduceErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR);
+                String msg = e != null ? e.getMessage() : "Unknown error";
+                ErrorCode code = (msg != null && msg.contains("NOT_LEADER")) ? ErrorCode.NOT_LEADER : ErrorCode.UNKNOWN_ERROR;
+                return createAtomicProduceErrorResponse(msg, code);
             });
 
         } catch (Exception e) {

@@ -35,7 +35,8 @@ export class DRMQClient {
   protected host: string;
   protected port: number;
   protected socket: net.Socket | null = null;
-  private responseQueue: Array<(data: Buffer) => void> = [];
+  private responseQueue: Map<string, (data: Buffer) => void> = new Map();
+  private nextCorrelationId: bigint = 1n;
   private receiveBuffer: Buffer = Buffer.alloc(0);
   protected maxRetries = 5;
 
@@ -135,7 +136,7 @@ export class DRMQClient {
       this.socket = null;
     }
     this.responseQueue.forEach(resolve => resolve(Buffer.alloc(0)));
-    this.responseQueue = [];
+    this.responseQueue.clear();
     this.receiveBuffer = Buffer.alloc(0);
   }
 
@@ -153,8 +154,17 @@ export class DRMQClient {
         const frameData = this.receiveBuffer.subarray(4, 4 + length);
         this.receiveBuffer = this.receiveBuffer.subarray(4 + length);
         
-        const resolve = this.responseQueue.shift();
-        if (resolve) resolve(frameData);
+        try {
+          const respEnvelope = MessageEnvelope.decode(frameData);
+          const correlationIdStr = respEnvelope.correlationId.toString();
+          const resolve = this.responseQueue.get(correlationIdStr);
+          if (resolve) {
+            this.responseQueue.delete(correlationIdStr);
+            resolve(frameData);
+          }
+        } catch (e) {
+          // Ignore invalid frames
+        }
       } else {
         break;
       }
@@ -164,9 +174,14 @@ export class DRMQClient {
   protected async sendEnvelope(msgType: MessageType, payload: Uint8Array): Promise<Uint8Array> {
     await this.ensureConnected();
 
+    const correlationId = this.nextCorrelationId++;
+    const correlationIdStr = correlationId.toString();
+
     const envelope = MessageEnvelope.create({
       type: msgType,
-      payload: Buffer.from(payload)
+      payload: Buffer.from(payload),
+      // protobufjs accepts Long, string, or number for int64. We pass string.
+      correlationId: correlationIdStr as any
     });
     const envelopeBytes = MessageEnvelope.encode(envelope).finish();
 
@@ -176,7 +191,7 @@ export class DRMQClient {
     return new Promise((resolve, reject) => {
       if (!this.socket) return reject(new Error('Socket disconnected'));
       
-      this.responseQueue.push((frameData: Buffer) => {
+      this.responseQueue.set(correlationIdStr, (frameData: Buffer) => {
         if (frameData.length === 0) {
           reject(new Error("Connection closed while waiting for response"));
           return;
@@ -190,7 +205,10 @@ export class DRMQClient {
       });
 
       this.socket.write(Buffer.concat([lengthPrefix, envelopeBytes]), (err) => {
-        if (err) reject(err);
+        if (err) {
+          this.responseQueue.delete(correlationIdStr);
+          reject(err);
+        }
       });
     });
   }

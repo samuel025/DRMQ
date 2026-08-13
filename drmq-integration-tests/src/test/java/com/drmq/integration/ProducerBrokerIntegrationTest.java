@@ -270,4 +270,30 @@ class ProducerBrokerIntegrationTest {
             assertThrows(Exception.class, () -> producer.sendAtomic(single).join());
         }
     }
+    @Test
+    void producerPipeliningWithMultipleInflightBatches() throws Exception {
+        int numRequests = 200;
+        try (DRMQProducer producer = new DRMQProducer("localhost", TEST_PORT)) {
+            // Force small batches so that many batches are sent inflight
+            producer.setBatchSizeBytes(100); 
+            producer.setLingerMs(5);
+            producer.connect();
+
+            List<java.util.concurrent.CompletableFuture<DRMQProducer.SendResult>> futures = new ArrayList<>();
+
+            // Fire 200 requests asynchronously as fast as possible
+            for (int i = 0; i < numRequests; i++) {
+                futures.add(producer.send("pipelined-topic", ("msg-" + i).getBytes()));
+            }
+
+            // Wait for all to complete
+            java.util.concurrent.CompletableFuture.allOf(
+                    futures.toArray(new java.util.concurrent.CompletableFuture[0])
+            ).get(10, java.util.concurrent.TimeUnit.SECONDS);
+
+            long totalSuccessful = futures.stream().filter(f -> !f.isCompletedExceptionally() && f.join().isSuccess()).count();
+            assertEquals(numRequests, totalSuccessful, "All pipelined requests should succeed");
+            assertEquals(numRequests, broker.getMessageStore().getMessageCount("pipelined-topic"));
+        }
+    }
 }

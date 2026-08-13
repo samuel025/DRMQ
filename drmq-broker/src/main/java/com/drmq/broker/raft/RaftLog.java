@@ -182,26 +182,34 @@ public class RaftLog {
                 batch.size(), batch.get(0).getIndex(), batch.get(batch.size() - 1).getIndex());
     }
 
-    public synchronized RaftEntry getEntry(long index) {
-        if (index < startIndex || index > getLastIndex()) {
-            return null;
+    public RaftEntry getEntry(long index) {
+        byte[] data;
+        long pos;
+        java.nio.ByteBuffer buf;
+        synchronized (this) {
+            if (index < startIndex || index > getLastIndex()) {
+                return null;
+            }
+            int listIndex = (int) (index - startIndex);
+            if (listIndex >= filePositions.size()) {
+                return null;
+            }
+            pos = filePositions.get(listIndex);
+            buf = mappedBuffer.duplicate();
         }
-        int listIndex = (int) (index - startIndex);
         try {
-            long pos = filePositions.get(listIndex);
-            
-            int originalPos = mappedBuffer.position();
-            mappedBuffer.position((int) pos);
-            
-            int length = mappedBuffer.getInt();
-            byte[] data = new byte[length];
-            mappedBuffer.get(data);
-            
-            mappedBuffer.position(originalPos);
-            
-            return RaftEntry.parseFrom(data);
+            buf.position((int) pos);
+            int length = buf.getInt();
+            data = new byte[length];
+            buf.get(data);
         } catch (Exception e) {
             logger.error("Failed to read raft entry at index {} from mapped buffer", index, e);
+            return null;
+        }
+        try {
+            return RaftEntry.parseFrom(data);
+        } catch (Exception e) {
+            logger.error("Failed to parse raft entry at index {}", index, e);
             return null;
         }
     }
@@ -212,43 +220,56 @@ public class RaftLog {
         return getEntriesFrom(fromIndex, MAX_ENTRIES_PER_RPC);
     }
 
-    public synchronized List<RaftEntry> getEntriesFrom(long fromIndex, int maxEntries) {
-        if (fromIndex < startIndex || fromIndex > getLastIndex() + 1) {
-            return Collections.emptyList();
-        }
-        if (fromIndex == getLastIndex() + 1) {
-            return Collections.emptyList();
-        }
-        int from = (int) (fromIndex - startIndex);
+    public List<RaftEntry> getEntriesFrom(long fromIndex, int maxEntries) {
+        List<byte[]> rawDataList = new ArrayList<>();
+        int maxBytes = 8 * 1024 * 1024; // 8 MB limit per RPC
+        java.nio.ByteBuffer buf;
+        long startPos;
+        int countToRead;
         
-        List<RaftEntry> result = new ArrayList<>();
-        long currentBytes = 0;
-        int maxBytes = 8 * 1024 * 1024; // 8 MB limit per RPC (~7 entries)
+        synchronized (this) {
+            if (fromIndex < startIndex || fromIndex > getLastIndex() + 1) {
+                return Collections.emptyList();
+            }
+            if (fromIndex == getLastIndex() + 1) {
+                return Collections.emptyList();
+            }
+            int from = (int) (fromIndex - startIndex);
+            if (from < 0 || from >= filePositions.size()) {
+                return Collections.emptyList();
+            }
+            startPos = filePositions.get(from);
+            buf = mappedBuffer.duplicate();
+            countToRead = Math.min(maxEntries, filePositions.size() - from);
+        }
         
         try {
-            int originalPos = mappedBuffer.position();
-            mappedBuffer.position((int) (long) filePositions.get(from));
-            
-            int to = from;
-            while (to < entries.size() && to - from < maxEntries) {
-                int length = mappedBuffer.getInt();
-                byte[] data = new byte[length];
-                mappedBuffer.get(data);
-                RaftEntry entry = RaftEntry.parseFrom(data);
-                
-                long entrySize = entry.getSerializedSize();
-                if (to > from && currentBytes + entrySize > maxBytes) {
-                    break; // ensure at least one entry is sent if the single entry is > 2MB
+            buf.position((int) startPos);
+            long currentBytes = 0;
+            for (int i = 0; i < countToRead; i++) {
+                if (buf.remaining() < 4) break;
+                int length = buf.getInt();
+                if (length <= 0 || buf.remaining() < length) break;
+                if (i > 0 && currentBytes + length > maxBytes) {
+                    break;
                 }
-                currentBytes += entrySize;
-                result.add(entry);
-                to++;
+                byte[] data = new byte[length];
+                buf.get(data);
+                rawDataList.add(data);
+                currentBytes += length;
             }
-            mappedBuffer.position(originalPos);
         } catch (Exception e) {
             logger.error("Failed to read raft entries from mapped buffer", e);
         }
         
+        List<RaftEntry> result = new ArrayList<>(rawDataList.size());
+        for (byte[] data : rawDataList) {
+            try {
+                result.add(RaftEntry.parseFrom(data));
+            } catch (Exception e) {
+                logger.error("Failed to parse raft entry", e);
+            }
+        }
         return result;
     }
 
@@ -268,6 +289,10 @@ public class RaftLog {
     public synchronized long getLastTerm() {
         if (entries.isEmpty()) return 0;
         return entries.get(entries.size() - 1).getTerm();
+    }
+
+    public synchronized long getLogicalFileSize() {
+        return logicalFileSize;
     }
 
     public synchronized long getTermAt(long index) {
@@ -362,7 +387,9 @@ public class RaftLog {
         while (true) {
             int currentSize;
             int addedCount;
-            byte[] addedData = null;
+            long startReadPos;
+            long currentLogicalFileSize;
+            java.nio.MappedByteBuffer readerBuffer;
 
             synchronized(this) {
                 if (entries.size() < initialSize) {
@@ -401,27 +428,25 @@ public class RaftLog {
                     return;
                 }
 
-                int dataLengthToRead = (int) (logicalFileSize - filePositions.get(initialSize));
-                addedData = new byte[dataLengthToRead];
-                int originalPos = mappedBuffer.position();
-                mappedBuffer.position((int) (long) filePositions.get(initialSize));
-                mappedBuffer.get(addedData);
-                mappedBuffer.position(originalPos);
+                startReadPos = filePositions.get(initialSize);
+                currentLogicalFileSize = logicalFileSize;
+                readerBuffer = (java.nio.MappedByteBuffer) mappedBuffer.duplicate();
             }
 
             try (FileChannel tempChannel = FileChannel.open(tempFile.toPath(), StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
-                long mapSize = Math.max(newLogicalFileSize + addedData.length, INITIAL_MAPPED_SIZE);
+                long dataLengthToRead = currentLogicalFileSize - startReadPos;
+                long mapSize = Math.max(newLogicalFileSize + dataLengthToRead, INITIAL_MAPPED_SIZE);
                 MappedByteBuffer tempMapped = tempChannel.map(FileChannel.MapMode.READ_WRITE, 0, mapSize);
                 tempMapped.position((int) newLogicalFileSize);
 
-                java.nio.ByteBuffer addedBuf = java.nio.ByteBuffer.wrap(addedData);
+                readerBuffer.position((int) startReadPos);
                 for (int i = 0; i < addedCount; i++) {
                     newPositions.add((long) tempMapped.position());
-                    int length = addedBuf.getInt();
+                    int length = readerBuffer.getInt();
                     tempMapped.putInt(length);
 
                     byte[] data = new byte[length];
-                    addedBuf.get(data);
+                    readerBuffer.get(data);
                     tempMapped.put(data);
                 }
 

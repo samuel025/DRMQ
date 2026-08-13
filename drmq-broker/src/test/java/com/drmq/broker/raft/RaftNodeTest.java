@@ -5,7 +5,6 @@ import com.drmq.broker.BrokerConfig;
 import com.drmq.broker.MessageStore;
 import com.drmq.broker.OffsetManager;
 import com.drmq.broker.persistence.LogManager;
-import com.drmq.protocol.DRMQProtocol.*;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -179,18 +178,47 @@ class RaftNodeTest {
     // ===========================
 
     @Test
-    @org.junit.jupiter.api.Disabled("Not implemented yet")
-    void testLogCompactionTriggersOnHighCommitIndex() {
-        // We set up a node with raftCompactThreshold=100 (which is default 1000 in constructor but we can override it if we had a setter, 
-        // wait, RaftNodeTest uses 1000 threshold because it calls the constructor with default... let's just use what we have or reflect)
-        // Since we didn't specify raftCompactThreshold in the test constructor, it uses 1000.
-        // Actually, RaftNodeTest constructor call:
-        // raftNode = new RaftNode(nodeId, 9092, List.of(peer2, peer3), messageStore, offsetManager, tempDir);
-        // Wait, RaftNodeTest calls constructor with 6 args, let's look at setUp.
-        
-        // We will just append enough entries to trigger compaction. Wait, we can't easily append 1000 entries manually.
-        // But we can check if compaction method works.
-        // I will add a reflection hack or simply skip it here and test it in RaftLogTest.
+    void testLogCompactionTriggersOnHighCommitIndex() throws Exception {
+        // Set raftCompactThreshold to 5 via reflection for fast testing
+        java.lang.reflect.Field thresholdField = RaftNode.class.getDeclaredField("raftCompactThreshold");
+        thresholdField.setAccessible(true);
+        thresholdField.set(raftNode, 5);
+
+        // Access RaftLog via reflection
+        java.lang.reflect.Field logField = RaftNode.class.getDeclaredField("raftLog");
+        logField.setAccessible(true);
+        RaftLog log = (RaftLog) logField.get(raftNode);
+
+        // Append 20 entries to log so that (lastApplied - threshold) - startIndex >= threshold
+        java.util.List<RaftEntry> entries = new java.util.ArrayList<>();
+        for (int i = 1; i <= 20; i++) {
+            entries.add(RaftEntry.newBuilder()
+                    .setIndex(i)
+                    .setTerm(1)
+                    .setTopic("test-topic")
+                    .setPayload(com.google.protobuf.ByteString.copyFromUtf8("data-" + i))
+                    .setCommandType(RaftCommandType.MESSAGE)
+                    .build());
+        }
+        log.append(entries);
+
+        // Set commitIndex to 20
+        java.lang.reflect.Field commitField = RaftNode.class.getDeclaredField("commitIndex");
+        commitField.setAccessible(true);
+        commitField.set(raftNode, 20L);
+
+        // Invoke private applyCommitted method
+        java.lang.reflect.Method applyMethod = RaftNode.class.getDeclaredMethod("applyCommitted");
+        applyMethod.setAccessible(true);
+        applyMethod.invoke(raftNode);
+
+        // Wait up to 3 seconds for async compaction executor to complete
+        long startNanos = System.nanoTime();
+        while (log.getStartIndex() <= 1 && System.nanoTime() - startNanos < 3_000_000_000L) {
+            Thread.sleep(50);
+        }
+
+        assertTrue(log.getStartIndex() > 1, "RaftLog startIndex should advance after compaction");
     }
 
     // ===========================
@@ -506,9 +534,81 @@ class RaftNodeTest {
         // checkQuorum every 900ms. The quorum window is 900ms.
         // Need: staleness > 900ms, i.e., we need at least one full check cycle
         // AFTER the contacts go stale. With generous buffer for scheduling jitter.
-        Thread.sleep(14000);
+        boolean steppedDown = false;
+        for (int i = 0; i < 40; i++) {
+            Thread.sleep(500);
+            if (raftNode.getState() != RaftState.LEADER) {
+                steppedDown = true;
+                break;
+            }
+        }
 
-        assertNotEquals(RaftState.LEADER, raftNode.getState(),
-                "Leader should step down after losing quorum");
+        assertTrue(steppedDown, "Leader should step down after losing quorum");
+    }
+
+    // ===========================
+    //  Edge Cases & Backpressure
+    // ===========================
+
+    @Test
+    void proposalQueueOverflowBackpressure() throws Exception {
+        // Set state to LEADER via reflection so proposeAsync passes leader check
+        java.lang.reflect.Field stateField = RaftNode.class.getDeclaredField("state");
+        stateField.setAccessible(true);
+        stateField.set(raftNode, RaftState.LEADER);
+
+        // Access proposalQueue field via reflection
+        java.lang.reflect.Field field = RaftNode.class.getDeclaredField("proposalQueue");
+        field.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.BlockingQueue<Object> queue = (java.util.concurrent.BlockingQueue<Object>) field.get(raftNode);
+
+        Class<?> prClass = Class.forName("com.drmq.broker.raft.RaftNode$ProposalRequest");
+        java.lang.reflect.Constructor<?> ctor = prClass.getDeclaredConstructor(String.class, java.util.List.class, java.util.concurrent.CompletableFuture.class);
+        ctor.setAccessible(true);
+        Object dummyReq = ctor.newInstance("test-topic", java.util.List.of(), new java.util.concurrent.CompletableFuture<>());
+
+        // Fill proposalQueue to max capacity (10,000) with dummy ProposalRequest objects
+        while (queue.offer(dummyReq)) {
+            // fill until full
+        }
+
+        // Propose message while queue is full
+        java.util.concurrent.CompletableFuture<Long> future =
+                raftNode.proposeAsync("test-topic", "overflow-data".getBytes(java.nio.charset.StandardCharsets.UTF_8), null, System.currentTimeMillis());
+
+        assertTrue(future.isCompletedExceptionally(), "Should fail immediately when proposal queue is full");
+        java.util.concurrent.ExecutionException ex = assertThrows(java.util.concurrent.ExecutionException.class, future::get);
+        assertTrue(ex.getCause().getMessage().contains("Proposal queue full"), "Exception message should indicate queue overflow");
+    }
+
+    @Test
+    void followerLogTruncationOnConflictingTerm() throws Exception {
+        // Appends initial entries at Term 1: Index 1..5
+        AppendEntriesRequest reqInitial = AppendEntriesRequest.newBuilder()
+                .setTerm(1).setLeaderId("node2").setPrevLogIndex(0).setPrevLogTerm(0).setLeaderCommit(0)
+                .addEntries(RaftEntry.newBuilder().setTerm(1).setIndex(1).setTopic("t1").setPayload(com.google.protobuf.ByteString.copyFromUtf8("e1")).build())
+                .addEntries(RaftEntry.newBuilder().setTerm(1).setIndex(2).setTopic("t1").setPayload(com.google.protobuf.ByteString.copyFromUtf8("e2")).build())
+                .addEntries(RaftEntry.newBuilder().setTerm(1).setIndex(3).setTopic("t1").setPayload(com.google.protobuf.ByteString.copyFromUtf8("e3")).build())
+                .addEntries(RaftEntry.newBuilder().setTerm(1).setIndex(4).setTopic("t1").setPayload(com.google.protobuf.ByteString.copyFromUtf8("e4")).build())
+                .addEntries(RaftEntry.newBuilder().setTerm(1).setIndex(5).setTopic("t1").setPayload(com.google.protobuf.ByteString.copyFromUtf8("e5")).build())
+                .build();
+        assertTrue(raftNode.handleAppendEntries(reqInitial).getSuccess());
+        assertEquals(5, raftNode.getRaftLog().getLastIndex());
+
+        // Now new leader (node3) at Term 2 sends AppendEntries starting at prevLogIndex=2, prevLogTerm=1
+        // with new entries for index 3, 4 at Term 2 (conflicting with index 3, 4, 5 at Term 1)
+        AppendEntriesRequest reqConflict = AppendEntriesRequest.newBuilder()
+                .setTerm(2).setLeaderId("node3").setPrevLogIndex(2).setPrevLogTerm(1).setLeaderCommit(4)
+                .addEntries(RaftEntry.newBuilder().setTerm(2).setIndex(3).setTopic("t1").setPayload(com.google.protobuf.ByteString.copyFromUtf8("e3-new")).build())
+                .addEntries(RaftEntry.newBuilder().setTerm(2).setIndex(4).setTopic("t1").setPayload(com.google.protobuf.ByteString.copyFromUtf8("e4-new")).build())
+                .build();
+
+        AppendEntriesResponse resp = raftNode.handleAppendEntries(reqConflict);
+        assertTrue(resp.getSuccess(), "Follower should accept new entries from leader at higher term");
+        assertEquals(4, raftNode.getRaftLog().getLastIndex(), "Conflicting entries beyond index 4 should be truncated");
+        assertEquals(2, raftNode.getRaftLog().getEntry(3).getTerm(), "Entry 3 should be updated to Term 2");
+        assertEquals(2, raftNode.getRaftLog().getEntry(4).getTerm(), "Entry 4 should be updated to Term 2");
+        assertNull(raftNode.getRaftLog().getEntry(5), "Entry 5 should be truncated");
     }
 }

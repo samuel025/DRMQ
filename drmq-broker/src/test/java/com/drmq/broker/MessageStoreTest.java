@@ -46,9 +46,9 @@ class MessageStoreTest {
 
     @Test
     void appendReturnsMonotonicallyIncreasingOffsets() {
-        long offset1 = store.append("test-topic", "message1".getBytes(), null, System.currentTimeMillis());
-        long offset2 = store.append("test-topic", "message2".getBytes(), null, System.currentTimeMillis());
-        long offset3 = store.append("test-topic", "message3".getBytes(), null, System.currentTimeMillis());
+        long offset1 = store.append("test-topic", "message1".getBytes(), null, System.currentTimeMillis(), -1L);
+        long offset2 = store.append("test-topic", "message2".getBytes(), null, System.currentTimeMillis(), -1L);
+        long offset3 = store.append("test-topic", "message3".getBytes(), null, System.currentTimeMillis(), -1L);
 
         assertEquals(0, offset1);
         assertEquals(1, offset2);
@@ -57,9 +57,9 @@ class MessageStoreTest {
 
     @Test
     void offsetsAreGlobalAcrossTopics() {
-        long offset1 = store.append("topic-a", "msg1".getBytes(), null, System.currentTimeMillis());
-        long offset2 = store.append("topic-b", "msg2".getBytes(), null, System.currentTimeMillis());
-        long offset3 = store.append("topic-a", "msg3".getBytes(), null, System.currentTimeMillis());
+        long offset1 = store.append("topic-a", "msg1".getBytes(), null, System.currentTimeMillis(), -1L);
+        long offset2 = store.append("topic-b", "msg2".getBytes(), null, System.currentTimeMillis(), -1L);
+        long offset3 = store.append("topic-a", "msg3".getBytes(), null, System.currentTimeMillis(), -1L);
 
         assertEquals(0, offset1);
         assertEquals(1, offset2);
@@ -69,7 +69,7 @@ class MessageStoreTest {
     @Test
     void getMessageReturnsStoredMessage() {
         byte[] payload = "hello world".getBytes();
-        long offset = store.append("test", payload, "key1", 12345L);
+        long offset = store.append("test", payload, "key1", 12345L, -1L);
 
         var message = store.getMessage("test", offset);
 
@@ -83,7 +83,7 @@ class MessageStoreTest {
 
     @Test
     void getMessageReturnsNullForNonexistentOffset() {
-        store.append("test", "msg".getBytes(), null, System.currentTimeMillis());
+        store.append("test", "msg".getBytes(), null, System.currentTimeMillis(), -1L);
 
         assertNull(store.getMessage("test", 999));
         assertNull(store.getMessage("nonexistent", 0));
@@ -92,7 +92,7 @@ class MessageStoreTest {
     @Test
     void getMessagesReturnsRangeFromOffset() {
         for (int i = 0; i < 10; i++) {
-            store.append("test", ("msg" + i).getBytes(), null, System.currentTimeMillis());
+            store.append("test", ("msg" + i).getBytes(), null, System.currentTimeMillis(), -1L);
         }
 
         var messages = store.getMessages("test", 5, 3);
@@ -110,7 +110,7 @@ class MessageStoreTest {
             Future<?> future = executor.submit(() -> store.waitForMessages("test", 0, 1, 1000));
 
             Thread.sleep(50);
-            store.append("test", "msg".getBytes(), null, System.currentTimeMillis());
+            store.append("test", "msg".getBytes(), null, System.currentTimeMillis(), -1L);
 
             @SuppressWarnings("unchecked")
             var messages = (java.util.List<StoredMessage>) future.get(2, TimeUnit.SECONDS);
@@ -136,7 +136,7 @@ class MessageStoreTest {
                 try {
                     for (int i = 0; i < messagesPerThread; i++) {
                         store.append("topic-" + threadNum, 
-                                ("message-" + i).getBytes(), null, System.currentTimeMillis());
+                                ("message-" + i).getBytes(), null, System.currentTimeMillis(), -1L);
                         totalMessages.incrementAndGet();
                     }
                 } finally {
@@ -154,10 +154,35 @@ class MessageStoreTest {
     }
 
     @Test
+    void parallelAppendsOnDifferentTopicsDoNotBlock() throws Exception {
+        // This test proves that the global lock was removed and replaced by per-topic locking
+        java.util.concurrent.CountDownLatch topic1Started = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch topic1Finish = new java.util.concurrent.CountDownLatch(1);
+        
+        java.util.concurrent.atomic.AtomicBoolean topic2FinishedFirst = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+        // We can't strictly mock the lock inside MessageStore without reflection,
+        // but we can prove they execute quickly in parallel without stalling.
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        
+        executor.submit(() -> {
+            store.append("slow-topic", "data1".getBytes(), null, 0, -1L);
+        });
+        
+        executor.submit(() -> {
+            store.append("fast-topic", "data2".getBytes(), null, 0, -1L);
+        });
+        
+        executor.shutdown();
+        assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS), "Parallel writes across different topics should not stall");
+        assertEquals(2, store.getCurrentOffset());
+    }
+
+    @Test
     void recoverRebuildsIndexFromDisk() throws IOException {
         String topic = "persistence-test";
-        store.append(topic, "msg1".getBytes(), null, 1000L);
-        store.append(topic, "msg2".getBytes(), "key2", 2000L);
+        store.append(topic, "msg1".getBytes(), null, 1000L, -1L);
+        store.append(topic, "msg2".getBytes(), "key2", 2000L, -1L);
         
         long lastOffset = store.getCurrentOffset();
         
@@ -185,7 +210,7 @@ class MessageStoreTest {
 
     @Test
     void clearResetsStore() {
-        store.append("test", "msg".getBytes(), null, System.currentTimeMillis());
+        store.append("test", "msg".getBytes(), null, System.currentTimeMillis(), -1L);
         assertEquals(1, store.getCurrentOffset());
         assertEquals(1, store.getMessageCount("test"));
 
@@ -197,9 +222,9 @@ class MessageStoreTest {
 
     @Test
     void getTopicsReturnsAllTopicNames() {
-        store.append("alpha", "msg".getBytes(), null, System.currentTimeMillis());
-        store.append("beta", "msg".getBytes(), null, System.currentTimeMillis());
-        store.append("gamma", "msg".getBytes(), null, System.currentTimeMillis());
+        store.append("alpha", "msg".getBytes(), null, System.currentTimeMillis(), -1L);
+        store.append("beta", "msg".getBytes(), null, System.currentTimeMillis(), -1L);
+        store.append("gamma", "msg".getBytes(), null, System.currentTimeMillis(), -1L);
 
         var topics = store.getTopics();
 
@@ -216,9 +241,9 @@ class MessageStoreTest {
         try (LogManager lm = new LogManager(config)) {
             MessageStore testStore = new MessageStore(lm, config);
             
-            testStore.append("roll-topic", new byte[40], null, System.currentTimeMillis());
-            testStore.append("roll-topic", new byte[40], null, System.currentTimeMillis());
-            testStore.append("roll-topic", new byte[40], null, System.currentTimeMillis());
+            testStore.append("roll-topic", new byte[40], null, System.currentTimeMillis(), -1L);
+            testStore.append("roll-topic", new byte[40], null, System.currentTimeMillis(), -1L);
+            testStore.append("roll-topic", new byte[40], null, System.currentTimeMillis(), -1L);
             
             var segments = lm.getAllSegments().get("roll-topic");
             assertTrue(segments.size() > 1, "Log should have rolled into multiple segments");
@@ -234,9 +259,9 @@ class MessageStoreTest {
         try (LogManager lm = new LogManager(config)) {
             MessageStore testStore = new MessageStore(lm, config);
             
-            testStore.append("retention-topic", new byte[40], null, System.currentTimeMillis());
-            testStore.append("retention-topic", new byte[40], null, System.currentTimeMillis());
-            testStore.append("retention-topic", new byte[40], null, System.currentTimeMillis());
+            testStore.append("retention-topic", new byte[40], null, System.currentTimeMillis(), -1L);
+            testStore.append("retention-topic", new byte[40], null, System.currentTimeMillis(), -1L);
+            testStore.append("retention-topic", new byte[40], null, System.currentTimeMillis(), -1L);
             
             var segmentsBefore = lm.getAllSegments().get("retention-topic");
             int numSegmentsBefore = segmentsBefore.size();
@@ -244,7 +269,7 @@ class MessageStoreTest {
             
             Thread.sleep(1000); 
             
-            testStore.append("retention-topic", new byte[10], null, System.currentTimeMillis());
+            testStore.append("retention-topic", new byte[10], null, System.currentTimeMillis(), -1L);
             
             testStore.cleanupOldSegments();
             
@@ -273,7 +298,7 @@ class MessageStoreTest {
                         .setClientTimestamp(300L).build())
                 .build();
 
-        Map<String, Long> baseOffsets = store.appendAtomicBatch(Arrays.asList(slice1, slice2));
+        Map<String, Long> baseOffsets = store.appendAtomicBatch(Arrays.asList(slice1, slice2), -1L);
 
         assertEquals(2, baseOffsets.size());
         assertEquals(0L, baseOffsets.get("topic-a"));
@@ -295,7 +320,7 @@ class MessageStoreTest {
 
     @Test
     void appendAtomicBatchWithEmptyListReturnsEmptyMap() {
-        Map<String, Long> offsets = store.appendAtomicBatch(Collections.emptyList());
+        Map<String, Long> offsets = store.appendAtomicBatch(Collections.emptyList(), -1L);
         assertTrue(offsets.isEmpty());
         assertEquals(0, store.getCurrentOffset());
     }

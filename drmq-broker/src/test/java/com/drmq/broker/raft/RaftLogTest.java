@@ -106,4 +106,58 @@ class RaftLogTest {
         assertEquals(11, raftLog.getLastIndex());
         assertEquals(2, raftLog.getLastTerm());
     }
+
+    @Test
+    void testConcurrentAppendAndCompaction() throws Exception {
+        // Pre-fill log
+        for (int i = 1; i <= 100; i++) {
+            raftLog.append(RaftEntry.newBuilder().setTerm(1).setIndex(i).build());
+        }
+
+        java.util.concurrent.atomic.AtomicBoolean running = new java.util.concurrent.atomic.AtomicBoolean(true);
+        java.util.concurrent.atomic.AtomicLong appendCounter = new java.util.concurrent.atomic.AtomicLong(101);
+        java.util.concurrent.atomic.AtomicReference<Throwable> errorRef = new java.util.concurrent.atomic.AtomicReference<>();
+
+        // Thread 1: Continuous Appender
+        Thread appender = new Thread(() -> {
+            while (running.get() && appendCounter.get() <= 200) {
+                long idx = appendCounter.getAndIncrement();
+                try {
+                    raftLog.append(RaftEntry.newBuilder().setTerm(1).setIndex(idx).build());
+                    Thread.sleep(2);
+                } catch (Throwable t) {
+                    errorRef.set(t);
+                    break;
+                }
+            }
+        });
+
+        // Thread 2: Continuous Reader
+        Thread reader = new Thread(() -> {
+            while (running.get()) {
+                long last = raftLog.getLastIndex();
+                if (last > raftLog.getStartIndex()) {
+                    raftLog.getEntriesFrom(raftLog.getStartIndex(), 10);
+                }
+                try { Thread.sleep(1); } catch (InterruptedException ignored) {}
+            }
+        });
+
+        appender.start();
+        reader.start();
+
+        // Perform compaction while threads are running
+        Thread.sleep(20);
+        raftLog.compact(50);
+        Thread.sleep(20);
+        raftLog.compact(80);
+
+        running.set(false);
+        appender.join(2000);
+        reader.join(2000);
+
+        assertNull(errorRef.get(), "Concurrent operations threw exception: " + errorRef.get());
+        assertTrue(raftLog.getStartIndex() >= 81);
+        assertTrue(raftLog.getLastIndex() >= 101);
+    }
 }
