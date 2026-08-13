@@ -284,7 +284,7 @@ public class MessageStore implements Closeable {
         return globalOffset.getAndAdd(count);
     }
 
-    private void updateGlobalOffset(long target) {
+    public void updateGlobalOffset(long target) {
         long current;
         while ((current = globalOffset.get()) < target) {
             globalOffset.compareAndSet(current, target);

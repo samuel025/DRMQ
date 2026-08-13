@@ -127,8 +127,6 @@ public class RaftNode {
         final ProduceBatchRequest batchRequest;
 
         AggregatedProposalState(long term, List<ProposalRequest> constituents, ProduceBatchRequest batchRequest) {
-            // The "master" future is not directly returned to any client;
-            // individual ProposalRequest futures are completed in applyCommitted.
             super(term, new CompletableFuture<>());
             this.constituents = constituents;
             this.batchRequest = batchRequest;
@@ -203,7 +201,7 @@ public class RaftNode {
      * Allows up to MAX_INFLIGHT_RPCS concurrent RPCs per peer.
      */
     private static class PeerReplicationState {
-        final java.util.concurrent.Semaphore pipelineSlots = new java.util.concurrent.Semaphore(MAX_INFLIGHT_RPCS);
+        final Semaphore pipelineSlots = new Semaphore(MAX_INFLIGHT_RPCS);
         final AtomicInteger connectionRoundRobin = new AtomicInteger(0);
         // Track whether a pipeline-fill task is already scheduled to avoid duplicate scheduling
         final AtomicBoolean pipelineFillScheduled = new AtomicBoolean(false);
@@ -245,8 +243,6 @@ public class RaftNode {
         this.lastApplied = 0;
         this.nextIndex = new ConcurrentHashMap<>();
         this.matchIndex = new ConcurrentHashMap<>();
-        // Thread pool must accommodate pipelined RPCs: up to MAX_INFLIGHT_RPCS per peer
-        // running concurrently, plus pipeline-fill tasks, heartbeats, and elections.
         this.raftExecutor = Executors.newFixedThreadPool(
                 Math.max(8, peers.size() * (MAX_INFLIGHT_RPCS + 1) + 4),
                 r -> {
@@ -371,16 +367,6 @@ public class RaftNode {
         }
     }
 
-    /**
-     * Background log appender — drains disk-write tasks from the queue and
-     * flushes them in micro-batches to amortize the replication trigger cost.
-     * Each aggregated Raft entry enqueues a task that does:
-     *   1. raftLog.append(entries)  — disk write
-     *   2. sendHeartbeats()         — triggers replication to followers
-     *
-     * By draining multiple tasks and calling sendHeartbeats() once at the end,
-     * we avoid redundant replication RPCs when multiple batches are queued.
-     */
     private void logAppenderLoop() {
         logger.info("[{}] Log appender thread started", nodeId);
         List<Runnable> drained = new ArrayList<>(64);
@@ -417,7 +403,6 @@ public class RaftNode {
 
                 if (drained.isEmpty()) continue;
 
-                // Check leadership before doing work
                 if (state != RaftState.LEADER) {
                     IOException err = new IOException("NOT_LEADER:" + (leaderId != null ? getLeaderAddress() : "UNKNOWN"));
                     for (ProposalRequest req : drained) {
@@ -426,13 +411,11 @@ public class RaftNode {
                     continue;
                 }
 
-                // Group proposals by topic for coalescing
                 Map<String, List<ProposalRequest>> byTopic = new LinkedHashMap<>();
                 for (ProposalRequest req : drained) {
                     byTopic.computeIfAbsent(req.topic, k -> new ArrayList<>()).add(req);
                 }
 
-                // --- BUILD CHUNKS AND SERIALIZE OUTSIDE LOCK ---
                 class ChunkData {
                     String topic;
                     List<ProposalRequest> requests;
@@ -1084,6 +1067,33 @@ public class RaftNode {
         if (electionTimer != null) electionTimer.cancel(false);
         if (quorumCheckTimer != null) quorumCheckTimer.cancel(false);
 
+        // Sync global offset with the highest uncommitted physical offset to prevent overlap
+        if (messageStore != null) {
+            for (long idx = lastLogIndex; idx > commitIndex; idx--) {
+                com.drmq.protocol.RaftEntry e = raftLog.getEntry(idx);
+                if (e != null && e.getBaseOffset() >= 0) {
+                    try {
+                        long total = 0;
+                        if (e.getCommandType() == com.drmq.protocol.RaftCommandType.BATCH_MESSAGE) {
+                            total = com.drmq.protocol.ProduceBatchRequest.parseFrom(e.getPayload()).getEntriesCount();
+                        } else if (e.getCommandType() == com.drmq.protocol.RaftCommandType.ATOMIC_BATCH) {
+                            total = com.drmq.protocol.AtomicBatchRequest.parseFrom(e.getPayload()).getSlicesList().stream()
+                                    .mapToInt(com.drmq.protocol.AtomicBatchTopicSlice::getEntriesCount).sum();
+                        } else if (e.getCommandType() == com.drmq.protocol.RaftCommandType.MESSAGE) {
+                            total = 1;
+                        }
+                        if (total > 0) {
+                            messageStore.updateGlobalOffset(e.getBaseOffset() + total);
+                            logger.info("[{}] Synchronized MessageStore globalOffset to {} based on uncommitted Raft entry {}", nodeId, e.getBaseOffset() + total, idx);
+                            break;
+                        }
+                    } catch (Exception ex) {
+                        logger.warn("[{}] Failed to parse uncommitted Raft entry {} during offset sync", nodeId, idx, ex);
+                    }
+                }
+            }
+        }
+
         logger.info("[{}] ★ Became LEADER for term {} (lastLogIndex={}, electionMs={})",
             nodeId, currentTerm, lastLogIndex, electionDuration);
         ClusterEventBuffer.emitElection(String.format("Broker-%s became LEADER for term %d", nodeId, currentTerm));
@@ -1189,8 +1199,6 @@ public class RaftNode {
 
         for (PeerAddress peer : peers) {
             if (snapshotInProgress.getOrDefault(peer.id(), false)) {
-                // If replication is blocked generating a massive snapshot, the peer lock is free.
-                // Send a lightweight heartbeat so the follower's election timer doesn't fire.
                 AtomicBoolean heartbeatInFlight = isHeartbeatInFlight.computeIfAbsent(peer.id(), k -> new AtomicBoolean(false));
                 if (heartbeatInFlight.compareAndSet(false, true)) {
                     CompletableFuture.runAsync(() -> {
@@ -1275,25 +1283,10 @@ public class RaftNode {
         }
     }
 
-    /**
-     * Pipelined replication: fill all available pipeline slots for a single peer.
-     *
-     * Instead of stop-and-wait (one RPC at a time), this method launches up to
-     * MAX_INFLIGHT_RPCS concurrent AppendEntries RPCs per peer. Each RPC:
-     *   1. Acquires a pipeline slot (semaphore permit)
-     *   2. Reads nextIndex and fetches entries
-     *   3. Optimistically advances nextIndex
-     *   4. Sends the RPC asynchronously
-     *   5. On response: updates matchIndex (or rolls back nextIndex on failure)
-     *   6. Releases the pipeline slot and re-fills if more entries are pending
-     */
     private void pipelinedReplicateTo(PeerAddress peer) {
         PeerReplicationState pState = peerPipelineState.get(peer.id());
         if (pState == null) return;
-
-        // Fill as many pipeline slots as we can
         while (state == RaftState.LEADER && running) {
-            // Try to acquire a pipeline slot (non-blocking)
             if (!pState.pipelineSlots.tryAcquire()) break;
 
             boolean needsSnapshot = false;
