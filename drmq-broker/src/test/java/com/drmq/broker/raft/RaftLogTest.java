@@ -160,4 +160,51 @@ class RaftLogTest {
         assertTrue(raftLog.getStartIndex() >= 81);
         assertTrue(raftLog.getLastIndex() >= 101);
     }
+
+    @Test
+    void testNonMonotonicAppendThrows() throws IOException {
+        raftLog.append(RaftEntry.newBuilder().setTerm(1).setIndex(1).build());
+        raftLog.append(RaftEntry.newBuilder().setTerm(1).setIndex(2).build());
+
+        // Attempting to append an out-of-sequence index must throw IllegalStateException
+        assertThrows(IllegalStateException.class, () -> {
+            raftLog.append(RaftEntry.newBuilder().setTerm(1).setIndex(1).build());
+        });
+
+        assertThrows(IllegalStateException.class, () -> {
+            raftLog.append(RaftEntry.newBuilder().setTerm(1).setIndex(5).build());
+        });
+
+        // Valid sequential index succeeds
+        raftLog.append(RaftEntry.newBuilder().setTerm(1).setIndex(3).build());
+        assertEquals(3, raftLog.getLastIndex());
+    }
+
+    @Test
+    void testRecoverySelfHealsCorruptedTrailingEntries() throws IOException {
+        for (int i = 1; i <= 10; i++) {
+            raftLog.append(RaftEntry.newBuilder().setTerm(1).setIndex(i).build());
+        }
+        assertEquals(10, raftLog.getLastIndex());
+
+        // Append a corrupted entry directly to disk with a backwards index
+        java.io.File logFile = tempDir.resolve("raft").resolve("raft.log").toFile();
+        byte[] corruptedData = RaftEntry.newBuilder().setTerm(1).setIndex(5).build().toByteArray();
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(logFile, "rw")) {
+            raf.seek(raf.length());
+            raf.writeInt(corruptedData.length);
+            raf.write(corruptedData);
+        }
+
+        // Re-open RaftLog: recovery should detect non-sequential entry 5 after 10, truncate it, and self-heal
+        RaftLog recoveredLog = new RaftLog(tempDir, true);
+        assertEquals(10, recoveredLog.getLastIndex());
+        assertEquals(1, recoveredLog.getStartIndex());
+        assertEquals(10, recoveredLog.size());
+
+        // Able to append next valid index 11 cleanly
+        recoveredLog.append(RaftEntry.newBuilder().setTerm(1).setIndex(11).build());
+        assertEquals(11, recoveredLog.getLastIndex());
+    }
 }
+
