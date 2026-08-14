@@ -524,7 +524,7 @@ export class DRMQConsumer extends DRMQClient {
               const nextOffset = resp.messages[resp.messages.length - 1].offset + 1;
               this.localOffsets[topic] = nextOffset;
               
-              if (this.autoCommit) {
+              if (this.autoCommit && this.groupMode) {
                 await this.commit(topic, nextOffset);
               }
             }
@@ -570,6 +570,9 @@ export class DRMQConsumer extends DRMQClient {
   }
 
   public async commit(topic: string, nextOffset: number): Promise<void> {
+    if (!this.groupMode) {
+      throw new Error("Commit offset is only supported in consumer group mode (in single mode, offsets are managed locally by the client)");
+    }
     for (let attempt = 0; attempt < this.maxRetries; attempt++) {
       try {
         await this.ensureConnected();

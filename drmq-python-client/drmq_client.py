@@ -459,7 +459,7 @@ class DRMQConsumer(DRMQClient):
                         if resp.messages:
                             next_offset = resp.messages[-1].offset + 1
                             self.local_offsets[topic] = next_offset
-                            if self.auto_commit:
+                            if self.auto_commit and self.group_mode:
                                 self.commit(topic, next_offset)
                     elif self._try_redirect_to_leader(resp.error_message):
                         # Break and retry the entire poll loop on the new leader
@@ -497,6 +497,8 @@ class DRMQConsumer(DRMQClient):
 
     def commit(self, topic: str, offset: int):
         """Commit an offset back to the broker."""
+        if not self.group_mode:
+            raise RuntimeError("Commit offset is only supported in consumer group mode (in single mode, offsets are managed locally by the client)")
         for _ in range(self.max_retries):
             try:
                 self._ensure_connected()
