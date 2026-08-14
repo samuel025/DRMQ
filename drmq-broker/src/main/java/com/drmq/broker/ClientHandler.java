@@ -120,55 +120,55 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
         ctx.close();
     }
 
-    private java.util.concurrent.CompletableFuture<MessageEnvelope> handleMessage(MessageEnvelope envelope) throws IOException {
+    private CompletableFuture<MessageEnvelope> handleMessage(MessageEnvelope envelope) throws IOException {
         return switch (envelope.getType()) {
             case PRODUCE_REQUEST -> handleProduceRequest(envelope);
             case PRODUCE_BATCH_REQUEST -> handleProduceBatchRequest(envelope);
-            case CONSUME_REQUEST -> java.util.concurrent.CompletableFuture.completedFuture(handleConsumeRequest(envelope));
+            case CONSUME_REQUEST -> CompletableFuture.completedFuture(handleConsumeRequest(envelope));
             case COMMIT_OFFSET_REQUEST -> handleCommitOffsetRequest(envelope);
-            case FETCH_OFFSET_REQUEST -> java.util.concurrent.CompletableFuture.completedFuture(handleFetchOffsetRequest(envelope));
-            case NACK_REQUEST -> java.util.concurrent.CompletableFuture.completedFuture(handleNackRequest(envelope));
+            case FETCH_OFFSET_REQUEST -> CompletableFuture.completedFuture(handleFetchOffsetRequest(envelope));
+            case NACK_REQUEST -> CompletableFuture.completedFuture(handleNackRequest(envelope));
             case REQUEST_VOTE_REQUEST -> handleRequestVoteRequest(envelope);
             case PRE_VOTE_REQUEST -> handlePreVoteRequest(envelope);
             case APPEND_ENTRIES_REQUEST -> handleAppendEntriesRequest(envelope);
             case REQUEST_TOPIC_OFFSETS_REQUEST -> handleRequestTopicOffsetsRequest(envelope);
             case INCREMENTAL_SNAPSHOT_CHUNK -> handleIncrementalSnapshotChunk(envelope);
             case INCREMENTAL_SNAPSHOT_DONE_REQUEST -> handleIncrementalSnapshotDoneRequest(envelope);
-            case SEARCH_OFFSET_BY_TIME_REQUEST -> java.util.concurrent.CompletableFuture.completedFuture(handleSearchOffsetByTimeRequest(envelope));
+            case SEARCH_OFFSET_BY_TIME_REQUEST -> CompletableFuture.completedFuture(handleSearchOffsetByTimeRequest(envelope));
             case ATOMIC_PRODUCE_REQUEST -> handleAtomicProduceRequest(envelope);
-            default -> java.util.concurrent.CompletableFuture.completedFuture(createErrorResponse("Unknown message type: " + envelope.getType()));
+            default -> CompletableFuture.completedFuture(createErrorResponse("Unknown message type: " + envelope.getType()));
         };
     }
 
-    private java.util.concurrent.CompletableFuture<MessageEnvelope> handleProduceRequest(MessageEnvelope envelope) {
+    private CompletableFuture<MessageEnvelope> handleProduceRequest(MessageEnvelope envelope) {
         long startNanos = System.nanoTime();
         try {
             ProduceRequest request = ProduceRequest.parseFrom(envelope.getPayload());
 
             String topic = request.getTopic();
             if (!isValidTopic(topic)) {
-                return java.util.concurrent.CompletableFuture.completedFuture(createProduceErrorResponse("Invalid topic name", ErrorCode.UNKNOWN_ERROR));
+                return CompletableFuture.completedFuture(createProduceErrorResponse("Invalid topic name", ErrorCode.UNKNOWN_ERROR));
             }
             com.google.protobuf.ByteString payload = request.getPayload();
             long finalPayloadBytes = payload.size();
             
             if (finalPayloadBytes > MAX_PAYLOAD_BYTES) {
-                return java.util.concurrent.CompletableFuture.completedFuture(createProduceErrorResponse("Payload exceeds maximum size of " + MAX_PAYLOAD_BYTES + " bytes", ErrorCode.UNKNOWN_ERROR));
+                return CompletableFuture.completedFuture(createProduceErrorResponse("Payload exceeds maximum size of " + MAX_PAYLOAD_BYTES + " bytes", ErrorCode.UNKNOWN_ERROR));
             }
             
             String key = request.hasKey() ? request.getKey() : null;
             long timestamp = request.getTimestamp();
 
-            java.util.concurrent.CompletableFuture<Long> offsetFuture;
+            CompletableFuture<Long> offsetFuture;
             if (raftNode != null) {
                 if (!raftNode.isLeader()) {
                     String leaderAddr = raftNode.getLeaderAddress();
-                    return java.util.concurrent.CompletableFuture.completedFuture(createProduceErrorResponse("NOT_LEADER:" +
+                    return CompletableFuture.completedFuture(createProduceErrorResponse("NOT_LEADER:" +
                             (leaderAddr != null ? leaderAddr : "UNKNOWN"), ErrorCode.NOT_LEADER));
                 }
                 offsetFuture = raftNode.proposeAsync(topic, payload, key, timestamp);
             } else {
-                offsetFuture = java.util.concurrent.CompletableFuture.completedFuture(messageStore.append(topic, payload, key, timestamp, -1));
+                offsetFuture = CompletableFuture.completedFuture(messageStore.append(topic, payload, key, timestamp, -1));
             }
 
             return offsetFuture.thenApply(offset -> {
@@ -199,11 +199,11 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
             logger.error("Error processing produce request", e);
             BrokerMetrics.get().recordRequest("produce", false,
                 System.nanoTime() - startNanos, 0, 1);
-            return java.util.concurrent.CompletableFuture.completedFuture(createProduceErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR));
+            return CompletableFuture.completedFuture(createProduceErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR));
         }
     }
 
-    private java.util.concurrent.CompletableFuture<MessageEnvelope> handleProduceBatchRequest(MessageEnvelope envelope) {
+    private CompletableFuture<MessageEnvelope> handleProduceBatchRequest(MessageEnvelope envelope) {
         long startNanos = System.nanoTime();
         long payloadBytes = 0;
         int count = 0;
@@ -212,16 +212,16 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
 
             String topic = request.getTopic();
             if (!isValidTopic(topic)) {
-                return java.util.concurrent.CompletableFuture.completedFuture(createProduceBatchErrorResponse("Invalid topic name", ErrorCode.UNKNOWN_ERROR));
+                return CompletableFuture.completedFuture(createProduceBatchErrorResponse("Invalid topic name", ErrorCode.UNKNOWN_ERROR));
             }
             count = request.getEntriesCount();
             final int finalBatchCount = count;
 
             if (finalBatchCount == 0) {
-                return java.util.concurrent.CompletableFuture.completedFuture(createProduceBatchErrorResponse("Batch must contain at least one message", ErrorCode.UNKNOWN_ERROR));
+                return CompletableFuture.completedFuture(createProduceBatchErrorResponse("Batch must contain at least one message", ErrorCode.UNKNOWN_ERROR));
             }
             if (finalBatchCount > MAX_BATCH_MESSAGES) {
-                return java.util.concurrent.CompletableFuture.completedFuture(createProduceBatchErrorResponse("Batch exceeds maximum message count of " + MAX_BATCH_MESSAGES, ErrorCode.UNKNOWN_ERROR));
+                return CompletableFuture.completedFuture(createProduceBatchErrorResponse("Batch exceeds maximum message count of " + MAX_BATCH_MESSAGES, ErrorCode.UNKNOWN_ERROR));
             }
 
             for (var entry : request.getEntriesList()) {
@@ -230,19 +230,19 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
             final long finalPayloadBytes = payloadBytes;
 
             if (finalPayloadBytes > MAX_PAYLOAD_BYTES) {
-                return java.util.concurrent.CompletableFuture.completedFuture(createProduceBatchErrorResponse("Batch payload exceeds maximum size of " + MAX_PAYLOAD_BYTES + " bytes", ErrorCode.UNKNOWN_ERROR));
+                return CompletableFuture.completedFuture(createProduceBatchErrorResponse("Batch payload exceeds maximum size of " + MAX_PAYLOAD_BYTES + " bytes", ErrorCode.UNKNOWN_ERROR));
             }
 
-            java.util.concurrent.CompletableFuture<Long> offsetFuture;
+            CompletableFuture<Long> offsetFuture;
             if (raftNode != null) {
                 if (!raftNode.isLeader()) {
                     String leaderAddr = raftNode.getLeaderAddress();
-                    return java.util.concurrent.CompletableFuture.completedFuture(createProduceBatchErrorResponse("NOT_LEADER:" +
+                    return CompletableFuture.completedFuture(createProduceBatchErrorResponse("NOT_LEADER:" +
                             (leaderAddr != null ? leaderAddr : "UNKNOWN"), ErrorCode.NOT_LEADER));
                 }
                 offsetFuture = raftNode.proposeBatchAsync(topic, request.getEntriesList());
             } else {
-                offsetFuture = java.util.concurrent.CompletableFuture.completedFuture(messageStore.appendBatch(topic, request.getEntriesList(), -1));
+                offsetFuture = CompletableFuture.completedFuture(messageStore.appendBatch(topic, request.getEntriesList(), -1));
             }
 
             return offsetFuture.thenApply(baseOffset -> {
@@ -274,7 +274,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
             logger.error("Error processing produce batch request", e);
             BrokerMetrics.get().recordRequest("produce_batch", false,
                 System.nanoTime() - startNanos, payloadBytes, count);
-            return java.util.concurrent.CompletableFuture.completedFuture(createProduceBatchErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR));
+            return CompletableFuture.completedFuture(createProduceBatchErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR));
         }
     }
 
@@ -290,7 +290,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
                 .build();
     }
 
-    private java.util.concurrent.CompletableFuture<MessageEnvelope> handleAtomicProduceRequest(MessageEnvelope envelope) {
+    private CompletableFuture<MessageEnvelope> handleAtomicProduceRequest(MessageEnvelope envelope) {
         long startNanos = System.nanoTime();
         long payloadBytes = 0;
         int count = 0;
@@ -299,7 +299,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
 
             for (var slice : request.getSlicesList()) {
                 if (!isValidTopic(slice.getTopic())) {
-                    return java.util.concurrent.CompletableFuture.completedFuture(createAtomicProduceErrorResponse("Invalid topic name: " + slice.getTopic(), ErrorCode.UNKNOWN_ERROR));
+                    return CompletableFuture.completedFuture(createAtomicProduceErrorResponse("Invalid topic name: " + slice.getTopic(), ErrorCode.UNKNOWN_ERROR));
                 }
                 count += slice.getEntriesCount();
                 for (var entry : slice.getEntriesList()) {
@@ -310,22 +310,22 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
             final long finalPayloadBytes = payloadBytes;
 
             if (finalBatchCount == 0) {
-                return java.util.concurrent.CompletableFuture.completedFuture(createAtomicProduceErrorResponse("Atomic batch must contain at least one message", ErrorCode.UNKNOWN_ERROR));
+                return CompletableFuture.completedFuture(createAtomicProduceErrorResponse("Atomic batch must contain at least one message", ErrorCode.UNKNOWN_ERROR));
             }
             if (finalPayloadBytes > MAX_PAYLOAD_BYTES) {
-                return java.util.concurrent.CompletableFuture.completedFuture(createAtomicProduceErrorResponse("Batch payload exceeds maximum size of " + MAX_PAYLOAD_BYTES + " bytes", ErrorCode.UNKNOWN_ERROR));
+                return CompletableFuture.completedFuture(createAtomicProduceErrorResponse("Batch payload exceeds maximum size of " + MAX_PAYLOAD_BYTES + " bytes", ErrorCode.UNKNOWN_ERROR));
             }
 
-            java.util.concurrent.CompletableFuture<java.util.Map<String, Long>> offsetsFuture;
+            CompletableFuture<java.util.Map<String, Long>> offsetsFuture;
             if (raftNode != null) {
                 if (!raftNode.isLeader()) {
                     String leaderAddr = raftNode.getLeaderAddress();
-                    return java.util.concurrent.CompletableFuture.completedFuture(createAtomicProduceErrorResponse("NOT_LEADER:" +
+                    return CompletableFuture.completedFuture(createAtomicProduceErrorResponse("NOT_LEADER:" +
                             (leaderAddr != null ? leaderAddr : "UNKNOWN"), ErrorCode.NOT_LEADER));
                 }
                 offsetsFuture = raftNode.proposeAtomicBatchAsync(request.getSlicesList());
             } else {
-                offsetsFuture = java.util.concurrent.CompletableFuture.completedFuture(messageStore.appendAtomicBatch(request.getSlicesList(), -1));
+                offsetsFuture = CompletableFuture.completedFuture(messageStore.appendAtomicBatch(request.getSlicesList(), -1));
             }
 
             return offsetsFuture.thenApply(offsets -> {
@@ -356,7 +356,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
             logger.error("Error processing atomic produce request", e);
             BrokerMetrics.get().recordRequest("atomic_produce", false,
                 System.nanoTime() - startNanos, payloadBytes, count);
-            return java.util.concurrent.CompletableFuture.completedFuture(createAtomicProduceErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR));
+            return CompletableFuture.completedFuture(createAtomicProduceErrorResponse(e.getMessage(), ErrorCode.UNKNOWN_ERROR));
         }
     }
 
@@ -539,7 +539,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
                 .build();
     }
 
-    private java.util.concurrent.CompletableFuture<MessageEnvelope> handleCommitOffsetRequest(MessageEnvelope envelope) {
+    private CompletableFuture<MessageEnvelope> handleCommitOffsetRequest(MessageEnvelope envelope) {
         long startNanos = System.nanoTime();
         try {
             CommitOffsetRequest request = CommitOffsetRequest.parseFrom(envelope.getPayload());
@@ -548,7 +548,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
             String topic = request.getTopic();
             long offset  = request.getOffset();
 
-            java.util.concurrent.CompletableFuture<Void> commitFuture = new java.util.concurrent.CompletableFuture<>();
+            CompletableFuture<Void> commitFuture = new CompletableFuture<>();
 
             // Route through the coordinator if this group is actively coordinated
             if (groupCoordinator != null && groupCoordinator.isGroupActive(group, topic)) {
@@ -562,7 +562,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
                             .setErrorMessage("NOT_LEADER:" +
                                     (leaderAddr != null ? leaderAddr : "UNKNOWN"))
                             .build();
-                    return java.util.concurrent.CompletableFuture.completedFuture(MessageEnvelope.newBuilder()
+                    return CompletableFuture.completedFuture(MessageEnvelope.newBuilder()
                             .setType(MessageType.COMMIT_OFFSET_RESPONSE)
                             .setPayload(response.toByteString())
                             .build());
@@ -609,7 +609,7 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
                     .setSuccess(false)
                     .setErrorMessage(e.getMessage() != null ? e.getMessage() : "Unknown error")
                     .build();
-            return java.util.concurrent.CompletableFuture.completedFuture(MessageEnvelope.newBuilder()
+            return CompletableFuture.completedFuture(MessageEnvelope.newBuilder()
                     .setType(MessageType.COMMIT_OFFSET_RESPONSE)
                     .setPayload(response.toByteString())
                     .build());
@@ -750,15 +750,15 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
                 .build();
     }
 
-    private java.util.concurrent.CompletableFuture<MessageEnvelope> handleRequestVoteRequest(MessageEnvelope envelope) {
+    private CompletableFuture<MessageEnvelope> handleRequestVoteRequest(MessageEnvelope envelope) {
         long startNanos = System.nanoTime();
         if (raftNode == null) {
             BrokerMetrics.get().recordRaftRpc("request_vote", false,
                     System.nanoTime() - startNanos);
-            return java.util.concurrent.CompletableFuture.completedFuture(createRequestVoteErrorResponse());
+            return CompletableFuture.completedFuture(createRequestVoteErrorResponse());
         }
         
-        return java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+        return CompletableFuture.supplyAsync(() -> {
             try {
                 RequestVoteRequest request = RequestVoteRequest.parseFrom(envelope.getPayload());
                 RequestVoteResponse response = raftNode.handleRequestVote(request);
@@ -779,15 +779,15 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
         }, rpcExecutor);
     }
 
-    private java.util.concurrent.CompletableFuture<MessageEnvelope> handlePreVoteRequest(MessageEnvelope envelope) {
+    private CompletableFuture<MessageEnvelope> handlePreVoteRequest(MessageEnvelope envelope) {
         long startNanos = System.nanoTime();
         if (raftNode == null) {
             BrokerMetrics.get().recordRaftRpc("pre_vote", false,
                     System.nanoTime() - startNanos);
-            return java.util.concurrent.CompletableFuture.completedFuture(createPreVoteErrorResponse());
+            return CompletableFuture.completedFuture(createPreVoteErrorResponse());
         }
         
-        return java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+        return CompletableFuture.supplyAsync(() -> {
             try {
                 PreVoteRequest request = PreVoteRequest.parseFrom(envelope.getPayload());
                 PreVoteResponse response = raftNode.handlePreVote(request);
@@ -808,15 +808,15 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
         }, rpcExecutor);
     }
 
-    private java.util.concurrent.CompletableFuture<MessageEnvelope> handleAppendEntriesRequest(MessageEnvelope envelope) {
+    private CompletableFuture<MessageEnvelope> handleAppendEntriesRequest(MessageEnvelope envelope) {
         long startNanos = System.nanoTime();
         if (raftNode == null) {
             BrokerMetrics.get().recordRaftRpc("append_entries", false,
                     System.nanoTime() - startNanos);
-            return java.util.concurrent.CompletableFuture.completedFuture(createAppendEntriesErrorResponse());
+            return CompletableFuture.completedFuture(createAppendEntriesErrorResponse());
         }
 
-        return java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+        return CompletableFuture.supplyAsync(() -> {
             try {
                 AppendEntriesRequest request = AppendEntriesRequest.parseFrom(envelope.getPayload());
                 AppendEntriesResponse response = raftNode.handleAppendEntries(request);
@@ -837,8 +837,8 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
         }, rpcExecutor);
     }
 
-    private java.util.concurrent.CompletableFuture<MessageEnvelope> handleRequestTopicOffsetsRequest(MessageEnvelope envelope) {
-        return java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+    private CompletableFuture<MessageEnvelope> handleRequestTopicOffsetsRequest(MessageEnvelope envelope) {
+        return CompletableFuture.supplyAsync(() -> {
             try {
                 RequestTopicOffsetsRequest request = RequestTopicOffsetsRequest.parseFrom(envelope.getPayload());
                 java.util.Map<String, Long> offsets = messageStore.getTopicMaxOffsets();
@@ -861,8 +861,8 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
         }, rpcExecutor);
     }
 
-    private java.util.concurrent.CompletableFuture<MessageEnvelope> handleIncrementalSnapshotChunk(MessageEnvelope envelope) {
-        return java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+    private CompletableFuture<MessageEnvelope> handleIncrementalSnapshotChunk(MessageEnvelope envelope) {
+        return CompletableFuture.supplyAsync(() -> {
             boolean success = false;
             try {
                 IncrementalSnapshotChunk request = IncrementalSnapshotChunk.parseFrom(envelope.getPayload());
@@ -884,8 +884,8 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
         }, rpcExecutor);
     }
 
-    private java.util.concurrent.CompletableFuture<MessageEnvelope> handleIncrementalSnapshotDoneRequest(MessageEnvelope envelope) {
-        return java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+    private CompletableFuture<MessageEnvelope> handleIncrementalSnapshotDoneRequest(MessageEnvelope envelope) {
+        return CompletableFuture.supplyAsync(() -> {
             boolean success = false;
             try {
                 IncrementalSnapshotDoneRequest request = IncrementalSnapshotDoneRequest.parseFrom(envelope.getPayload());

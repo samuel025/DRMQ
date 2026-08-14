@@ -2,11 +2,30 @@
 
 **Official Documentation:** [https://drmq.vercel.app](https://drmq.vercel.app)
 
-DRMQ is a fault-tolerant, high-performance distributed message broker built from first principles. It provides guaranteed message delivery, strict ordering, and high availability through the implementation of the Raft consensus algorithm for log replication and leader election. DRMQ supports scalable consumption via multi-consumer groups — multiple consumers can share a group to load-balance message processing without partitions.
+DRMQ is a fault-tolerant, consensus-backed distributed message queue built from first principles. Unlike high-throughput, partition-centric message systems (such as Apache Kafka) designed primarily for massive raw streaming ingest, **DRMQ prioritizes strict cross-topic atomicity, linear consensus consistency, and zero-coordinator transactional safety**. By unifying message logs, consumer offset state, and multi-topic writes under a single Raft consensus engine, DRMQ guarantees that cross-topic operations commit or fail as a single atomic unit without the latency and failure modes of external two-phase commit (2PC) coordinators.
+
+## Core Design Philosophy & Architectural Positioning
+
+Modern distributed message queues usually trade atomic guarantees for extreme write throughput:
+
+* **High-Throughput Systems (e.g., Apache Kafka)**: Scale throughput horizontally by distributing independent topic partitions across distinct broker nodes. However, cross-topic atomic writes require complex, two-phase commit (2PC) transaction coordinators, transaction markers, and background state topics (`__transaction_state`). This introduces coordinator failure modes, partial commit vulnerability windows, and significant operational complexity.
+* **DRMQ (Atomicity & Reliability First)**: Designed specifically for mission-critical transactional workloads (such as financial payment flows, order processing pipelines, and audit logs) where **a partial commit across topics is catastrophic**. In DRMQ, cross-topic atomic batches are proposed and committed directly into the core Raft log as a single, indivisible entry. Either **all** messages across all requested topics are durably replicated and committed, or **none** are.
+
+### Key Architectural Trade-Offs
+
+| Architectural Dimension | **Apache Kafka** | **DRMQ** |
+| :--- | :--- | :--- |
+| **Primary Design Goal** | Multi-million msg/sec horizontal scale | **Strict Cross-Topic Atomicity & Zero-2PC Reliability** |
+| **Cross-Topic Transactions** | Heavy 2PC Coordinator + Transaction Markers | **Native Single-Raft Atomic Log Commit** |
+| **Offset & Group State** | Separate internal `__consumer_offsets` log | **Unified Raft Consensus State Machine** |
+| **Durability Discipline** | Deferred OS page-cache flushes (by default) | **Synchronous `fsync` by default (Configurable to OS Page Cache)** |
+| **Target Use Cases** | Event streaming, metrics, log aggregation | Financial transactions, order pipelines, audit ledgers |
+
+---
 
 ## Overview
 
-DRMQ is designed to be a resilient, easily understandable, and scalable message queue. It operates via a custom TCP protocol and supports both a standalone single-node mode for development or simple deployments, and a robust cluster mode for production environments requiring fault tolerance.
+DRMQ operates via a custom high-performance TCP protocol and supports both a standalone single-node mode for development and a robust cluster mode for production environments requiring fault tolerance.
 
 The project is structured as a multi-module Maven build, separating the core broker logic, client libraries, protocol definitions, and integration tests to ensure maintainability and clear boundaries.
 
