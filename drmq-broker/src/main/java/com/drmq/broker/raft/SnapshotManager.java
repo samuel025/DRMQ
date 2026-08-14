@@ -11,6 +11,8 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.file.*;
+import java.util.List;
+import java.util.Map;
 
 
 /**
@@ -115,11 +117,11 @@ public class SnapshotManager {
         }
     }
 
-    public SnapshotManifest freezeSnapshot(long snapshotIndex, long snapshotTerm, java.util.Map<String, Long> followerOffsets) {
-        java.util.Map<String, Long> offsetState = offsetManager != null ? offsetManager.getAllOffsets() : java.util.Collections.emptyMap();
-        java.util.Map<String, Long> fileManifest = new java.util.HashMap<>();
-        java.util.List<Path> allSegmentsToStream = new java.util.ArrayList<>();
-        java.util.Map<Path, String> pathToTopic = new java.util.HashMap<>();
+    public SnapshotManifest freezeSnapshot(long snapshotIndex, long snapshotTerm, Map<String, Long> followerOffsets) {
+        Map<String, Long> offsetState = offsetManager != null ? offsetManager.getAllOffsets() : java.util.Collections.emptyMap();
+        Map<String, Long> fileManifest = new java.util.HashMap<>();
+        List<Path> allSegmentsToStream = new java.util.ArrayList<>();
+        Map<Path, String> pathToTopic = new java.util.HashMap<>();
 
         messageStore.lockForSnapshot(() -> {
             try {
