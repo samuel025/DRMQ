@@ -212,17 +212,21 @@ public class ConsumerApp {
                         System.out.printf("\nGroup: %s\n", consumerGroup);
                         System.out.printf("Consumer ID: %s\n", consumer.getConsumerId());
                         System.out.println("─────────────────────────────");
-                        System.out.printf("Group mode:  %s\n", consumer.isGroupMode() ? "on (broker coordinates)" : "off (single mode)");
+                        System.out.printf("Group mode:  %s\n", consumer.isGroupMode() ? "on (broker coordinates & commits offsets)" : "off (single mode: client-driven offsets, no broker commits)");
                         System.out.printf("Auto-commit: %s\n", consumer.isAutoCommit() ? "on" : "off");
                         System.out.println("  (Use 'subscribe <topic>' to add subscriptions)");
                         if (consumer.isGroupMode()) {
                             System.out.println("  Tip: Multiple consumers with the same group share the workload!\n");
                         } else {
-                            System.out.println("  Tip: Use 'mode group' to enable broker-coordinated consumption.\n");
+                            System.out.println("  Tip: In single mode, offsets are managed locally by the client. Use 'mode group' to enable broker-coordinated offset commits.\n");
                         }
                     }
 
                     case "commit" -> {
+                        if (!consumer.isGroupMode()) {
+                            System.out.println("❌ Commit offset is only supported in group mode (in single mode, offsets are managed locally on the client). Use 'mode group' to enable group mode.\n");
+                            continue;
+                        }
                         if (parts.length < 2) {
                             System.out.println("❌ Usage: commit <topic> [offset]\n");
                             continue;
@@ -244,7 +248,7 @@ public class ConsumerApp {
                         try {
                             consumer.commit(topic, offset);
                             System.out.printf("✓ Committed offset %d for topic '%s'\n\n", offset, topic);
-                        } catch (IOException e) {
+                        } catch (IOException | IllegalStateException e) {
                             System.out.printf("❌ Commit failed: %s\n\n", e.getMessage());
                         }
                     }

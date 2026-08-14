@@ -102,6 +102,15 @@ public class RaftLog {
                 mappedBuffer.get(data);
                 
                 RaftEntry entry = RaftEntry.parseFrom(data);
+                if (!entries.isEmpty()) {
+                    long prevIndex = entries.get(entries.size() - 1).getIndex();
+                    if (entry.getIndex() != prevIndex + 1) {
+                        logger.error("Raft log recovery detected non-sequential entry index {} following {} at pos {}. Truncating corrupted tail.",
+                                entry.getIndex(), prevIndex, entryStart);
+                        logicalFileSize = entryStart;
+                        break;
+                    }
+                }
                 entries.add(entry.toBuilder().clearPayload().build());
                 filePositions.add(entryStart);
                 count++;
@@ -126,6 +135,15 @@ public class RaftLog {
     }
 
     public synchronized void append(RaftEntry entry) throws IOException {
+        if (!entries.isEmpty()) {
+            long expected = getLastIndex() + 1;
+            if (entry.getIndex() != expected) {
+                throw new IllegalStateException(String.format(
+                    "Non-monotonic Raft append: expected index %d, got %d (lastIndex=%d)",
+                    expected, entry.getIndex(), getLastIndex()
+                ));
+            }
+        }
         byte[] data = entry.toByteArray();
         ensureCapacity(4 + data.length);
         
@@ -148,6 +166,24 @@ public class RaftLog {
 
     public synchronized void append(List<RaftEntry> batch) throws IOException {
         if (batch.isEmpty()) return;
+        
+        if (!entries.isEmpty()) {
+            long expected = getLastIndex() + 1;
+            if (batch.get(0).getIndex() != expected) {
+                throw new IllegalStateException(String.format(
+                    "Non-monotonic Raft batch append: expected starting index %d, got %d (lastIndex=%d)",
+                    expected, batch.get(0).getIndex(), getLastIndex()
+                ));
+            }
+        }
+        for (int i = 1; i < batch.size(); i++) {
+            if (batch.get(i).getIndex() != batch.get(i - 1).getIndex() + 1) {
+                throw new IllegalStateException(String.format(
+                    "Non-monotonic Raft batch: entry at %d has index %d, expected %d",
+                    i, batch.get(i).getIndex(), batch.get(i - 1).getIndex() + 1
+                ));
+            }
+        }
         
         int totalRequired = 0;
         List<byte[]> serializedBatch = new ArrayList<>(batch.size());

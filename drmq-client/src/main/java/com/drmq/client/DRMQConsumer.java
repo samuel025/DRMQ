@@ -424,7 +424,7 @@ public class DRMQConsumer implements AutoCloseable {
             if (!messages.isEmpty()) {
                 long nextOffset = messages.get(messages.size() - 1).offset() + 1;
                 topicOffsets.put(topic, nextOffset);
-                if (autoCommit) {
+                if (groupMode && autoCommit) {
                     commitOffsetToBroker(topic, nextOffset);
                 }
             }
@@ -436,8 +436,12 @@ public class DRMQConsumer implements AutoCloseable {
 
     /**
      * Manually commit a specific offset to the broker.
+     * Only supported in consumer group mode.
      */
     public void commit(String topic, long offset) throws IOException {
+        if (!groupMode) {
+            throw new IllegalStateException("Commit offset is only supported in consumer group mode (in single mode, offsets are managed locally by the client)");
+        }
         ensureConnectedWithRetry();
         topicOffsets.put(topic, offset);
         commitOffsetToBroker(topic, offset);
@@ -767,10 +771,6 @@ public class DRMQConsumer implements AutoCloseable {
         return MessageEnvelope.parseFrom(bytes);
     }
 
-    // -------------------------------------------------------------------------
-    // Lifecycle
-    // -------------------------------------------------------------------------
-
     @Override
     public void close() throws IOException {
         if (connected) {
@@ -785,9 +785,6 @@ public class DRMQConsumer implements AutoCloseable {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // ConsumedMessage record
-    // -------------------------------------------------------------------------
 
     public record ConsumedMessage(
             long offset,

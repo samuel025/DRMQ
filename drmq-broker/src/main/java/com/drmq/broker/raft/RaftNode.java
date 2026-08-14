@@ -1986,7 +1986,7 @@ public class RaftNode {
      */
     public CompletableFuture<Long> proposeOffsetCommitAsync(String consumerGroup, String topic, long offset) {
         lock.lock();
-        long index;
+        long index = -1;
         long proposalTerm;
         CompletableFuture<Long> future;
         try {
@@ -1997,9 +1997,10 @@ public class RaftNode {
             }
 
             proposalTerm = currentTerm;
-            index = raftLog.getLastIndex() + 1;
+            index = uncommittedNextIndex++;
 
             if (pendingProposals.size() >= MAX_PENDING_PROPOSALS) {
+                uncommittedNextIndex--;
                 CompletableFuture<Long> err = new CompletableFuture<>();
                 err.completeExceptionally(new IOException("Too many pending proposals (" + pendingProposals.size()
                         + "/" + MAX_PENDING_PROPOSALS + ")"));
@@ -2015,20 +2016,37 @@ public class RaftNode {
                     .setOffsetValue(offset)
                     .build();
 
-            raftLog.append(entry);
-
             future = new CompletableFuture<>();
             pendingProposals.put(index, new ProposalState(proposalTerm, future));
 
-        } catch (Exception e) {
+            long finalProposalTerm = proposalTerm;
+            logAppenderQueue.put(() -> {
+                try {
+                    raftLog.append(entry);
+                    sendHeartbeats();
+                } catch (IOException e) {
+                    logger.error("[{}] Failed to append offset commit to RaftLog", nodeId, e);
+                    stepDown(finalProposalTerm);
+                }
+            });
+
+        } catch (Throwable t) {
+            if (index != -1) {
+                pendingProposals.remove(index);
+                if (uncommittedNextIndex == index + 1) {
+                    uncommittedNextIndex = index;
+                }
+            }
+            if (t instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
             CompletableFuture<Long> err = new CompletableFuture<>();
-            err.completeExceptionally(e);
+            err.completeExceptionally(t);
             return err;
         } finally {
             lock.unlock();
         }
 
-        sendHeartbeats();
         final long finalIndex = index;
         return future.orTimeout(PROPOSAL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
                 .exceptionally(e -> {
@@ -2464,6 +2482,7 @@ public class RaftNode {
             votedFor = null;
             lastApplied = 0;
             commitIndex = Math.min(raftLog.getLastIndex(), Math.max(commitIndex, lastApplied));
+            uncommittedNextIndex = raftLog.getLastIndex() + 1;
             return;
         }
 
@@ -2500,8 +2519,9 @@ public class RaftNode {
                 }
             }
             
-            logger.info("[{}] Loaded persistent state: term={}, votedFor={}, lastApplied={}",
-                    nodeId, currentTerm, votedFor, lastApplied);
+            uncommittedNextIndex = raftLog.getLastIndex() + 1;
+            logger.info("[{}] Loaded persistent state: term={}, votedFor={}, lastApplied={}, uncommittedNextIndex={}",
+                    nodeId, currentTerm, votedFor, lastApplied, uncommittedNextIndex);
         } catch (IOException | NumberFormatException e) {
             throw new IOException("Failed to load persistent state", e);
         }
