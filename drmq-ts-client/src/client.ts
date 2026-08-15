@@ -85,12 +85,12 @@ export class DRMQClient {
             reject(new Error("Connection timeout"));
           });
         });
-        return; // Connected successfully
+        return; 
       } catch (err) {
         lastError = err as Error;
         this.closeConnection();
         this.rotateServer();
-        await new Promise(res => setTimeout(res, 500)); // sleep
+        await new Promise(res => setTimeout(res, 500));
       }
     }
     throw new DRMQConnectionError(`Failed to connect after ${totalAttempts} attempts. Last error: ${lastError?.message}`);
@@ -180,7 +180,6 @@ export class DRMQClient {
     const envelope = MessageEnvelope.create({
       type: msgType,
       payload: Buffer.from(payload),
-      // protobufjs accepts Long, string, or number for int64. We pass string.
       correlationId: correlationIdStr as any
     });
     const envelopeBytes = MessageEnvelope.encode(envelope).finish();

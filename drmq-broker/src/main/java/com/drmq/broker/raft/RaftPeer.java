@@ -42,8 +42,9 @@ public class RaftPeer {
         socket = new Socket();
         socket.connect(new java.net.InetSocketAddress(address.host(), address.port()), CONNECT_TIMEOUT_MS);
         socket.setSoTimeout(READ_TIMEOUT_MS);
-        in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
-        out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+        socket.setTcpNoDelay(true);
+        in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 65536));
+        out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 65536));
     }
 
     /**
@@ -133,8 +134,18 @@ public class RaftPeer {
                         .setPayload(request.toByteString())
                         .build();
 
+                long envStart = System.nanoTime();
                 sendEnvelope(envelope);
+                long sendTimeMs = (System.nanoTime() - envStart) / 1000000;
+                
+                long recvStart = System.nanoTime();
                 MessageEnvelope response = receiveEnvelope();
+                long recvTimeMs = (System.nanoTime() - recvStart) / 1000000;
+                
+                if (sendTimeMs > 10 || recvTimeMs > 10) {
+                    logger.debug("RaftPeer to {} timing: send={}ms, recv={}ms", address, sendTimeMs, recvTimeMs);
+                }
+                
                 requireResponseType(response, MessageType.APPEND_ENTRIES_RESPONSE, "AppendEntries");
                 AppendEntriesResponse parsed = AppendEntriesResponse.parseFrom(response.getPayload());
                 BrokerMetrics.get().recordRaftRpc("append_entries", true,

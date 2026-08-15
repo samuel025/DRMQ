@@ -57,13 +57,13 @@ public class EndToEndLatencyBenchmarkTest {
 
         BrokerConfig c1 = new BrokerConfig("b1", PORT_1, trialDir.resolve("data-1").toString(),
                 List.of(new PeerAddress("b2", "localhost", PORT_2), new PeerAddress("b3", "localhost", PORT_3)),
-                true, 9110, "/metrics", 100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.", false, true, null, null, null);
+                true, 9110, "/metrics", 100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.", true, true, null, null, null);
         BrokerConfig c2 = new BrokerConfig("b2", PORT_2, trialDir.resolve("data-2").toString(),
                 List.of(new PeerAddress("b1", "localhost", PORT_1), new PeerAddress("b3", "localhost", PORT_3)),
-                true, 9111, "/metrics", 100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.", false, true, null, null, null);
+                true, 9111, "/metrics", 100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.", true, true, null, null, null);
         BrokerConfig c3 = new BrokerConfig("b3", PORT_3, trialDir.resolve("data-3").toString(),
                 List.of(new PeerAddress("b1", "localhost", PORT_1), new PeerAddress("b2", "localhost", PORT_2)),
-                true, 9112, "/metrics", 100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.", false, true, null, null, null);
+                true, 9112, "/metrics", 100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.", true, true, null, null, null);
 
         BrokerServer b1 = new BrokerServer(c1);
         BrokerServer b2 = new BrokerServer(c2);
@@ -78,15 +78,50 @@ public class EndToEndLatencyBenchmarkTest {
         String topic = "e2e-topic-" + batchSize;
         String bootstrap = "localhost:" + PORT_1 + ",localhost:" + PORT_2 + ",localhost:" + PORT_3;
 
-        List<Double> latencies = new ArrayList<>();
+        List<Double> latencies = Collections.synchronizedList(new ArrayList<>());
         byte[] payload = new byte[512];
 
         try (DRMQProducer producer = new DRMQProducer(bootstrap);
-             DRMQConsumer consumer = new DRMQConsumer("localhost", PORT_1, "e2e-group")) {
+             DRMQConsumer consumer = new DRMQConsumer(bootstrap, "e2e-group-" + batchSize)) {
             
             producer.connect();
             consumer.connect();
             consumer.subscribe(topic);
+
+            // Warmup: 20 messages to prime sockets, JVM JIT, and Raft pipeline
+            for (int i = 0; i < 20; i++) {
+                producer.send(topic, payload).join();
+            }
+            long warmupDeadline = System.currentTimeMillis() + 3000;
+            int warmupReceived = 0;
+            while (warmupReceived < 20 && System.currentTimeMillis() < warmupDeadline) {
+                var msgs = consumer.poll(20, 200);
+                warmupReceived += msgs.size();
+            }
+
+            CountDownLatch allReceivedLatch = new CountDownLatch(messageCount);
+            java.util.concurrent.atomic.AtomicBoolean consumerRunning = new java.util.concurrent.atomic.AtomicBoolean(true);
+
+            // Start concurrent consumer thread to poll messages as they arrive
+            Thread consumerThread = new Thread(() -> {
+                try {
+                    while (consumerRunning.get() && latencies.size() < messageCount) {
+                        var msgs = consumer.poll(1000, 100);
+                        long rcvTime = System.nanoTime();
+                        for (var m : msgs) {
+                            long sentTime = parseTimestamp(m.payload());
+                            if (sentTime > 0) {
+                                double elapsedMs = (rcvTime - sentTime) / 1_000_000.0;
+                                latencies.add(elapsedMs);
+                                allReceivedLatch.countDown();
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+            }, "consumer-thread-" + batchSize);
+            consumerThread.start();
+            Thread.sleep(50);
 
             // Send messages with embedded nanoTime timestamp
             List<CompletableFuture<?>> sendFutures = new ArrayList<>();
@@ -96,28 +131,22 @@ public class EndToEndLatencyBenchmarkTest {
                 sendFutures.add(producer.send(topic, msgPayload));
 
                 if ((i + 1) % batchSize == 0) {
+                    long beforeJoin = System.nanoTime();
                     CompletableFuture.allOf(sendFutures.toArray(new CompletableFuture[0])).join();
+                    long afterJoin = System.nanoTime();
+                    if (batchSize == 32 && i < 32 * 5) {
+                        System.out.println("DEBUG JOIN for batch " + (i/batchSize) + ": " + ((afterJoin - beforeJoin) / 1000000.0) + " ms");
+                    }
                     sendFutures.clear();
-                    Thread.sleep(2);
                 }
             }
             if (!sendFutures.isEmpty()) {
                 CompletableFuture.allOf(sendFutures.toArray(new CompletableFuture[0])).join();
             }
 
-            // Poll messages and compute latency
-            long deadline = System.currentTimeMillis() + 10000;
-            while (latencies.size() < messageCount && System.currentTimeMillis() < deadline) {
-                var msgs = consumer.poll(messageCount - latencies.size(), 500);
-                long rcvTime = System.nanoTime();
-                for (var m : msgs) {
-                    long sentTime = parseTimestamp(m.payload());
-                    if (sentTime > 0) {
-                        double elapsedMs = (rcvTime - sentTime) / 1_000_000.0;
-                        latencies.add(elapsedMs);
-                    }
-                }
-            }
+            allReceivedLatch.await(15, TimeUnit.SECONDS);
+            consumerRunning.set(false);
+            consumerThread.join(2000);
         } finally {
             b1.shutdown();
             b2.shutdown();
@@ -128,6 +157,9 @@ public class EndToEndLatencyBenchmarkTest {
         double p50 = getPercentile(latencies, 50);
         double p95 = getPercentile(latencies, 95);
         double p99 = getPercentile(latencies, 99);
+        if (batchSize == 32) {
+            System.out.println("DEBUG LATENCIES FOR 32: " + latencies);
+        }
         return new LatencyResult(p50, p95, p99);
     }
 
@@ -158,7 +190,10 @@ public class EndToEndLatencyBenchmarkTest {
             if (b1 != null && b1.getRaftNode() != null && b1.getRaftNode().isLeader()) leaderCount++;
             if (b2 != null && b2.getRaftNode() != null && b2.getRaftNode().isLeader()) leaderCount++;
             if (b3 != null && b3.getRaftNode() != null && b3.getRaftNode().isLeader()) leaderCount++;
-            if (leaderCount == 1) return true;
+            if (leaderCount == 1) {
+                Thread.sleep(150);
+                return true;
+            }
             Thread.sleep(20);
         }
         return false;
