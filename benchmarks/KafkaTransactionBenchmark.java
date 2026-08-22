@@ -92,6 +92,21 @@ public class KafkaTransactionBenchmark {
 
         AtomicLong lastPrint  = new AtomicLong(System.currentTimeMillis());
         AtomicLong lastCount  = new AtomicLong(0);
+        // ── Warm-up Phase (100 unmeasured transactions) ──────────────────────
+        System.out.println("⏳ Warming up cluster with 100 transactions (unmeasured)...");
+        try {
+            for (int w = 0; w < 100; w++) {
+                producers[0].beginTransaction();
+                for (int t = 0; t < numTopics; t++) {
+                    producers[0].send(new ProducerRecord<>("txn-topic-" + t, payloadA));
+                }
+                producers[0].commitTransaction();
+            }
+            System.out.println("✓  Warmup complete. Saturated and ready.\n");
+        } catch (Exception e) {
+            System.err.println("⚠️  Warmup note: " + e.getMessage());
+        }
+
         long startTime        = System.currentTimeMillis();
 
         // ── Reporter thread ───────────────────────────────────────────────────
