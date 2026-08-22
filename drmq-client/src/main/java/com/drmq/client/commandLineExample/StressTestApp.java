@@ -96,32 +96,6 @@ public class StressTestApp {
         AtomicLong errors         = new AtomicLong(0);
         CountDownLatch doneLatch  = bounded ? new CountDownLatch(1) : null;
 
-        // ── Build producers ───────────────────────────────────────────────────
-        ExecutorService executor = Executors.newFixedThreadPool(concurrency);
-        long startTime = System.currentTimeMillis();
-
-        System.out.println("🚀 Starting load test..." + (bounded ? "" : " Press Ctrl+C to stop."));
-
-        // ── Periodic reporter thread ──────────────────────────────────────────
-        Thread reporter = new Thread(() -> {
-            try {
-                long lastSent = 0;
-                while (!Thread.currentThread().isInterrupted()) {
-                    Thread.sleep(1000);
-                    long currentSent   = messagesSent.get();
-                    long currentErrors = errors.get();
-                    long elapsedSec    = (System.currentTimeMillis() - startTime) / 1000;
-                    System.out.printf("[%3ds] %,7d msgs/sec | Total: %,d | Errors: %d%n",
-                            elapsedSec, (currentSent - lastSent), currentSent, currentErrors);
-                    lastSent = currentSent;
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }, "stress-reporter");
-        reporter.setDaemon(true);
-        reporter.start();
-
         // ── Build producer(s) ────────────────────────────────────────────────
         // Two modes:
         //   "shared"   — single DRMQProducer, all threads call send() on it.
@@ -155,6 +129,43 @@ public class StressTestApp {
                 System.exit(1);
             }
         }
+
+        // ── Warm-up Phase (100 unmeasured messages) ───────────────────────────
+        System.out.println("⏳ Warming up cluster with 100 messages (unmeasured)...");
+        try {
+            for (int w = 0; w < 100; w++) {
+                producers[0].send(topic, payloadBytes).get(10, TimeUnit.SECONDS);
+            }
+            System.out.println("✓  Warmup complete. Saturated and ready.\n");
+        } catch (Exception e) {
+            System.err.println("⚠️  Warmup note: " + e.getMessage());
+        }
+
+        // ── Build producers & executor ────────────────────────────────────────
+        ExecutorService executor = Executors.newFixedThreadPool(concurrency);
+        long startTime = System.currentTimeMillis();
+
+        System.out.println("🚀 Starting load test..." + (bounded ? "" : " Press Ctrl+C to stop."));
+
+        // ── Periodic reporter thread ──────────────────────────────────────────
+        Thread reporter = new Thread(() -> {
+            try {
+                long lastSent = 0;
+                while (!Thread.currentThread().isInterrupted()) {
+                    Thread.sleep(1000);
+                    long currentSent   = messagesSent.get();
+                    long currentErrors = errors.get();
+                    long elapsedSec    = (System.currentTimeMillis() - startTime) / 1000;
+                    System.out.printf("[%3ds] %,7d msgs/sec | Total: %,d | Errors: %d%n",
+                            elapsedSec, (currentSent - lastSent), currentSent, currentErrors);
+                    lastSent = currentSent;
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "stress-reporter");
+        reporter.setDaemon(true);
+        reporter.start();
 
         // ── Per-thread backpressure semaphore ─────────────────────────────────
         // Prevents accumulator overflow when threads call send() faster than the

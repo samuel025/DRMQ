@@ -338,3 +338,9 @@ The broker exposes Prometheus metrics and real-time WebSocket telemetry. When in
 - `drmq_messages_consumed_total`
 - `drmq_raft_state` (Leader/Follower/Candidate)
 - `drmq_log_size_bytes`
+
+## Benchmarks Reproducibility
+
+DRMQ was designed to aggressively optimize atomic multi-topic transactions by bypassing the traditional Two-Phase Commit (2PC) coordinator. 
+
+To view the raw performance data, load-testing methodology, and instructions on how to perfectly replicate the comparative experiments (DRMQ vs. Apache Kafka), please see the exact [Figures Reproducibility Guide](benchmarks/THESIS_REPRODUCIBILITY.md).

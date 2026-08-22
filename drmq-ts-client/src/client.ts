@@ -85,12 +85,12 @@ export class DRMQClient {
             reject(new Error("Connection timeout"));
           });
         });
-        return; // Connected successfully
+        return; 
       } catch (err) {
         lastError = err as Error;
         this.closeConnection();
         this.rotateServer();
-        await new Promise(res => setTimeout(res, 500)); // sleep
+        await new Promise(res => setTimeout(res, 500));
       }
     }
     throw new DRMQConnectionError(`Failed to connect after ${totalAttempts} attempts. Last error: ${lastError?.message}`);
@@ -180,7 +180,6 @@ export class DRMQClient {
     const envelope = MessageEnvelope.create({
       type: msgType,
       payload: Buffer.from(payload),
-      // protobufjs accepts Long, string, or number for int64. We pass string.
       correlationId: correlationIdStr as any
     });
     const envelopeBytes = MessageEnvelope.encode(envelope).finish();
@@ -524,7 +523,7 @@ export class DRMQConsumer extends DRMQClient {
               const nextOffset = resp.messages[resp.messages.length - 1].offset + 1;
               this.localOffsets[topic] = nextOffset;
               
-              if (this.autoCommit) {
+              if (this.autoCommit && this.groupMode) {
                 await this.commit(topic, nextOffset);
               }
             }
@@ -570,6 +569,9 @@ export class DRMQConsumer extends DRMQClient {
   }
 
   public async commit(topic: string, nextOffset: number): Promise<void> {
+    if (!this.groupMode) {
+      throw new Error("Commit offset is only supported in consumer group mode (in single mode, offsets are managed locally by the client)");
+    }
     for (let attempt = 0; attempt < this.maxRetries; attempt++) {
       try {
         await this.ensureConnected();

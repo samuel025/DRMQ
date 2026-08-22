@@ -161,8 +161,9 @@ public class DRMQConsumer implements AutoCloseable {
         }
 
         socket = new Socket(host, port);
-        inputStream = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
-        outputStream = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+        socket.setTcpNoDelay(true);
+        inputStream = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 65536));
+        outputStream = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 65536));
         connected = true;
 
         logger.info("Connected to DRMQ broker at {}:{} as group '{}'", host, port, consumerGroup);

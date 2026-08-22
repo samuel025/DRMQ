@@ -9,7 +9,6 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-import java.io.IOException;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
@@ -33,7 +32,6 @@ public class AtomicBatchIntegrationTest {
         BrokerConfig config = new BrokerConfig(9092, dataDir);
         broker = new BrokerServer(config);
         
-        // Start broker in a separate thread so it doesn't block the test
         Thread brokerThread = new Thread(() -> {
             try {
                 broker.start();
@@ -43,7 +41,6 @@ public class AtomicBatchIntegrationTest {
         });
         brokerThread.start();
         
-        // Wait for broker to start up and become leader (since it's a standalone node)
         Thread.sleep(2000); 
     }
 

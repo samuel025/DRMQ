@@ -31,7 +31,7 @@ import java.util.concurrent.atomic.AtomicLong;
  *                    (each producer serial, like Kafka's begin→send→commit)
  *
  * Usage:
- *   AtomicStressTestApp [bootstrapServers] [concurrency] [numTransactions] [inFlight] [mode]
+ *   AtomicStressTestApp [bootstrapServers] [concurrency] [numTransactions] [pendingTxnLimit] [mode]
  */
 public class AtomicStressTestApp {
 
@@ -44,25 +44,27 @@ public class AtomicStressTestApp {
         String bootstrapServers = args.length > 0 ? args[0] : "localhost:9092,localhost:9093,localhost:9094";
         int    concurrency;
         long   numTransactions;
-        int    inFlight;
+        int    pendingTxnLimit;
         String producerMode;
         try {
             concurrency      = args.length > 1 ? Integer.parseInt(args[1])  : 10;
             numTransactions  = args.length > 2 ? Long.parseLong(args[2])    : 0L;
-            inFlight         = args.length > 3 ? Integer.parseInt(args[3])  : 5000;
+            pendingTxnLimit  = args.length > 3 ? Integer.parseInt(args[3])  : 5000;
             producerMode     = args.length > 4 ? args[4]                    : "shared";
-            if (concurrency < 1 || numTransactions < 0 || inFlight < 1) throw new NumberFormatException("must be positive");
+            if (concurrency < 1 || numTransactions < 0 || pendingTxnLimit < 1) throw new NumberFormatException("must be positive");
             if (!producerMode.equals("shared") && !producerMode.equals("separate")) {
                 throw new NumberFormatException("mode must be 'shared' or 'separate'");
             }
         } catch (NumberFormatException e) {
-            System.err.println("Usage: AtomicStressTestApp [bootstrapServers] [concurrency] [numTransactions] [inFlight] [mode] [numTopics]");
+            System.err.println("Usage: AtomicStressTestApp [bootstrapServers] [concurrency] [numTransactions] [pendingTxnLimit] [mode] [numTopics]");
             System.err.println("  mode: 'shared' (default, one producer) or 'separate' (one producer per thread, mirrors Kafka)");
             System.exit(1);
             return;
         }
 
         int numTopics = args.length > 5 ? Integer.parseInt(args[5]) : 2;
+        int batchSizeBytes = args.length > 6 ? Integer.parseInt(args[6]) : 16384;
+        long lingerMs = args.length > 7 ? Long.parseLong(args[7]) : 5L;
 
         boolean bounded = numTransactions > 0;
         boolean separateProducers = producerMode.equals("separate");
@@ -74,9 +76,11 @@ public class AtomicStressTestApp {
         System.out.println("  Producer mode  : " + (separateProducers ? "separate (one per thread, Kafka-comparable)" : "shared (single producer)"));
         System.out.println("  Topics         : " + numTopics + " topics per transaction");
         System.out.println("  Payload/topic  : 1 KB  (" + numTopics + " KB total per transaction)");
+        System.out.println("  Batch Size     : " + batchSizeBytes + " bytes");
+        System.out.println("  Linger         : " + lingerMs + " ms");
         System.out.println("  ACKs           : all (Raft quorum)");
-        System.out.printf ("  In-flight      : %d (%s)%n", inFlight,
-                inFlight > 1 ? "batching ON — multiple txns per Raft proposal" : "serial — 1 txn per Raft proposal");
+        System.out.printf ("  Pending Txns Limit : %d (%s)%n", pendingTxnLimit,
+                pendingTxnLimit > 1 ? "batching ON — multiple txns per Raft proposal" : "serial — 1 txn per Raft proposal");
         if (bounded) {
             System.out.printf("  Transactions   : %,d%n%n", numTransactions);
         } else {
@@ -107,6 +111,8 @@ public class AtomicStressTestApp {
             producers = new DRMQProducer[concurrency];
             for (int i = 0; i < concurrency; i++) {
                 producers[i] = new DRMQProducer(bootstrapServers);
+                producers[i].setBatchSizeBytes(batchSizeBytes);
+                producers[i].setLingerMs(lingerMs);
                 try {
                     producers[i].connect();
                 } catch (java.io.IOException e) {
@@ -117,6 +123,8 @@ public class AtomicStressTestApp {
         } else {
             producers = new DRMQProducer[1];
             producers[0] = new DRMQProducer(bootstrapServers);
+            producers[0].setBatchSizeBytes(batchSizeBytes);
+            producers[0].setLingerMs(lingerMs);
             try {
                 producers[0].connect();
             } catch (java.io.IOException e) {
@@ -130,12 +138,27 @@ public class AtomicStressTestApp {
         //   atomicAccumulator before the atomicSenderLoop batches them.
         // In separate mode: each producer has its own accumulator; each thread
         //   gets its own semaphore so they don't serialize each other.
-        final Semaphore[] threadInFlight = separateProducers
+        final Semaphore[] threadPendingTxns = separateProducers
                 ? java.util.stream.IntStream.range(0, concurrency)
-                        .mapToObj(i -> new Semaphore(inFlight))
+                        .mapToObj(i -> new Semaphore(pendingTxnLimit))
                         .toArray(Semaphore[]::new)
                 : null;
-        Semaphore inFlightSem = separateProducers ? null : new Semaphore(inFlight);
+        Semaphore globalPendingTxns = separateProducers ? null : new Semaphore(pendingTxnLimit);
+
+        // ── Warm-up Phase (500 unmeasured transactions to reach JIT steady state) ──
+        System.out.println("⏳ Warming up cluster with 500 transactions (unmeasured, reaching steady state)...");
+        try {
+            for (int w = 0; w < 500; w++) {
+                Map<String, byte[]> warmupBatch = new HashMap<>();
+                for (int t = 0; t < numTopics; t++) {
+                    warmupBatch.put("Topic-" + t, payloadA);
+                }
+                producers[0].sendAtomic(warmupBatch).get(10, TimeUnit.SECONDS);
+            }
+            System.out.println("✓  Warmup complete. Cluster saturated & JIT steady state reached.\n");
+        } catch (Exception e) {
+            System.err.println("⚠️  Warmup note: " + e.getMessage());
+        }
 
         // ── Reporter ──────────────────────────────────────────────────────────
         long startTime = System.currentTimeMillis();
@@ -169,7 +192,7 @@ public class AtomicStressTestApp {
         ExecutorService executor = Executors.newFixedThreadPool(concurrency);
         for (int i = 0; i < concurrency; i++) {
             final int tid = i;
-            final Semaphore mySem = separateProducers ? threadInFlight[tid] : inFlightSem;
+            final Semaphore mySem = separateProducers ? threadPendingTxns[tid] : globalPendingTxns;
             final DRMQProducer prod = separateProducers ? producers[i] : producers[0];
             executor.submit(() -> {
                 try {

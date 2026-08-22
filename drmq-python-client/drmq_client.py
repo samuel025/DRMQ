@@ -9,7 +9,6 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Import the generated Protobuf classes
 import messages_pb2 as pb
 
 class DRMQConnectionError(Exception):
@@ -95,25 +94,20 @@ class DRMQClient:
         with self.sock_lock:
             self._ensure_connected()
     
-            # 1. Create the MessageEnvelope
             envelope = pb.MessageEnvelope()
             envelope.type = msg_type
             envelope.payload = payload_bytes
             envelope_bytes = envelope.SerializeToString()
     
-            # 2. Add the 4-byte Big-Endian length prefix
             length_prefix = struct.pack('>I', len(envelope_bytes))
             
-            # Send Length + Data
             self.sock.sendall(length_prefix + envelope_bytes)
     
-            # 3. Read the response length prefix (4 bytes)
             resp_len_bytes = self._recv_exactly(4)
             if not resp_len_bytes:
                 raise ConnectionError("Broker closed connection")
             resp_len = struct.unpack('>I', resp_len_bytes)[0]
     
-            # 4. Read the response envelope
             resp_envelope_bytes = self._recv_exactly(resp_len)
             resp_envelope = pb.MessageEnvelope()
             resp_envelope.ParseFromString(resp_envelope_bytes)
@@ -228,8 +222,6 @@ class DRMQProducer(DRMQClient):
                 
             try:
                 self._ensure_connected()
-                # At-least-once semantics: If the network drops after the server processes the batch,
-                # this retry may result in duplicate messages being appended.
                 resp_payload = self._send_envelope(pb.MessageType.PRODUCE_BATCH_REQUEST, envelope_bytes)
                 
                 resp = pb.ProduceBatchResponse()
@@ -459,7 +451,7 @@ class DRMQConsumer(DRMQClient):
                         if resp.messages:
                             next_offset = resp.messages[-1].offset + 1
                             self.local_offsets[topic] = next_offset
-                            if self.auto_commit:
+                            if self.auto_commit and self.group_mode:
                                 self.commit(topic, next_offset)
                     elif self._try_redirect_to_leader(resp.error_message):
                         # Break and retry the entire poll loop on the new leader
@@ -497,6 +489,8 @@ class DRMQConsumer(DRMQClient):
 
     def commit(self, topic: str, offset: int):
         """Commit an offset back to the broker."""
+        if not self.group_mode:
+            raise RuntimeError("Commit offset is only supported in consumer group mode (in single mode, offsets are managed locally by the client)")
         for _ in range(self.max_retries):
             try:
                 self._ensure_connected()

@@ -22,7 +22,7 @@ public class DRMQProducer implements AutoCloseable {
     private static final int MAX_RETRIES = 5;
     private static final long RECONNECT_DELAY_MS = 500;
     private static final long INFLIGHT_TIMEOUT_MS = 120_000;
-    private int batchSizeBytes = 1048576; // 1MB default
+    private int batchSizeBytes = 16384; // 16 KB default
     private long lingerMs = 5;
     private int maxInflight = 5;
 
@@ -153,8 +153,9 @@ public class DRMQProducer implements AutoCloseable {
         }
 
         socket = new Socket(host, port);
-        in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
-        out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+        socket.setTcpNoDelay(true);
+        in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 65536));
+        out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 65536));
         connected = true;
 
         logger.info("Connected to broker at {}:{}", host, port);
@@ -748,8 +749,9 @@ public class DRMQProducer implements AutoCloseable {
             } else {
                 ErrorCode errorCode = response.getErrorCode();
                 String errorMsg = response.getErrorMessage();
-                
-                boolean isNotLeader = errorCode == ErrorCode.NOT_LEADER || (errorMsg != null && errorMsg.contains("NOT_LEADER"));
+                boolean isNotLeader = errorCode == ErrorCode.NOT_LEADER || (errorMsg != null && (
+                        errorMsg.contains("NOT_LEADER")));
+                       
                 if (isNotLeader && running) {
                     // Parse leader address from error message (format: "NOT_LEADER:host:port")
                     String leaderAddr = extractLeaderAddress(errorMsg);
@@ -807,8 +809,8 @@ public class DRMQProducer implements AutoCloseable {
             } else {
                 ErrorCode errorCode = response.getErrorCode();
                 String errorMsg = response.getErrorMessage();
-                
-                boolean isNotLeader = errorCode == ErrorCode.NOT_LEADER || (errorMsg != null && errorMsg.contains("NOT_LEADER"));
+                boolean isNotLeader = errorCode == ErrorCode.NOT_LEADER || (errorMsg != null && (
+                        errorMsg.contains("NOT_LEADER")));
                 if (isNotLeader && running) {
                     // Parse leader address from error message (format: "NOT_LEADER:host:port")
                     String leaderAddr = extractLeaderAddress(errorMsg);

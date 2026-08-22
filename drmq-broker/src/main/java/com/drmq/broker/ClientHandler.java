@@ -68,7 +68,6 @@ public class ClientHandler extends SimpleChannelInboundHandler<io.netty.buffer.B
             long correlationId = envelope.getCorrelationId();
             
             handleMessage(envelope).thenAccept(response -> {
-                // Echo the correlation_id so the client can match pipelined responses
                 MessageEnvelope tagged = correlationId != 0
                         ? response.toBuilder().setCorrelationId(correlationId).build()
                         : response;

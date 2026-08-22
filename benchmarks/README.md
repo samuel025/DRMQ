@@ -44,7 +44,7 @@ Evaluates DRMQ's unique multi-topic atomic transaction performance.
 - `-c <concurrency>`: Number of threads issuing transactions (default: `10`).
 - `-n <numTransactions>`: Total atomic transactions to execute (default: `200000`).
 - `-t <topics>`: Number of topics to write to atomically per transaction (default: `2`).
-- `-i <inFlight>`: Maximum in-flight transactions in the accumulator (default: `5000` to maximize batching).
+- `-p <pendingTxnLimit>`: Maximum pending transactions in the accumulator (default: `5000` to maximize batching).
 - `-m <mode>`: Producer mode (`shared` or `separate`).
 - `-b <brokers>`: Bootstrap server addresses.
 
@@ -125,3 +125,9 @@ Spins up a 3-node RabbitMQ cluster (`.docker-compose.rabbitmq.yml`) and evaluate
 ```bash
 ./rabbitmq_benchmark.sh
 ```
+
+---
+
+## 4. Thesis Figures Reproducibility
+
+If you are a reviewer or researcher looking to reproduce the exact experimental figures (1-6) from the thesis, please see the dedicated [THESIS_REPRODUCIBILITY.md](THESIS_REPRODUCIBILITY.md) file for detailed, step-by-step instructions.
