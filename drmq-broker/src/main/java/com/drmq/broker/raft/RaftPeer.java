@@ -38,7 +38,7 @@ public class RaftPeer {
             return;
         }
 
-        close(); // Clean up any partial state
+        close();
         socket = new Socket();
         socket.connect(new java.net.InetSocketAddress(address.host(), address.port()), CONNECT_TIMEOUT_MS);
         socket.setSoTimeout(READ_TIMEOUT_MS);
@@ -174,7 +174,7 @@ public class RaftPeer {
             long startNanos = System.nanoTime();
             try {
                 ensureConnected();
-                socket.setSoTimeout(10000); // 10 seconds for offset resolution
+                socket.setSoTimeout(10000);
 
                 MessageEnvelope envelope = MessageEnvelope.newBuilder()
                         .setType(MessageType.REQUEST_TOPIC_OFFSETS_REQUEST)
@@ -209,8 +209,7 @@ public class RaftPeer {
             long startNanos = System.nanoTime();
             try {
                 ensureConnected();
-                socket.setSoTimeout(30000); // 30 seconds to allow for chunk flush (mappedBuffer.force())
-
+                socket.setSoTimeout(30000); 
                 MessageEnvelope envelope = MessageEnvelope.newBuilder()
                         .setType(MessageType.INCREMENTAL_SNAPSHOT_CHUNK)
                         .setPayload(request.toByteString())
@@ -244,8 +243,7 @@ public class RaftPeer {
             long startNanos = System.nanoTime();
             try {
                 ensureConnected();
-                socket.setSoTimeout(300000); // 5 minutes to allow for large MessageStore reload
-
+                socket.setSoTimeout(300000); 
                 MessageEnvelope envelope = MessageEnvelope.newBuilder()
                         .setType(MessageType.INCREMENTAL_SNAPSHOT_DONE_REQUEST)
                         .setPayload(request.toByteString())

@@ -5,7 +5,6 @@ services:
     ports:
       - "9092:9092"
     environment:
-      # KRaft – no Zookeeper
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: "broker,controller"
       KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka1:9093,2@kafka2:9093,3@kafka3:9093"
@@ -14,19 +13,15 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT"
       KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
       KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
-      # Cluster ID (must be 22 base64 chars)
       CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
-      # Replication / ack settings – matches DRMQ
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
       KAFKA_MIN_INSYNC_REPLICAS: 2
-      # Producer settings – matches DRMQ stress test
       KAFKA_BATCH_SIZE: 65536
       KAFKA_LINGER_MS: 1
-      # Disk‑friendly log settings
       KAFKA_LOG_DIRS: "/tmp/kafka-logs"
-      KAFKA_LOG_RETENTION_MS: 3600000     # 1 hour
-      KAFKA_LOG_SEGMENT_BYTES: 67108864   # 64 MiB
+      KAFKA_LOG_RETENTION_MS: 3600000     
+      KAFKA_LOG_SEGMENT_BYTES: 67108864  
       KAFKA_LOG_CLEANUP_POLICY: "delete"
 
   kafka2:

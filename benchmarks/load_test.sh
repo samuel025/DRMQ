@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "🚀 Starting DRMQ High-Throughput Load Test..."
+echo "Starting DRMQ High-Throughput Load Test..."
 echo "Press Ctrl+C to stop the load test."
 echo ""
 

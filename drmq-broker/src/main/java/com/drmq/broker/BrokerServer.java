@@ -106,13 +106,9 @@ public class BrokerServer {
                 raftNode.registerIncrementalSnapshotChunkHandler(peer.id(), raftPeer::sendIncrementalSnapshotChunk);
                 raftNode.registerIncrementalSnapshotDoneHandler(peer.id(), raftPeer::sendIncrementalSnapshotDone);
                 raftNode.registerHeartbeatHandler(peer.id(), raftPeer::sendAppendEntries);
-
-                // Create a pool of connections for pipelined AppendEntries RPCs.
-                // Each connection has its own TCP socket, so parallel RPCs don't
-                // contend on a single socket mutex.
                 for (int i = 0; i < APPEND_POOL_SIZE; i++) {
                     RaftPeer appendPeer = new RaftPeer(peer);
-                    raftPeers.add(appendPeer); // track for shutdown cleanup
+                    raftPeers.add(appendPeer); 
                     raftNode.registerAppendHandler(peer.id(), appendPeer::sendAppendEntries);
                 }
             }

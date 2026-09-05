@@ -11,8 +11,13 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.file.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Stream;
 
 
 /**
@@ -39,21 +44,16 @@ public class SnapshotManager {
     public static void activateSnapshot(Path dataDir) throws IOException {
         Path tempSnapshotDir = dataDir.resolve(".snapshot-tmp");
         Path markerFile = dataDir.resolve(".snapshot-activate");
-
-        // If the marker exists, we must resume a crashed activation even if tempSnapshotDir is gone 
-        // (though if temp is gone, we might just be cleaning up .old files).
-        // If marker doesn't exist, and tempSnapshotDir doesn't exist, nothing to do.
         if (!Files.exists(markerFile) && !Files.exists(tempSnapshotDir)) {
             return;
         }
 
-        // Write marker if it doesn't exist to indicate we are committed to activating
         if (!Files.exists(markerFile)) {
             Files.writeString(markerFile, "active");
         }
 
         if (Files.exists(tempSnapshotDir)) {
-            try (java.util.stream.Stream<Path> tempDirs = Files.list(tempSnapshotDir)) {
+            try (Stream<Path> tempDirs = Files.list(tempSnapshotDir)) {
                 tempDirs.forEach(topicDir -> {
                     try {
                         String topicName = topicDir.getFileName().toString();
@@ -62,8 +62,7 @@ public class SnapshotManager {
                             Files.createDirectories(targetTopicDir);
                         }
 
-                        // Move individual segment files from .snapshot-tmp/topic into active topic dir
-                        try (java.util.stream.Stream<Path> chunkFiles = Files.list(topicDir)) {
+                        try (Stream<Path> chunkFiles = Files.list(topicDir)) {
                             chunkFiles.forEach(chunkFile -> {
                                 try {
                                     Path targetFile = targetTopicDir.resolve(chunkFile.getFileName().toString());
@@ -81,9 +80,7 @@ public class SnapshotManager {
             }
         }
 
-        // 3. Cleanup temp dir and marker
         if (Files.exists(tempSnapshotDir)) {
-            // Delete now empty topic subdirs
             try (java.util.stream.Stream<Path> tempDirs = Files.list(tempSnapshotDir)) {
                 tempDirs.forEach(d -> {
                     try { Files.delete(d); } catch (Exception ignored) {}
@@ -100,14 +97,14 @@ public class SnapshotManager {
     public static class SnapshotManifest {
         public final long snapshotIndex;
         public final long snapshotTerm;
-        public final java.util.Map<String, Long> offsetState;
-        public final java.util.Map<String, Long> fileManifest;
-        public final java.util.List<Path> allSegmentsToStream;
-        public final java.util.Map<Path, String> pathToTopic;
+        public final Map<String, Long> offsetState;
+        public final Map<String, Long> fileManifest;
+        public final List<Path> allSegmentsToStream;
+        public final Map<Path, String> pathToTopic;
 
-        public SnapshotManifest(long snapshotIndex, long snapshotTerm, java.util.Map<String, Long> offsetState,
-                                java.util.Map<String, Long> fileManifest, java.util.List<Path> allSegmentsToStream,
-                                java.util.Map<Path, String> pathToTopic) {
+        public SnapshotManifest(long snapshotIndex, long snapshotTerm, Map<String, Long> offsetState,
+                                Map<String, Long> fileManifest, List<Path> allSegmentsToStream,
+                                Map<Path, String> pathToTopic) {
             this.snapshotIndex = snapshotIndex;
             this.snapshotTerm = snapshotTerm;
             this.offsetState = offsetState;
@@ -118,16 +115,16 @@ public class SnapshotManager {
     }
 
     public SnapshotManifest freezeSnapshot(long snapshotIndex, long snapshotTerm, Map<String, Long> followerOffsets) {
-        Map<String, Long> offsetState = offsetManager != null ? offsetManager.getAllOffsets() : java.util.Collections.emptyMap();
-        Map<String, Long> fileManifest = new java.util.HashMap<>();
-        List<Path> allSegmentsToStream = new java.util.ArrayList<>();
-        Map<Path, String> pathToTopic = new java.util.HashMap<>();
+        Map<String, Long> offsetState = offsetManager != null ? offsetManager.getAllOffsets() : Collections.emptyMap();
+        Map<String, Long> fileManifest = new HashMap<>();
+        List<Path> allSegmentsToStream = new ArrayList<>();
+        Map<Path, String> pathToTopic = new HashMap<>();
 
         messageStore.lockForSnapshot(() -> {
             try {
                 for (String topic : messageStore.getTopics()) {
                     long followerOffset = followerOffsets.getOrDefault(topic, -1L);
-                    java.util.List<Path> segments = messageStore.getSegmentsForSync(topic, followerOffset);
+                    List<Path> segments = messageStore.getSegmentsForSync(topic, followerOffset);
                     for (Path segmentPath : segments) {
                         allSegmentsToStream.add(segmentPath);
                         pathToTopic.put(segmentPath, topic);
@@ -162,7 +159,6 @@ public class SnapshotManager {
                 streamFile(segmentPath, topic, manifest.snapshotTerm, nodeId, exactLength, chunkHandler);
             }
 
-            // After all topic files are streamed, send the Done request with the manifest
             com.drmq.protocol.IncrementalSnapshotDoneRequest doneReq = com.drmq.protocol.IncrementalSnapshotDoneRequest.newBuilder()
                     .setTerm(manifest.snapshotTerm)
                     .setLeaderId(nodeId)
@@ -185,15 +181,15 @@ public class SnapshotManager {
     }
 
     private void streamFile(Path filePath, String topic, long term, String leaderId, long exactLength,
-                            java.util.function.Function<com.drmq.protocol.IncrementalSnapshotChunk, com.drmq.protocol.IncrementalSnapshotChunkResponse> chunkHandler) throws IOException {
+                            Function<com.drmq.protocol.IncrementalSnapshotChunk, com.drmq.protocol.IncrementalSnapshotChunkResponse> chunkHandler) throws IOException {
         
         if (!Files.exists(filePath) || exactLength <= 0) return;
         
         String fileName = filePath.getFileName().toString();
         try (java.nio.channels.FileChannel channel = java.nio.channels.FileChannel.open(filePath, StandardOpenOption.READ)) {
-            long totalBytes = exactLength; // Limit streaming to the exact point-in-time boundary length
+            long totalBytes = exactLength; 
             long offset = 0;
-            long chunkSize = 2 * 1024 * 1024; // 2MB
+            long chunkSize = 2 * 1024 * 1024; 
 
             while (offset < totalBytes || totalBytes == 0) {
                 long remaining = totalBytes - offset;

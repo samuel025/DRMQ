@@ -7,7 +7,7 @@ set -e
 echo "Compiling all modules first..."
 (cd .. && mvn compile -q)
 
-CONCURRENCIES=(1 5 10 20 50)
+CONCURRENCIES=(1 5 10 20)
 RESULTS_CSV="figure2_scaling_results.csv"
 
 echo "concurrency,system,tps" > $RESULTS_CSV
@@ -30,19 +30,34 @@ sleep 15
 BOOTSTRAP="localhost:9093,localhost:9095,localhost:9097"
 
 for C in "${CONCURRENCIES[@]}"; do
-  echo "Running DRMQ with Concurrency=$C ..."
-  # Run test in background because maven exec:java sometimes hangs
-  > drmq_out_${C}.log
-  (cd ../drmq-client && mvn exec:java -Dexec.mainClass="com.drmq.client.commandLineExample.AtomicStressTestApp" -Dexec.args="$BOOTSTRAP $C 2000 $C separate 2" -q > ../benchmarks/drmq_out_${C}.log 2>&1) &
+  # DRMQ No-Batch (pendingTxnLimit = 1)
+  echo "Running DRMQ-NoBatch with Concurrency=$C ..."
+  > drmq_nobatch_out_${C}.log
+  (cd ../drmq-client && mvn exec:java -Dexec.mainClass="com.drmq.client.commandLineExample.AtomicStressTestApp" -Dexec.args="$BOOTSTRAP $C 2000 1 separate 2" -q > ../benchmarks/drmq_nobatch_out_${C}.log 2>&1) &
   DRMQ_PID=$!
   
-  # Wait until "transactions committed" appears in the log
-  while ! grep -q "transactions committed" drmq_out_${C}.log 2>/dev/null; do
+  while ! grep -q "transactions committed" drmq_nobatch_out_${C}.log 2>/dev/null; do
     sleep 2
   done
   
-  DRMQ_TPS=$(grep "transactions committed" drmq_out_${C}.log | sed -n 's/.*committed, \([0-9,.]*\) TPS.*/\1/p' | tr -d ',')
-  echo "$C,DRMQ,$DRMQ_TPS" >> $RESULTS_CSV
+  DRMQ_NOBATCH_TPS=$(grep "transactions committed" drmq_nobatch_out_${C}.log | sed -n 's/.*committed, \([0-9,.]*\) TPS.*/\1/p' | tr -d ',')
+  echo "$C,DRMQ-NoBatch,$DRMQ_NOBATCH_TPS" >> $RESULTS_CSV
+  
+  kill -9 $DRMQ_PID 2>/dev/null || true
+  pkill -f "com.drmq.client.commandLineExample.AtomicStressTestApp" || true
+
+  # DRMQ Batch (pendingTxnLimit = C)
+  echo "Running DRMQ-Batch with Concurrency=$C ..."
+  > drmq_batch_out_${C}.log
+  (cd ../drmq-client && mvn exec:java -Dexec.mainClass="com.drmq.client.commandLineExample.AtomicStressTestApp" -Dexec.args="$BOOTSTRAP $C 2000 $C separate 2" -q > ../benchmarks/drmq_batch_out_${C}.log 2>&1) &
+  DRMQ_PID=$!
+  
+  while ! grep -q "transactions committed" drmq_batch_out_${C}.log 2>/dev/null; do
+    sleep 2
+  done
+  
+  DRMQ_BATCH_TPS=$(grep "transactions committed" drmq_batch_out_${C}.log | sed -n 's/.*committed, \([0-9,.]*\) TPS.*/\1/p' | tr -d ',')
+  echo "$C,DRMQ-Batch,$DRMQ_BATCH_TPS" >> $RESULTS_CSV
   
   kill -9 $DRMQ_PID 2>/dev/null || true
   pkill -f "com.drmq.client.commandLineExample.AtomicStressTestApp" || true
@@ -71,7 +86,19 @@ sleep 15
 docker-compose exec kafka1 /opt/kafka/bin/kafka-topics.sh --create --topic txn-topic-0 --partitions 1 --replication-factor 3 --bootstrap-server localhost:9092 --if-not-exists
 docker-compose exec kafka1 /opt/kafka/bin/kafka-topics.sh --create --topic txn-topic-1 --partitions 1 --replication-factor 3 --bootstrap-server localhost:9092 --if-not-exists
 
-CP=".kafka-bench/classes:$(find ".kafka-bench/libs" -name "*.jar" | tr '\n' ':')"
+echo "Extracting Kafka client libs from image..."
+BENCH_DIR=".kafka-bench"
+rm -rf "${BENCH_DIR}"
+mkdir -p "${BENCH_DIR}/classes"
+CID=$(docker create apache/kafka:3.7.0)
+docker cp "${CID}:/opt/kafka/libs/." "${BENCH_DIR}/libs/"
+docker rm "${CID}" >/dev/null
+
+CP="$(find "${BENCH_DIR}/libs" -name "*.jar" | tr '\n' ':')"
+echo "Compiling Kafka benchmark..."
+javac -cp "${CP}" KafkaTransactionBenchmark.java -d "${BENCH_DIR}/classes"
+
+CP="${BENCH_DIR}/classes:${CP}"
 
 for C in "${CONCURRENCIES[@]}"; do
   echo "Running Kafka with Concurrency=$C ..."

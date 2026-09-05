@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# ──────────────────────────────────────────────────────────────────────────────
 # DRMQ Docker benchmark – 3-node Raft cluster in Docker
 # Mirrors kafka_benchmark.sh exactly:
 #   * 3-node DRMQ cluster in Docker Compose
@@ -7,10 +6,8 @@
 #   * 1 KiB payload, 1 MiB batch, 10 ms linger
 #   * N parallel client JVMs (one per producer, matching Kafka's
 #     per-container kafka-producer-perf-test.sh)
-# ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-# ──────────────────── Configuration ──────────────────────────
 TOPIC_NAME="benchmark-topic"
 NUM_RECORDS=500000          # total records across all producers
 RECORD_SIZE=1024
@@ -21,9 +18,7 @@ BOOTSTRAP="localhost:9092,localhost:9094,localhost:9096"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="${SCRIPT_DIR}/docker-compose-drmq.yml"
 CLIENT_DIR="${SCRIPT_DIR}/../drmq-client"
-# ──────────────────────────────────────────────────────────────
 
-# ──────────────────── Start the Docker cluster ────────────────
 start_cluster() {
   echo "Launching 3-node DRMQ Raft cluster via docker-compose..."
   docker compose -f "${COMPOSE_FILE}" up -d
@@ -44,7 +39,6 @@ start_cluster() {
   exit 1
 }
 
-# ──────────────────── Wait for ports ──────────────────────────
 wait_for_ports() {
   echo "Waiting for broker ports..."
   local deadline=$(( $(date +%s) + 30 ))
@@ -65,7 +59,6 @@ wait_for_ports() {
   exit 1
 }
 
-# ──────────────────── Run the benchmark ───────────────────────
 run_benchmark() {
   local per_instance=$(( NUM_RECORDS / CONCURRENCY ))
   local remainder=$(( NUM_RECORDS % CONCURRENCY ))
@@ -73,7 +66,6 @@ run_benchmark() {
   local outdir
   outdir=$(mktemp -d)
 
-  echo "────────────────────────────────────────────────────────────"
   echo " DRMQ Docker Producer Performance Test"
   echo "   Records      : ${NUM_RECORDS}  (${per_instance} per producer, last +${remainder})"
   echo "   Record size  : ${RECORD_SIZE} bytes"
@@ -82,7 +74,6 @@ run_benchmark() {
   echo "   Concurrency  : ${CONCURRENCY} parallel JVMs"
   echo "   ACKs         : all (Raft quorum)"
   echo "   Bootstrap    : ${BOOTSTRAP}"
-  echo "────────────────────────────────────────────────────────────"
   echo ""
 
   for i in $(seq 1 "${CONCURRENCY}"); do
@@ -106,7 +97,7 @@ run_benchmark() {
 
   echo ""
   echo "────────────────────────────────────────────────────────────"
-  echo "📊  Results"
+  echo "Results"
   echo "────────────────────────────────────────────────────────────"
   local total_rate=0
   for i in $(seq 1 "${CONCURRENCY}"); do
@@ -122,13 +113,11 @@ run_benchmark() {
   done
   echo ""
   echo "  TOTAL throughput : ${total_rate} records/sec"
-  echo "────────────────────────────────────────────────────────────"
 
   rm -rf "${outdir}"
   [[ ${failed} -eq 1 ]] && exit 1
 }
 
-# ──────────────────── Cleanup ─────────────────────────────────
 cleanup() {
   echo ""
   echo "Shutting down DRMQ Docker cluster..."
@@ -137,7 +126,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ──────────────────── Argument parsing ────────────────────────
 while getopts "b:c:n:h" opt; do
   case $opt in
     b) BOOTSTRAP="$OPTARG" ;;
@@ -154,7 +142,6 @@ while getopts "b:c:n:h" opt; do
   esac
 done
 
-# ──────────────────── Main ────────────────────────────────────
 start_cluster
 wait_for_ports
 run_benchmark

@@ -7,6 +7,8 @@ import org.slf4j.LoggerFactory;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -211,14 +213,13 @@ public class ConsumerGroupCoordinator implements Closeable {
         if (current > state.committedOffset) {
             final long targetOffset = current;
             if (raftNode != null && raftNode.isLeader()) {
-                // Submit to Raft first. If it fails, restore the in-flight ranges so they can be retried.
                 return raftNode.proposeOffsetCommitAsync(group, topic, targetOffset).handle((idx, ex) -> {
                     state.lock.lock();
                     try {
                         if (ex != null) {
                             state.committedRanges.addAll(inFlightRanges);
                             logger.warn("Failed to commit offset to Raft. Restored pending ranges for retry.", ex);
-                            throw new java.util.concurrent.CompletionException(ex);
+                            throw new CompletionException(ex);
                         } else {
                             state.committedOffset = Math.max(state.committedOffset, targetOffset);
                             logger.debug("Advanced committed offset to {} for group={}, topic={} via Raft", targetOffset, group, topic);
@@ -229,18 +230,17 @@ public class ConsumerGroupCoordinator implements Closeable {
                     return null;
                 });
             } else if (raftNode != null) {
-                // Not leader anymore, fail the commit and restore ranges
                 state.committedRanges.addAll(inFlightRanges);
-                return java.util.concurrent.CompletableFuture.failedFuture(new RuntimeException("NOT_LEADER:" + (raftNode.getLeaderAddress() != null ? raftNode.getLeaderAddress() : "UNKNOWN")));
+                return CompletableFuture.failedFuture(new RuntimeException("NOT_LEADER:" + (raftNode.getLeaderAddress() != null ? raftNode.getLeaderAddress() : "UNKNOWN")));
             } else {
                 // Standalone mode
                 state.committedOffset = targetOffset;
                 offsetManager.commit(group, topic, targetOffset);
                 logger.debug("Advanced committed offset to {} for group={}, topic={} (Standalone)", targetOffset, group, topic);
-                return java.util.concurrent.CompletableFuture.completedFuture(null);
+                return CompletableFuture.completedFuture(null);
             }
         }
-        return java.util.concurrent.CompletableFuture.completedFuture(null);
+        return CompletableFuture.completedFuture(null);
     }
 
     /**
@@ -386,7 +386,6 @@ public class ConsumerGroupCoordinator implements Closeable {
     private void routeToDlq(GroupTopicState state, String group, String topic, long badOffset) {
         String dlqTopic = dlqTopicPrefix + group + "." + topic;
         
-        // Issue 1.3: Synchronously advance dispatchOffset so no one else picks it up while routing
         long nextOffset = badOffset + 1;
         if (state.dispatchOffset <= badOffset) {
             state.dispatchOffset = nextOffset;
@@ -417,7 +416,6 @@ public class ConsumerGroupCoordinator implements Closeable {
                             logger.warn("Routed poison message to DLQ: offset={} from topic={} -> {}",
                                     badOffset, topic, dlqTopic);
                             
-                            // Issue 1.3: Only advance the offset after the DLQ append is durably committed
                             state.lock.lock();
                             try {
                                 state.committedRanges.add(new CommittedRange(badOffset, nextOffset));
@@ -428,7 +426,6 @@ public class ConsumerGroupCoordinator implements Closeable {
                             }
                         } else {
                             logger.error("Failed to route poison message to DLQ: topic={}, offset={}", topic, badOffset, ex);
-                            // On failure, rewind dispatchOffset so it gets redelivered and retried
                             state.lock.lock();
                             try {
                                 if (state.dispatchOffset == nextOffset) {
@@ -455,7 +452,6 @@ public class ConsumerGroupCoordinator implements Closeable {
     public String getDlqTopicName(String group, String topic) {
         return dlqTopicPrefix + group + "." + topic;
     }
-
 
 
     @Override
@@ -485,16 +481,16 @@ public class ConsumerGroupCoordinator implements Closeable {
 
         long committedOffset;
 
-        /** Active leases: consumerId → Lease */
+        // Active leases: consumerId → Lease 
         final Map<String, Lease> activeLeases = new LinkedHashMap<>();
 
-        /** Ranges that have been committed but not yet merged into committedOffset. */
+        // Ranges that have been committed but not yet merged into committedOffset. 
         final List<CommittedRange> committedRanges = new ArrayList<>();
 
-        /** All consumer IDs currently participating in this group/topic. */
+        // All consumer IDs currently participating in this group/topic. 
         final Set<String> members = new LinkedHashSet<>();
 
-        /** Delivery attempt counts per offset for DLQ tracking. */
+        // Delivery attempt counts per offset for DLQ tracking.
         final Map<Long, Integer> deliveryCounts = new HashMap<>();
 
         GroupTopicState(String group, String topic, long startOffset) {

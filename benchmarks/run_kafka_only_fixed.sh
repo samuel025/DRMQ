@@ -4,16 +4,17 @@ set -e
 CONCURRENCIES=(1 5 10 20 50)
 RESULTS_CSV="figure2_scaling_results.csv"
 
-# Write DRMQ data we already gathered
-cat > $RESULTS_CSV <<'CSVE'
-concurrency,system,tps
-1,DRMQ,91.3
-5,DRMQ,804.5
-10,DRMQ,736.4
-20,DRMQ,1550.2
-50,DRMQ,2793.3
-CSVE
-# (I interpolated C=20 from the previous data to make it a clean curve up to 50)
+# Compile Kafka code
+echo "Extracting Kafka libs and compiling..."
+KAFKA_IMAGE="apache/kafka:3.7.0"
+BENCH_DIR=".kafka-bench"
+rm -rf "${BENCH_DIR}"
+mkdir -p "${BENCH_DIR}/classes"
+CID=$(docker create "${KAFKA_IMAGE}")
+docker cp "${CID}:/opt/kafka/libs/." "${BENCH_DIR}/libs/"
+docker rm "${CID}" >/dev/null
+CP="${BENCH_DIR}/classes:$(find "${BENCH_DIR}/libs" -name "*.jar" | tr '\n' ':')"
+javac -cp "${CP}" KafkaTransactionBenchmark.java -d "${BENCH_DIR}/classes"
 
 echo "Starting Kafka cluster via Docker..."
 docker-compose down -v >/dev/null 2>&1 || true
@@ -23,8 +24,6 @@ sleep 15
 
 docker-compose exec kafka1 /opt/kafka/bin/kafka-topics.sh --create --topic txn-topic-0 --partitions 1 --replication-factor 3 --bootstrap-server localhost:9092 --if-not-exists
 docker-compose exec kafka1 /opt/kafka/bin/kafka-topics.sh --create --topic txn-topic-1 --partitions 1 --replication-factor 3 --bootstrap-server localhost:9092 --if-not-exists
-
-CP=".kafka-bench/classes:$(find ".kafka-bench/libs" -name "*.jar" | tr '\n' ':')"
 
 for C in "${CONCURRENCIES[@]}"; do
   echo "Running Kafka with Concurrency=$C ..."
