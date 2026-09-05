@@ -134,15 +134,12 @@ public class LogManager implements AutoCloseable {
                 com.drmq.protocol.StoredMessage firstMsg = segment.read(0);
                 if (firstMsg != null) {
                     if (firstMsg.getTimestamp() >= targetTimestamp) {
-                        // The current segment starts at or after the target timestamp.
-                        // The very first message >= targetTimestamp might be at the tail of the previous segment.
                         if (prevSegment != null) {
                             long offset = prevSegment.findOffsetByTimestamp(targetTimestamp);
                             if (offset != -1) {
                                 return offset;
                             }
                         }
-                        // If not found in the previous segment (or no previous segment exists), it must be here.
                         return segment.findOffsetByTimestamp(targetTimestamp);
                     }
                 }
@@ -152,8 +149,6 @@ public class LogManager implements AutoCloseable {
             }
             prevSegment = segment;
         }
-
-        // If all segments start strictly before the targetTimestamp, check the final segment.
         if (prevSegment != null) {
             return prevSegment.findOffsetByTimestamp(targetTimestamp);
         }
@@ -180,10 +175,7 @@ public class LogManager implements AutoCloseable {
         }
     }
 
-    /**
-     * Recovery: Scan the data directory and load existing segments.
-     * This populates the internal maps and returns them.
-     */
+
     public Map<String, List<Path>> discoverSegments() throws IOException {
         Map<String, List<Path>> discovered = new ConcurrentHashMap<>();
         if (!Files.exists(dataDir)) return discovered;
@@ -239,7 +231,6 @@ public class LogManager implements AutoCloseable {
             topicDirs.filter(Files::isDirectory).forEach(topicDir -> {
                 String topic = topicDir.getFileName().toString();
                 if (topic.equals("raft") || topic.equals("__consumer_offsets") || topic.endsWith(".old") || topic.equals(".snapshot-tmp") || topic.equals(".snapshot-activate")) return;
-                // Find the minimum base offset in the manifest for this topic to establish the snapshot boundary
                 long minManifestOffset = Long.MAX_VALUE;
                 for (String manifestKey : fileManifest.keySet()) {
                     if (manifestKey.startsWith(topic + "/")) {
@@ -268,8 +259,6 @@ public class LogManager implements AutoCloseable {
                         String manifestKey = topic + "/" + filename;
                         Long expectedSize = fileManifest.get(manifestKey);
                         if (expectedSize == null) {
-                            // Only delete if the segment is at or above the snapshot boundary.
-                            // If it's below the boundary, it was intentionally excluded by the leader's followerOffset filter.
                             if (localBaseOffset >= finalMinManifestOffset) {
                                 try {
                                     Files.delete(logPath);
@@ -301,8 +290,6 @@ public class LogManager implements AutoCloseable {
 
     public void close() throws IOException {
         IOException primaryException = null;
-        
-        // Attempt to close all segments, collecting exceptions
         for (ConcurrentSkipListMap<Long, LogSegment> segments : topicSegments.values()) {
             for (LogSegment segment : segments.values()) {
                 try {
@@ -319,8 +306,6 @@ public class LogManager implements AutoCloseable {
         }
         
         topicSegments.clear();
-        
-        // Rethrow primary exception if any close failed
         if (primaryException != null) {
             throw primaryException;
         }

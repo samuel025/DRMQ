@@ -11,12 +11,12 @@ import java.util.concurrent.atomic.*;
  * ─────────────────────────────────────────────────────────────────────────────
  * Mirrors DRMQ AtomicStressTestApp exactly:
  *   - 200,000 transactions
- *   - Each transaction writes atomically to 2 topics (topic-A + topic-B)
- *   - 1 KB payload per topic per transaction  →  2 KB total per transaction
- *   - Uses Kafka Transactions API: beginTransaction → send × 2 → commitTransaction
+ *   - Each transaction writes atomically to N topics (txn-topic-0, txn-topic-1, ...)
+ *   - 1 KB payload per topic per transaction  →  N KB total per transaction
+ *   - Uses Kafka Transactions API: beginTransaction → send × N → commitTransaction
  *   - Measures TPS and latency percentiles (p50 / p95 / p99 / p999 / max)
  *
- * Usage: java KafkaTransactionBenchmark <bootstrap> <numTransactions> <concurrency> [mode]
+ * Usage: java KafkaTransactionBenchmark <bootstrap> <numTransactions> <concurrency> [mode] [numTopics]
  *
  * NOTE: Kafka transactions are per-producer — each producer handles one
  * transaction at a time (serial: begin → send → commit → begin → ...).
@@ -30,19 +30,18 @@ import java.util.concurrent.atomic.*;
 public class KafkaTransactionBenchmark {
 
     // ── Configuration (matches AtomicStressTestApp / kafka_benchmark.sh) ──────
-    static final String TOPIC_A        = "txn-topic-a";
-    static final String TOPIC_B        = "txn-topic-b";
+    static final String TOPIC_PREFIX   = "txn-topic-";
     static final int    RECORD_SIZE    = 1024;          // 1 KB per topic per txn
     static final String ACKS           = "all";
     static final int    BATCH_SIZE     = 1048576;       // 1 MiB
     static final int    LINGER_MS      = 10;
 
     public static void main(String[] args) throws Exception {
-        String bootstrap      = args.length > 0 ? args[0] : "localhost:9092";
+        String bootstrap       = args.length > 0 ? args[0] : "localhost:9092";
         long   numTransactions = args.length > 1 ? Long.parseLong(args[1]) : 200_000;
-        int    concurrency    = args.length > 2 ? Integer.parseInt(args[2]) : 1;
-        String producerMode   = args.length > 3 ? args[3] : "separate";
-        int    numTopics      = args.length > 4 ? Integer.parseInt(args[4]) : 2;
+        int    concurrency     = args.length > 2 ? Integer.parseInt(args[2]) : 1;
+        String producerMode    = args.length > 3 ? args[3] : "separate";
+        int    numTopics       = args.length > 4 ? Integer.parseInt(args[4]) : 2;
         if (!producerMode.equals("separate")) {
             System.err.println("WARNING: Kafka transactions require per-producer serial execution.");
             System.err.println("  'separate' mode is always used (one producer per thread).");
@@ -55,7 +54,8 @@ public class KafkaTransactionBenchmark {
         System.out.println();
         System.out.println("Configuration:");
         System.out.printf("  Bootstrap      : %s%n", bootstrap);
-        System.out.printf("  Topics         : %d topics per transaction%n", numTopics);
+        System.out.printf("  Topics         : %d topics per transaction (%s0..%s%d)%n",
+                numTopics, TOPIC_PREFIX, TOPIC_PREFIX, numTopics - 1);
         System.out.printf("  Transactions   : %,d%n", numTransactions);
         System.out.printf("  Concurrency    : %d transactional producer(s)%n", concurrency);
         System.out.printf("  Producer mode  : separate (one per thread — Kafka txns require it)%n");
@@ -67,9 +67,7 @@ public class KafkaTransactionBenchmark {
         System.out.println();
 
         byte[] payloadA = new byte[RECORD_SIZE];
-        byte[] payloadB = new byte[RECORD_SIZE];
         Arrays.fill(payloadA, (byte) 'A');
-        Arrays.fill(payloadB, (byte) 'B');
 
         // ── Latency tracking ──────────────────────────────────────────────────
         long[] latencies   = new long[(int) numTransactions];
@@ -92,22 +90,25 @@ public class KafkaTransactionBenchmark {
 
         AtomicLong lastPrint  = new AtomicLong(System.currentTimeMillis());
         AtomicLong lastCount  = new AtomicLong(0);
-        // ── Warm-up Phase (100 unmeasured transactions) ──────────────────────
+        // ── Warm-up Phase (100 unmeasured transactions across producers) ──────
         System.out.println("⏳ Warming up cluster with 100 transactions (unmeasured)...");
         try {
-            for (int w = 0; w < 100; w++) {
-                producers[0].beginTransaction();
-                for (int t = 0; t < numTopics; t++) {
-                    producers[0].send(new ProducerRecord<>("txn-topic-" + t, payloadA));
+            int warmupPerProducer = Math.max(1, 100 / concurrency);
+            for (int i = 0; i < concurrency; i++) {
+                for (int w = 0; w < warmupPerProducer; w++) {
+                    producers[i].beginTransaction();
+                    for (int t = 0; t < numTopics; t++) {
+                        producers[i].send(new ProducerRecord<>(TOPIC_PREFIX + t, payloadA));
+                    }
+                    producers[i].commitTransaction();
                 }
-                producers[0].commitTransaction();
             }
             System.out.println("✓  Warmup complete. Saturated and ready.\n");
         } catch (Exception e) {
-            System.err.println("⚠️  Warmup note: " + e.getMessage());
+            System.err.println(" Warmup note: " + e.getMessage());
         }
 
-        long startTime        = System.currentTimeMillis();
+        long startTime = System.currentTimeMillis();
 
         // ── Reporter thread ───────────────────────────────────────────────────
         Thread reporter = new Thread(() -> {
@@ -128,8 +129,7 @@ public class KafkaTransactionBenchmark {
         }, "txn-reporter");
         reporter.setDaemon(true);
         reporter.start();
-
-        System.out.printf("🚀 Starting Kafka transaction benchmark...%n%n");
+        System.out.printf("Starting Kafka transaction benchmark...%n%n");
 
         // ── Worker threads ────────────────────────────────────────────────────
         for (int i = 0; i < concurrency; i++) {
@@ -144,21 +144,24 @@ public class KafkaTransactionBenchmark {
                         try {
                             prod.beginTransaction();
                             for (int t = 0; t < numTopics; t++) {
-                                prod.send(new ProducerRecord<>("txn-topic-" + t, payloadA));
+                                prod.send(new ProducerRecord<>(TOPIC_PREFIX + t, payloadA));
                             }
-                            prod.commitTransaction();   // blocks until broker acks both
+                            prod.commitTransaction();   // blocks until broker acks all
 
                             long lat = System.currentTimeMillis() - txStart;
                             latencies[(int) idx] = lat;
 
-                            long done = txDone.incrementAndGet();
-                            if (done >= numTransactions) doneLatch.countDown();
+                            txDone.incrementAndGet();
+                            if (txDone.get() + errors.get() >= numTransactions) {
+                                doneLatch.countDown();
+                            }
 
                         } catch (Exception e) {
                             errors.incrementAndGet();
                             try { prod.abortTransaction(); } catch (Exception ignored) {}
-                            long done = txDone.get() + errors.get();
-                            if (done >= numTransactions) doneLatch.countDown();
+                            if (txDone.get() + errors.get() >= numTransactions) {
+                                doneLatch.countDown();
+                            }
                         }
                     }
                 } catch (Exception e) {
@@ -178,7 +181,7 @@ public class KafkaTransactionBenchmark {
         }
 
         if (!finished) {
-            System.out.println("\n⚠️  Timed out.");
+            System.out.println("\n Timed out.");
         }
 
         printReport(totalTimeMs, numTransactions, txDone.get(), errors.get(), latencies, numTopics);
@@ -192,27 +195,28 @@ public class KafkaTransactionBenchmark {
 
         System.out.println();
         System.out.println("─".repeat(62));
-        System.out.println("📊  Kafka Transactions Performance Report");
+        System.out.println("Kafka Transactions Performance Report");
         System.out.println("─".repeat(62));
         System.out.printf("%,d transactions committed, %,.1f TPS (%.2f MB/sec)%n",
                 done, tps, mbSec);
 
         if (done > 0) {
-            long[] filled = Arrays.copyOf(latencies, (int) Math.min(done, latencies.length));
-            Arrays.sort(filled);
-            double avg = Arrays.stream(filled).average().orElse(0);
-            long p50   = percentile(filled, 50);
-            long p95   = percentile(filled, 95);
-            long p99   = percentile(filled, 99);
-            long p999  = percentile(filled, 99.9);
-            long max   = filled[filled.length - 1];
+            long[] filled = Arrays.stream(latencies).filter(l -> l > 0).sorted().toArray();
+            if (filled.length > 0) {
+                double avg = Arrays.stream(filled).average().orElse(0);
+                long p50   = percentile(filled, 50);
+                long p95   = percentile(filled, 95);
+                long p99   = percentile(filled, 99);
+                long p999  = percentile(filled, 99.9);
+                long max   = filled[filled.length - 1];
 
-            System.out.printf("  avg latency : %.2f ms%n", avg);
-            System.out.printf("  max latency : %d ms%n",   max);
-            System.out.printf("  p50 latency : %d ms%n",   p50);
-            System.out.printf("  p95 latency : %d ms%n",   p95);
-            System.out.printf("  p99 latency : %d ms%n",   p99);
-            System.out.printf("  p999 latency: %d ms%n",   p999);
+                System.out.printf("  avg latency : %.2f ms%n", avg);
+                System.out.printf("  max latency : %d ms%n",   max);
+                System.out.printf("  p50 latency : %d ms%n",   p50);
+                System.out.printf("  p95 latency : %d ms%n",   p95);
+                System.out.printf("  p99 latency : %d ms%n",   p99);
+                System.out.printf("  p999 latency: %d ms%n",   p999);
+            }
         }
 
         System.out.println("─".repeat(62));

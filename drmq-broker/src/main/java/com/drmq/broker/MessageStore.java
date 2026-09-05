@@ -7,8 +7,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
+import java.io.DataInputStream;
+import java.io.FileInputStream;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -21,6 +25,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.net.URI;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import com.drmq.broker.persistence.CorruptRecordException;
 import com.drmq.broker.persistence.InfinityLogResolver;
@@ -103,7 +108,6 @@ public class MessageStore implements Closeable {
 
     private void recoverInternal() throws IOException {
         logger.info("Starting message store recovery...");
-        // Discover segments triggers loading them into LogManager
         Map<String, List<Path>> segments = logManager.discoverSegments();
         long maxOffset = -1;
 
@@ -151,11 +155,10 @@ public class MessageStore implements Closeable {
             }
         }
 
-        // Recover partial atomic batch from WAL (intent file) if present
-        java.nio.file.Path intentFile = java.nio.file.Paths.get(config.getDataDir()).resolve(".atomic-intent");
+        Path intentFile = Paths.get(config.getDataDir()).resolve(".atomic-intent");
         if (java.nio.file.Files.exists(intentFile)) {
             logger.info("Found .atomic-intent file. Recovering partial atomic batch...");
-            try (java.io.DataInputStream dis = new java.io.DataInputStream(new java.io.FileInputStream(intentFile.toFile()))) {
+            try (DataInputStream dis = new DataInputStream(new FileInputStream(intentFile.toFile()))) {
                 int numTopics = dis.readInt();
                 for (int i = 0; i < numTopics; i++) {
                     String topic = dis.readUTF();
@@ -204,10 +207,9 @@ public class MessageStore implements Closeable {
                         }
                     }
                 }
-                
-                // Only delete if recovery completely succeeded
+  
                 try {
-                    java.nio.file.Files.deleteIfExists(intentFile);
+                  Files.deleteIfExists(intentFile);
                 } catch (IOException e) {
                     logger.warn("Failed to delete atomic intent file after successful recovery", e);
                 }
@@ -328,8 +330,6 @@ public class MessageStore implements Closeable {
         try {
             long position;
             LogSegment segment = logManager.getOrCreateActiveSegment(topic);
-            
-            // Check if we need to roll over
             if (segment.getSize() >= config.getLogSegmentBytes()) {
                 segment = logManager.rollNewSegment(topic, offset);
             }
@@ -355,8 +355,6 @@ public class MessageStore implements Closeable {
         } finally {
             lock.unlock();
         }
-
-        // 4. Wake any long-polling consumers waiting for new messages
         synchronized (messageMonitor) {
             messageSignal.incrementAndGet();
             messageMonitor.notifyAll();
@@ -412,7 +410,7 @@ public class MessageStore implements Closeable {
             messages.add(builder.build());
         }
 
-        java.util.concurrent.locks.ReentrantLock lock = topicLocks.computeIfAbsent(topic, k -> new java.util.concurrent.locks.ReentrantLock());
+        ReentrantLock lock = topicLocks.computeIfAbsent(topic, k -> new ReentrantLock());
         lock.lock();
         try {
             List<Long> positions;
@@ -508,8 +506,7 @@ public class MessageStore implements Closeable {
             }
         }
 
-        // 1. Write the Atomic Intent to disk (WAL)
-        java.nio.file.Path intentFile = java.nio.file.Paths.get(config.getDataDir()).resolve(".atomic-intent");
+        Path intentFile = Paths.get(config.getDataDir()).resolve(".atomic-intent");
         try (java.io.FileOutputStream fos = new java.io.FileOutputStream(intentFile.toFile());
              java.io.DataOutputStream dos = new java.io.DataOutputStream(fos)) {
             dos.writeInt(topicMessages.size());
@@ -529,8 +526,6 @@ public class MessageStore implements Closeable {
             logger.error("Failed to write atomic intent file", e);
             throw new RuntimeException("Failed to write atomic intent file", e);
         }
-
-        // 2. Lock all affected topics to ensure atomicity
         List<String> sortedTopics = new ArrayList<>(topicMessages.keySet());
         Collections.sort(sortedTopics);
         List<java.util.concurrent.locks.ReentrantLock> acquiredLocks = new ArrayList<>();
@@ -573,10 +568,8 @@ public class MessageStore implements Closeable {
                 acquiredLocks.get(i).unlock();
             }
         }
-
-        // 3. Delete intent file now that everything is fully flushed to segments
         try {
-            java.nio.file.Files.deleteIfExists(intentFile);
+            Files.deleteIfExists(intentFile);
         } catch (IOException e) {
             logger.warn("Failed to delete atomic intent file", e);
         }
@@ -718,7 +711,7 @@ public class MessageStore implements Closeable {
                             segment = higherEntry.getValue();
                             currentOffset = segment.getBaseOffset();
                         } else {
-                            break; // No more segments anywhere
+                            break; 
                         }
                     } else {
                         break;
@@ -758,7 +751,6 @@ public class MessageStore implements Closeable {
             return diskResult;
         }
         
-        // Merge disk and cache results with offset-aware deduplication
         Map<Long, StoredMessage> merged = new java.util.TreeMap<>();
         for (StoredMessage msg : diskResult) {
             merged.put(msg.getOffset(), msg);
@@ -862,10 +854,6 @@ public class MessageStore implements Closeable {
         if (segments == null) return Collections.emptyList();
 
         List<Path> paths = new ArrayList<>();
-        // We need any segment where the next segment's baseOffset > followerOffset,
-        // or the current segment's baseOffset > followerOffset.
-        // A simpler approach: Include the segment that contains followerOffset,
-        // and all segments after it.
         Map.Entry<Long, LogSegment> floorEntry = segments.floorEntry(followerOffset);
         if (floorEntry != null) {
             paths.add(floorEntry.getValue().getFilePath());
@@ -988,9 +976,6 @@ public class MessageStore implements Closeable {
             }
         }
     }
-
-
-     // Bounded cache for messages with FIFO eviction.
         private static class BoundedMessageCache {
         private final int maxSize;
         private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();

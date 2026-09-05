@@ -4,9 +4,9 @@
 #
 # Mirrors DRMQ atomic_stress_test.sh configuration exactly:
 #   * 3-node KRaft cluster (replication factor 3, majority ACK)
-#   * Each transaction writes atomically to 2 topics (txn-topic-a + txn-topic-b)
-#   * 1 KB payload per topic per transaction  →  2 KB total per transaction
-#   * Kafka Transactions API: beginTransaction → send×2 → commitTransaction
+#   * Each transaction writes atomically to N topics (txn-topic-0 .. txn-topic-(N-1))
+#   * 1 KB payload per topic per transaction  →  N KB total per transaction
+#   * Kafka Transactions API: beginTransaction → send×N → commitTransaction
 #   * 200,000 transactions
 #   * batch.size = 1 MiB, linger.ms = 10, acks = all, max.in.flight = 1
 #   * Concurrency = 1 transactional producer (serial, mirrors DRMQ's single Raft leader)
@@ -24,8 +24,6 @@ KAFKA_LIBS="/opt/kafka/libs"
 # ─────────────────── Configuration ───────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.yml"
-TOPIC_A="txn-topic-a"
-TOPIC_B="txn-topic-b"
 REPLICATION_FACTOR=3
 PARTITIONS=1
 NUM_TRANSACTIONS=200000     # total atomic transactions
@@ -77,11 +75,12 @@ start_cluster() {
   exit 1
 }
 
-# ─────────────────── Create both topics ──────────────────────────────────────
+# ─────────────────── Create topics ───────────────────────────────────────────
 create_topics() {
-  for t in {0..10}; do
-    TOPIC="txn-topic-$t"
-    echo "Creating topic ${TOPIC}..."
+  local num_create=$(( TOPICS > 10 ? TOPICS : 10 ))
+  for ((t=0; t<num_create; t++)); do
+    local topic="txn-topic-$t"
+    echo "Creating topic ${topic}..."
     for attempt in {1..10}; do
       if docker exec kafka1 ${KAFKA_BIN}/kafka-topics.sh \
           --bootstrap-server localhost:9092 \
@@ -89,7 +88,7 @@ create_topics() {
           --if-not-exists \
           --replication-factor ${REPLICATION_FACTOR} \
           --partitions ${PARTITIONS} \
-          --topic "${TOPIC}"; then
+          --topic "${topic}"; then
         break
       fi
       echo "  Attempt ${attempt} failed, retrying in 3s..."
@@ -133,8 +132,8 @@ run_txn_benchmark() {
   echo "────────────────────────────────────────────────────────────"
   echo " Kafka Transactions Performance Test"
   echo "   Transactions : ${NUM_TRANSACTIONS}"
-  echo "   Topics       : ${TOPIC_A}  +  ${TOPIC_B}"
-  echo "   Payload/topic: 1 KB  (2 KB total per transaction)"
+  echo "   Topics       : ${TOPICS} topics (txn-topic-0 .. txn-topic-$((TOPICS - 1)))"
+  echo "   Payload/topic: 1 KB  ($((TOPICS)) KB total per transaction)"
   echo "   Concurrency  : ${CONCURRENCY} transactional producer(s)"
   echo "   Producer mode: separate (one per thread — Kafka txns require it)"
   echo "   ACKs         : all (ISR quorum)"

@@ -19,7 +19,7 @@ import java.util.List;
  */
 public class LogSegment implements AutoCloseable {
     private static final Logger logger = LoggerFactory.getLogger(LogSegment.class);
-    private static final int MAX_MESSAGE_SIZE = 10 * 1024 * 1024; // 10MB limit
+    private static final int MAX_MESSAGE_SIZE = 10 * 1024 * 1024; 
 
     private final Path filePath;
     private final FileChannel fileChannel;
@@ -92,7 +92,6 @@ public class LogSegment implements AutoCloseable {
         int totalBytesWritten = 0;
 
         try {
-            // Pre-validate, serialize, and calculate total size
             int totalBatchSize = 0;
             List<byte[]> serializedMessages = new ArrayList<>(messages.size());
             for (StoredMessage message : messages) {
@@ -106,8 +105,7 @@ public class LogSegment implements AutoCloseable {
                 totalBatchSize += 4 + messageBytes.length;
             }
 
-            // Allocate a single buffer for the entire batch
-            java.nio.ByteBuffer buffer = java.nio.ByteBuffer.allocate(totalBatchSize);
+            ByteBuffer buffer = ByteBuffer.allocate(totalBatchSize);
             for (byte[] messageBytes : serializedMessages) {
                 positions.add(currentSize + buffer.position());
                 buffer.putInt(messageBytes.length);
@@ -115,7 +113,6 @@ public class LogSegment implements AutoCloseable {
             }
             buffer.flip();
 
-            // Write the entire batch in minimal syscalls
             long position = currentSize;
             while (buffer.hasRemaining()) {
                 fileChannel.write(buffer, position + buffer.position());

@@ -89,9 +89,7 @@ public class AtomicStressTestApp {
 
         // ── Payloads ──────────────────────────────────────────────────────────
         final byte[] payloadA = new byte[1024];
-        final byte[] payloadB = new byte[1024];
         Arrays.fill(payloadA, (byte) 'A');
-        Arrays.fill(payloadB, (byte) 'B');
 
         // ── Counters / latency ────────────────────────────────────────────────
         final long[] latencies        = bounded ? new long[(int) numTransactions] : null;
@@ -215,11 +213,11 @@ public class AtomicStressTestApp {
                         prod.sendAtomic(atomicBatch).whenComplete((res, ex) -> {
                             mySem.release();
                             if (ex == null) {
-                                long done = txDone.incrementAndGet();
+                                txDone.incrementAndGet();
                                 if (bounded && latencies != null && capturedIdx >= 0) {
                                     latencies[(int) capturedIdx] = System.currentTimeMillis() - txStart;
                                 }
-                                if (bounded && done >= numTransactions && doneLatch != null) {
+                                if (bounded && (txDone.get() + errors.get()) >= numTransactions && doneLatch != null) {
                                     doneLatch.countDown();
                                 }
                             } else {
@@ -289,21 +287,22 @@ public class AtomicStressTestApp {
                 done, tps, mbSec);
 
         if (latencies != null && done > 0) {
-            long[] filled = Arrays.copyOf(latencies, (int) Math.min(done, latencies.length));
-            Arrays.sort(filled);
-            double avg = Arrays.stream(filled).average().orElse(0);
-            long p50   = percentile(filled, 50);
-            long p95   = percentile(filled, 95);
-            long p99   = percentile(filled, 99);
-            long p999  = percentile(filled, 99.9);
-            long max   = filled[filled.length - 1];
+            long[] filled = Arrays.stream(latencies).filter(l -> l > 0).sorted().toArray();
+            if (filled.length > 0) {
+                double avg = Arrays.stream(filled).average().orElse(0);
+                long p50   = percentile(filled, 50);
+                long p95   = percentile(filled, 95);
+                long p99   = percentile(filled, 99);
+                long p999  = percentile(filled, 99.9);
+                long max   = filled[filled.length - 1];
 
-            System.out.printf("  avg latency : %.2f ms%n", avg);
-            System.out.printf("  max latency : %d ms%n",   max);
-            System.out.printf("  p50 latency : %d ms%n",   p50);
-            System.out.printf("  p95 latency : %d ms%n",   p95);
-            System.out.printf("  p99 latency : %d ms%n",   p99);
-            System.out.printf("  p999 latency: %d ms%n",   p999);
+                System.out.printf("  avg latency : %.2f ms%n", avg);
+                System.out.printf("  max latency : %d ms%n",   max);
+                System.out.printf("  p50 latency : %d ms%n",   p50);
+                System.out.printf("  p95 latency : %d ms%n",   p95);
+                System.out.printf("  p99 latency : %d ms%n",   p99);
+                System.out.printf("  p999 latency: %d ms%n",   p999);
+            }
         }
 
         System.out.println("─".repeat(62));

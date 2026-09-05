@@ -188,7 +188,7 @@ public class DRMQConsumer implements AutoCloseable {
         for (int attempt = 0; attempt < totalAttempts; attempt++) {
             try {
                 connectInternal();
-                return;  // Success
+                return;  
             } catch (IOException e) {
                 logger.debug("Connection to {}:{} failed (attempt {}/{}): {}",
                         host, port, attempt + 1, totalAttempts, e.getMessage());
@@ -267,26 +267,38 @@ public class DRMQConsumer implements AutoCloseable {
             return false;
         }
 
-        String leader = errorMessage.substring("NOT_LEADER:".length());
-        if (!"UNKNOWN".equals(leader)) {
-            String[] parts = leader.split(":");
-            if (parts.length == 2) {
-                try {
-                    this.host = parts[0];
-                    this.port = Integer.parseInt(parts[1]);
-                    syncServerIndexToCurrent();
-                    closeConnection();
-                    ensureConnectedWithRetry();
-                    logger.info("Redirected to leader {}:{}", host, port);
-                    return true;
-                } catch (NumberFormatException e) {
-                    // Fall through to reconnect cycling.
-                }
-            }
+        String leaderAddr = parseLeaderAddress(errorMessage);
+        if (leaderAddr != null) {
+            this.host = leaderAddr.split(":")[0];
+            this.port = Integer.parseInt(leaderAddr.split(":")[1]);
+            syncServerIndexToCurrent();
+            closeConnection();
+            ensureConnectedWithRetry();
+            logger.info("Redirected to leader {}:{}", host, port);
+            return true;
         }
 
         reconnect();
         return true;
+    }
+
+    /**
+     * Extracts and validates the leader "host:port" from a NOT_LEADER error message.
+     * Returns null if the address is missing, UNKNOWN, or malformed.
+     */
+    private String parseLeaderAddress(String errorMessage) {
+        String leader = errorMessage.substring("NOT_LEADER:".length());
+        if ("UNKNOWN".equals(leader)) return null;
+
+        String[] parts = leader.split(":");
+        if (parts.length != 2) return null;
+
+        try {
+            Integer.parseInt(parts[1]);
+            return leader;
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     /**
@@ -338,30 +350,7 @@ public class DRMQConsumer implements AutoCloseable {
         while (attempts < MAX_RETRIES) {
             try {
                 ensureConnectedWithRetry();
-                SearchOffsetByTimeRequest request = SearchOffsetByTimeRequest.newBuilder()
-                        .setTopic(topic)
-                        .setTimestamp(timestamp)
-                        .build();
-
-                sendEnvelope(MessageEnvelope.newBuilder()
-                        .setType(MessageType.SEARCH_OFFSET_BY_TIME_REQUEST)
-                        .setPayload(request.toByteString())
-                        .build());
-                MessageEnvelope responseEnvelope = receiveEnvelope();
-
-                if (responseEnvelope.getType() == MessageType.SEARCH_OFFSET_BY_TIME_RESPONSE) {
-                    SearchOffsetByTimeResponse resp = SearchOffsetByTimeResponse.parseFrom(responseEnvelope.getPayload());
-                    return resp.getOffset();
-                } else if (responseEnvelope.getType() == MessageType.PRODUCE_RESPONSE) {
-                    ProduceResponse errorResp = ProduceResponse.parseFrom(responseEnvelope.getPayload());
-                    if (tryRedirectToLeader(errorResp.getErrorMessage())) {
-                        attempts++;
-                        continue;
-                    }
-                    throw new IOException("Error searching offset by time: " + errorResp.getErrorMessage());
-                } else {
-                    throw new IOException("Unexpected response type: " + responseEnvelope.getType());
-                }
+                return sendSearchOffsetRequest(topic, timestamp);
             } catch (IOException e) {
                 if (e.getMessage() != null && e.getMessage().contains("Error searching offset")) {
                     throw e;
@@ -374,6 +363,34 @@ public class DRMQConsumer implements AutoCloseable {
             }
         }
         return -1;
+    }
+
+    private long sendSearchOffsetRequest(String topic, long timestamp) throws IOException {
+        SearchOffsetByTimeRequest request = SearchOffsetByTimeRequest.newBuilder()
+                .setTopic(topic)
+                .setTimestamp(timestamp)
+                .build();
+
+        sendEnvelope(MessageEnvelope.newBuilder()
+                .setType(MessageType.SEARCH_OFFSET_BY_TIME_REQUEST)
+                .setPayload(request.toByteString())
+                .build());
+        MessageEnvelope responseEnvelope = receiveEnvelope();
+
+        if (responseEnvelope.getType() == MessageType.SEARCH_OFFSET_BY_TIME_RESPONSE) {
+            SearchOffsetByTimeResponse resp = SearchOffsetByTimeResponse.parseFrom(responseEnvelope.getPayload());
+            return resp.getOffset();
+        }
+
+        if (responseEnvelope.getType() == MessageType.PRODUCE_RESPONSE) {
+            ProduceResponse errorResp = ProduceResponse.parseFrom(responseEnvelope.getPayload());
+            if (tryRedirectToLeader(errorResp.getErrorMessage())) {
+                return sendSearchOffsetRequest(topic, timestamp);
+            }
+            throw new IOException("Error searching offset by time: " + errorResp.getErrorMessage());
+        }
+
+        throw new IOException("Unexpected response type: " + responseEnvelope.getType());
     }
 
     public List<ConsumedMessage> poll() throws IOException {
@@ -488,28 +505,7 @@ public class DRMQConsumer implements AutoCloseable {
     }
 
     private long fetchOffsetFromBrokerWithRetry(String topic, int retriesLeft) throws IOException {
-        IOException lastException = null;
-
-        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-            try {
-                ensureConnectedWithRetry();
-                return fetchOffsetFromBrokerInternal(topic);
-            } catch (IOException e) {
-                lastException = e;
-                logger.warn("Failed to fetch offset for topic '{}' from {}:{} (attempt {}/{}): {}",
-                        topic, host, port, attempt + 1, MAX_RETRIES, e.getMessage());
-                closeConnection();
-                rotateToNextServer();
-                try { Thread.sleep(RECONNECT_DELAY_MS); } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Interrupted during offset fetch retry", ie);
-                }
-            }
-        }
-
-        logger.error("Failed to fetch offset for topic '{}' after {} attempts", topic, MAX_RETRIES);
-        throw new IOException("Failed to fetch offset after " + MAX_RETRIES + " attempts: " +
-                (lastException != null ? lastException.getMessage() : "unknown error"));
+        return executeWithRetry("fetch offset", () -> fetchOffsetFromBrokerInternal(topic));
     }
 
     private long fetchOffsetFromBrokerInternal(String topic) throws IOException {
@@ -551,29 +547,10 @@ public class DRMQConsumer implements AutoCloseable {
     }
 
     private void commitOffsetToBrokerWithRetry(String topic, long offset, int retriesLeft) throws IOException {
-        IOException lastException = null;
-
-        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-            try {
-                ensureConnectedWithRetry();
-                commitOffsetToBrokerInternal(topic, offset);
-                return;
-            } catch (IOException e) {
-                lastException = e;
-                logger.warn("Failed to commit offset {} for topic '{}' to {}:{} (attempt {}/{}): {}",
-                        offset, topic, host, port, attempt + 1, MAX_RETRIES, e.getMessage());
-                closeConnection();
-                rotateToNextServer();
-                try { Thread.sleep(RECONNECT_DELAY_MS); } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Interrupted during offset commit retry", ie);
-                }
-            }
-        }
-
-        logger.error("Failed to commit offset {} for topic '{}' after {} attempts", offset, topic, MAX_RETRIES);
-        throw new IOException("Failed to commit offset after " + MAX_RETRIES + " attempts: " +
-                (lastException != null ? lastException.getMessage() : "unknown error"));
+        executeWithRetry("commit offset", () -> {
+            commitOffsetToBrokerInternal(topic, offset);
+            return null;
+        });
     }
 
     private void commitOffsetToBrokerInternal(String topic, long offset) throws IOException {
@@ -613,28 +590,7 @@ public class DRMQConsumer implements AutoCloseable {
     }
 
     private boolean nackOffsetToBrokerWithRetry(String topic, long offset, int retriesLeft) throws IOException {
-        IOException lastException = null;
-
-        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-            try {
-                ensureConnectedWithRetry();
-                return nackOffsetToBrokerInternal(topic, offset);
-            } catch (IOException e) {
-                lastException = e;
-                logger.warn("Failed to NACK offset {} for topic '{}' to {}:{} (attempt {}/{}): {}",
-                        offset, topic, host, port, attempt + 1, MAX_RETRIES, e.getMessage());
-                closeConnection();
-                rotateToNextServer();
-                try { Thread.sleep(RECONNECT_DELAY_MS); } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Interrupted during NACK retry", ie);
-                }
-            }
-        }
-
-        logger.error("Failed to NACK offset {} for topic '{}' after {} attempts", offset, topic, MAX_RETRIES);
-        throw new IOException("Failed to NACK offset after " + MAX_RETRIES + " attempts: " +
-                (lastException != null ? lastException.getMessage() : "unknown error"));
+        return executeWithRetry("NACK offset", () -> nackOffsetToBrokerInternal(topic, offset));
     }
 
     private boolean nackOffsetToBrokerInternal(String topic, long offset) throws IOException {
@@ -684,28 +640,7 @@ public class DRMQConsumer implements AutoCloseable {
     }
 
     private List<ConsumedMessage> fetchMessagesWithRetry(String topic, long fromOffset, int maxMessages, long timeoutMs, int retriesLeft) throws IOException {
-        IOException lastException = null;
-
-        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-            try {
-                ensureConnectedWithRetry();
-                return fetchMessagesInternal(topic, fromOffset, maxMessages, timeoutMs);
-            } catch (IOException e) {
-                lastException = e;
-                logger.warn("Failed to fetch messages from topic '{}' at offset {} from {}:{} (attempt {}/{}): {}",
-                        topic, fromOffset, host, port, attempt + 1, MAX_RETRIES, e.getMessage());
-                closeConnection();
-                rotateToNextServer();
-                try { Thread.sleep(RECONNECT_DELAY_MS); } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Interrupted during message fetch retry", ie);
-                }
-            }
-        }
-
-        logger.error("Failed to fetch messages from topic '{}' after {} attempts", topic, MAX_RETRIES);
-        throw new IOException("Failed to fetch messages after " + MAX_RETRIES + " attempts: " +
-                (lastException != null ? lastException.getMessage() : "unknown error"));
+        return executeWithRetry("fetch messages", () -> fetchMessagesInternal(topic, fromOffset, maxMessages, timeoutMs));
     }
 
     private List<ConsumedMessage> fetchMessagesInternal(String topic, long fromOffset, int maxMessages, long timeoutMs) throws IOException {
@@ -754,6 +689,39 @@ public class DRMQConsumer implements AutoCloseable {
 
         logger.debug("Fetched {} messages from topic '{}' starting at offset {}", messages.size(), topic, fromOffset);
         return messages;
+    }
+
+    /**
+     * Executes an operation with retry and broker failover.
+     * On each failure, closes the connection, rotates to the next server, and retries.
+     */
+    private <T> T executeWithRetry(String operationName, RetryableOperation<T> operation) throws IOException {
+        IOException lastException = null;
+
+        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+            try {
+                ensureConnectedWithRetry();
+                return operation.execute();
+            } catch (IOException e) {
+                lastException = e;
+                logger.warn("Failed to {} from {}:{} (attempt {}/{}): {}",
+                        operationName, host, port, attempt + 1, MAX_RETRIES, e.getMessage());
+                closeConnection();
+                rotateToNextServer();
+                try { Thread.sleep(RECONNECT_DELAY_MS); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted during " + operationName + " retry", ie);
+                }
+            }
+        }
+
+        throw new IOException("Failed to " + operationName + " after " + MAX_RETRIES + " attempts: " +
+                (lastException != null ? lastException.getMessage() : "unknown error"));
+    }
+
+    @FunctionalInterface
+    private interface RetryableOperation<T> {
+        T execute() throws IOException;
     }
 
 

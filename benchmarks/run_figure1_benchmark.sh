@@ -25,7 +25,20 @@ docker-compose exec kafka1 /opt/kafka/bin/kafka-topics.sh --create --topic txn-t
 docker-compose exec kafka1 /opt/kafka/bin/kafka-topics.sh --create --topic txn-topic-1 --partitions 1 --replication-factor 3 --bootstrap-server localhost:9092 --if-not-exists
 
 echo "Running Kafka with Concurrency=1 ..."
-CP=".kafka-bench/classes:$(find ".kafka-bench/libs" -name "*.jar" | tr '\n' ':')"
+
+echo "Extracting Kafka client libs from image..."
+BENCH_DIR=".kafka-bench"
+rm -rf "${BENCH_DIR}"
+mkdir -p "${BENCH_DIR}/classes"
+CID=$(docker create apache/kafka:3.7.0)
+docker cp "${CID}:/opt/kafka/libs/." "${BENCH_DIR}/libs/"
+docker rm "${CID}" >/dev/null
+
+CP="$(find "${BENCH_DIR}/libs" -name "*.jar" | tr '\n' ':')"
+echo "Compiling Kafka benchmark..."
+javac -cp "${CP}" KafkaTransactionBenchmark.java -d "${BENCH_DIR}/classes"
+
+CP="${BENCH_DIR}/classes:${CP}"
 # Run for 5000 transactions to get stable throughput
 java -cp "${CP}" KafkaTransactionBenchmark "localhost:9092,localhost:9094,localhost:9096" 5000 1 separate 2 > kafka_out.log 2>&1 || true
 KAFKA_TPS=$(grep "transactions committed" kafka_out.log | sed -n 's/.*committed, \([0-9,.]*\) TPS.*/\1/p' | tr -d ',')

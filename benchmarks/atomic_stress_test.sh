@@ -4,8 +4,8 @@
 #
 # Mirrors DRMQ's natural architectural advantage:
 #   * 3-node Raft cluster (replication factor 3, majority ACK)
-#   * Each transaction writes atomically to 2 topics (Topic-A + Topic-B)
-#   * 1 KB payload per topic per transaction  →  2 KB total per transaction
+#   * Each transaction writes atomically to N topics (Topic-0 .. Topic-(N-1))
+#   * 1 KB payload per topic per transaction  →  N KB total per transaction
 #   * CONCURRENCY = 10  (enables atomic batching: the atomicSenderLoop collapses
 #     multiple sendAtomic() calls into ONE Raft proposal — this is DRMQ's core
 #     architectural advantage, analogous to Kafka's partitions in throughput tests)
@@ -19,24 +19,20 @@
 # Output:
 #   N transactions committed, X.X TPS (Y.Y MB/sec)
 #   avg / max / p50 / p95 / p99 / p999 latency
-# ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 # ─────────────────── Configuration (mirrors kafka_txn_benchmark.sh) ───────────
-TOPIC_A="Topic-A"
-TOPIC_B="Topic-B"
 NUM_TRANSACTIONS=200000     # total atomic transactions
 CONCURRENCY=10             # threads feeding shared producer (enables atomic batching)
 PENDING_TXN_LIMIT=5000     # Semaphore size — keeps accumulator full for max batching
 MODE="shared"              # "shared" (one producer) or "separate" (one per thread, mirrors Kafka)
 BROKERS="localhost:9092,localhost:9093,localhost:9094"
 TOPICS=2                   # number of topics per transaction
-# ─────────────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLIENT_DIR="${SCRIPT_DIR}/../drmq-client"
 
-while getopts "b:c:n:i:m:t:h" opt; do
+while getopts "b:c:n:p:m:t:h" opt; do
   case $opt in
     b) BROKERS="$OPTARG" ;;
     c) CONCURRENCY="$OPTARG" ;;
@@ -60,18 +56,16 @@ while getopts "b:c:n:i:m:t:h" opt; do
   esac
 done
 
-# ─────────────────── Build ────────────────────────────────────────────────────
 echo "⏳ Building drmq-client..."
 (cd "${CLIENT_DIR}" && mvn compile -q 2>/dev/null)
 echo "✓  Build complete"
 echo ""
 
-# ─────────────────── Run ─────────────────────────────────────────────────────
 echo "────────────────────────────────────────────────────────────"
 echo " DRMQ Atomic Transactions Performance Test"
 echo "   Transactions : ${NUM_TRANSACTIONS}"
-echo "   Topics       : ${TOPIC_A}  +  ${TOPIC_B}"
-echo "   Payload/topic: 1 KB  (2 KB total per transaction)"
+echo "   Topics       : ${TOPICS} topics (Topic-0 .. Topic-$((TOPICS - 1)))"
+echo "   Payload/topic: 1 KB  ($((TOPICS)) KB total per transaction)"
 echo "   Concurrency  : ${CONCURRENCY} thread(s)"
 echo "   Producer mode: ${MODE} ($([ "${MODE}" = "separate" ] && echo 'one producer per thread, Kafka comparable' || echo 'single shared producer'))"
 echo "   Pending Txns : ${PENDING_TXN_LIMIT} (batching $([ "${PENDING_TXN_LIMIT}" -gt 1 ] && echo 'ON' || echo 'OFF — serial mode'))"
