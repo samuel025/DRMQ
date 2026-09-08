@@ -2,12 +2,12 @@
 set -e
 
 # Laptop-friendly scaling benchmark for DRMQ vs Kafka (Figure 2)
-# Concurrencies: 1, 5, 10, 50, 100
+# Concurrencies: 1, 5, 10, 20
 
 echo "Compiling all modules first..."
 (cd .. && mvn compile -q)
 
-CONCURRENCIES=(1 5 10 20)
+CONCURRENCIES=(1 5 10)
 RESULTS_CSV="figure2_scaling_results.csv"
 
 echo "concurrency,system,tps" > $RESULTS_CSV
@@ -83,8 +83,8 @@ echo "Waiting for Kafka to be ready (15s)..."
 sleep 15
 
 # Create topics
-docker-compose exec kafka1 /opt/kafka/bin/kafka-topics.sh --create --topic txn-topic-0 --partitions 1 --replication-factor 3 --bootstrap-server localhost:9092 --if-not-exists
-docker-compose exec kafka1 /opt/kafka/bin/kafka-topics.sh --create --topic txn-topic-1 --partitions 1 --replication-factor 3 --bootstrap-server localhost:9092 --if-not-exists
+docker-compose exec -T kafka1 /opt/kafka/bin/kafka-topics.sh --create --topic txn-topic-0 --partitions 1 --replication-factor 3 --bootstrap-server localhost:9092 --if-not-exists
+docker-compose exec -T kafka1 /opt/kafka/bin/kafka-topics.sh --create --topic txn-topic-1 --partitions 1 --replication-factor 3 --bootstrap-server localhost:9092 --if-not-exists
 
 echo "Extracting Kafka client libs from image..."
 BENCH_DIR=".kafka-bench"
