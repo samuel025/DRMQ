@@ -7,8 +7,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
-import java.io.DataInputStream;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -155,76 +153,252 @@ public class MessageStore implements Closeable {
             }
         }
 
-        Path intentFile = Paths.get(config.getDataDir()).resolve(".atomic-intent");
-        if (java.nio.file.Files.exists(intentFile)) {
-            logger.info("Found .atomic-intent file. Recovering partial atomic batch...");
-            try (DataInputStream dis = new DataInputStream(new FileInputStream(intentFile.toFile()))) {
-                int numTopics = dis.readInt();
-                for (int i = 0; i < numTopics; i++) {
-                    String topic = dis.readUTF();
-                    int numMsgs = dis.readInt();
-                    List<StoredMessage> msgs = new ArrayList<>(numMsgs);
-                    for (int j = 0; j < numMsgs; j++) {
-                        int len = dis.readInt();
-                        byte[] msgBytes = new byte[len];
-                        dis.readFully(msgBytes);
-                        msgs.add(StoredMessage.parseFrom(msgBytes));
-                    }
+        // --- Atomic batch partial-apply detection via completion markers ---
+        // Each successful appendAtomicBatch() writes a .atomic-done-{raftIndex} marker
+        // after all topic segments are durably written. If the highest raftIndex seen
+        // in the segments does NOT have a corresponding marker, the apply was partial
+        // and we must truncate back so Raft re-applies the entry cleanly.
+        recoverPartialAtomicBatch(maxOffset);
 
-                    long currentHeadOffset = topicHeadOffsets.containsKey(topic) ? topicHeadOffsets.get(topic).get() : -1;
-                    List<StoredMessage> missingMsgs = new ArrayList<>();
-                    for (StoredMessage m : msgs) {
-                        if (m.getOffset() > currentHeadOffset) {
-                            missingMsgs.add(m);
-                        }
-                    }
+        globalOffset.set(maxOffset + 1);
+        logger.info("Recovery complete. Global offset set to {}", globalOffset.get());
+    }
 
-                    if (!missingMsgs.isEmpty()) {
-                        logger.info("Recovering {} missing messages for topic {}", missingMsgs.size(), topic);
-                        LogSegment segment = logManager.getOrCreateActiveSegment(topic);
-                        if (segment.getSize() >= config.getLogSegmentBytes()) {
-                            segment = logManager.rollNewSegment(topic, missingMsgs.get(0).getOffset());
-                        }
-                        List<Long> positions = segment.appendBatch(missingMsgs);
-                        
-                        AtomicLong counter = topicMessageCounts.computeIfAbsent(topic, k -> new AtomicLong());
-                        AtomicLong head = topicHeadOffsets.computeIfAbsent(topic, k -> new AtomicLong(-1));
-                        
-                        for (int j = 0; j < missingMsgs.size(); j++) {
-                            StoredMessage m = missingMsgs.get(j);
-                            indexMessage(topic, m.getOffset(), positions.get(j));
-                            addToCache(topic, m);
-                            counter.incrementAndGet();
-                            if (m.getOffset() > head.get()) {
-                                head.set(m.getOffset());
-                            }
-                            if (m.getOffset() > maxOffset) {
-                                maxOffset = m.getOffset();
-                            }
-                            if (m.getRaftIndex() > lastAppliedRaftIndex.get()) {
-                                lastAppliedRaftIndex.set(m.getRaftIndex());
-                            }
-                        }
-                    }
-                }
-  
+    /**
+     * Detect and recover from a partially-applied atomic batch.
+     *
+     * After scanning all segments during recovery, the highest raftIndex found in
+     * stored messages may belong to an atomic batch that was only partially written
+     * (e.g. Topic A written, crash before Topic B). We detect this by checking for
+     * a corresponding .atomic-done-{raftIndex} completion marker.
+     *
+     * If the marker is missing:
+     *   1. Truncate all topic segments that contain messages with that raftIndex.
+     *   2. Decrement lastAppliedRaftIndex so Raft will re-apply the entry.
+     *   3. Recalculate maxOffset from the remaining messages.
+     *
+     * If the marker is present, the batch was fully applied — clean up old markers.
+     *
+     * @param maxOffset the highest offset discovered during segment scanning
+     */
+    private void recoverPartialAtomicBatch(long maxOffset) {
+        long highestRaftIndex = lastAppliedRaftIndex.get();
+        if (highestRaftIndex < 0) {
+            // No messages found during recovery — nothing to check.
+            cleanupAllAtomicDoneMarkers();
+            return;
+        }
+
+        Path dataPath = Paths.get(config.getDataDir());
+        Path markerFile = dataPath.resolve(".atomic-done-" + highestRaftIndex);
+
+        if (Files.exists(markerFile)) {
+            // The atomic batch (if any) at this raftIndex was fully applied.
+            // Clean up all markers and proceed normally.
+            cleanupAllAtomicDoneMarkers();
+            return;
+        }
+
+        // No completion marker for the highest raftIndex. Check if any topics
+        // have messages at this raftIndex — if so, the apply was partial.
+        Map<String, ConcurrentSkipListMap<Long, LogSegment>> allSegments = logManager.getAllSegments();
+        boolean foundPartial = false;
+        List<String> affectedTopics = new ArrayList<>();
+
+        for (Map.Entry<String, ConcurrentSkipListMap<Long, LogSegment>> entry : allSegments.entrySet()) {
+            String topic = entry.getKey();
+            for (LogSegment segment : entry.getValue().values()) {
                 try {
-                  Files.deleteIfExists(intentFile);
-                } catch (IOException e) {
-                    logger.warn("Failed to delete atomic intent file after successful recovery", e);
-                }
-            } catch (Exception e) {
-                logger.error("FATAL: Failed to recover atomic intent file. Panicking to prevent dataloss!", e);
-                if (System.getProperty("drmq.test.mode") != null) {
-                    throw new RuntimeException("Simulated panic during atomic intent recovery", e);
-                } else {
-                    System.exit(1);
+                    long position = 0;
+                    long segmentSize = segment.getSize();
+                    while (position < segmentSize) {
+                        StoredMessage message = segment.read(position);
+                        if (message.getRaftIndex() == highestRaftIndex) {
+                            foundPartial = true;
+                            if (!affectedTopics.contains(topic)) {
+                                affectedTopics.add(topic);
+                            }
+                            break;
+                        }
+                        position += 4 + message.getSerializedSize();
+                    }
+                } catch (Exception e) {
+                    logger.warn("Error scanning segment {} during partial apply check", segment.getFilePath(), e);
                 }
             }
         }
 
-        globalOffset.set(maxOffset + 1);
-        logger.info("Recovery complete. Global offset set to {}", globalOffset.get());
+        if (!foundPartial) {
+            // No messages with this raftIndex exist — the raftIndex was derived from
+            // a non-atomic write (single or batch), which doesn't need a marker.
+            cleanupAllAtomicDoneMarkers();
+            return;
+        }
+
+        // Partial atomic batch detected. Truncate messages with this raftIndex
+        // from all affected topics.
+        logger.warn("Partial atomic batch detected at raftIndex {}. Truncating affected topics: {}",
+                highestRaftIndex, affectedTopics);
+
+        long newMaxOffset = -1;
+        long newMaxRaftIndex = -1;
+
+        for (Map.Entry<String, ConcurrentSkipListMap<Long, LogSegment>> entry : allSegments.entrySet()) {
+            String topic = entry.getKey();
+            for (LogSegment segment : entry.getValue().values()) {
+                try {
+                    long position = 0;
+                    long segmentSize = segment.getSize();
+                    long truncateAt = -1;
+
+                    while (position < segmentSize) {
+                        StoredMessage message = segment.read(position);
+                        if (message.getRaftIndex() == highestRaftIndex) {
+                            // Found the first message belonging to the partial batch —
+                            // truncate from here.
+                            truncateAt = position;
+                            break;
+                        }
+                        // Track the highest offset/raftIndex of messages we're keeping
+                        if (message.getOffset() > newMaxOffset) {
+                            newMaxOffset = message.getOffset();
+                        }
+                        if (message.getRaftIndex() > newMaxRaftIndex) {
+                            newMaxRaftIndex = message.getRaftIndex();
+                        }
+                        position += 4 + message.getSerializedSize();
+                    }
+
+                    if (truncateAt >= 0) {
+                        logger.info("Truncating segment {} for topic {} at position {} (removing raftIndex {} messages)",
+                                segment.getFilePath().getFileName(), topic, truncateAt, highestRaftIndex);
+                        segment.truncate(truncateAt);
+                    } else {
+                        // Segment doesn't contain the partial batch — scan for maxOffset tracking
+                        position = 0;
+                        segmentSize = segment.getSize();
+                        while (position < segmentSize) {
+                            StoredMessage message = segment.read(position);
+                            if (message.getOffset() > newMaxOffset) {
+                                newMaxOffset = message.getOffset();
+                            }
+                            if (message.getRaftIndex() > newMaxRaftIndex) {
+                                newMaxRaftIndex = message.getRaftIndex();
+                            }
+                            position += 4 + message.getSerializedSize();
+                        }
+                    }
+                } catch (Exception e) {
+                    logger.error("Error during partial batch truncation for topic {}", topic, e);
+                }
+            }
+        }
+
+        // Reset in-memory state to reflect the truncation.
+        // Clear and rebuild indexes, caches, and counters from the now-truncated segments.
+        topicIndex.clear();
+        topicMessageCounts.clear();
+        topicHeadOffsets.clear();
+        messageCache.clear();
+
+        // Re-scan segments to rebuild indexes after truncation
+        for (Map.Entry<String, ConcurrentSkipListMap<Long, LogSegment>> entry : allSegments.entrySet()) {
+            String topic = entry.getKey();
+            for (LogSegment segment : entry.getValue().values()) {
+                try {
+                    long position = 0;
+                    long segmentSize = segment.getSize();
+                    while (position < segmentSize) {
+                        StoredMessage message = segment.read(position);
+                        indexMessage(topic, message.getOffset(), position);
+                        addToCache(topic, message);
+                        topicMessageCounts.computeIfAbsent(topic, k -> new AtomicLong()).incrementAndGet();
+                        AtomicLong head = topicHeadOffsets.computeIfAbsent(topic, k -> new AtomicLong(-1));
+                        if (message.getOffset() > head.get()) {
+                            head.set(message.getOffset());
+                        }
+                        position += 4 + message.getSerializedSize();
+                    }
+                } catch (Exception e) {
+                    logger.warn("Error re-scanning segment {} after truncation", segment.getFilePath(), e);
+                }
+            }
+        }
+
+        lastAppliedRaftIndex.set(newMaxRaftIndex);
+        globalOffset.set(newMaxOffset + 1);
+
+        logger.info("Partial atomic batch recovery complete. lastAppliedRaftIndex decremented to {}, globalOffset set to {}",
+                newMaxRaftIndex, globalOffset.get());
+
+        cleanupAllAtomicDoneMarkers();
+    }
+
+    /**
+     * Write a completion marker file for a successfully applied atomic batch.
+     * The marker is an empty file named .atomic-done-{raftIndex}. Its presence
+     * on recovery confirms that the atomic batch was fully applied to all topics.
+     *
+     * The marker file is always fsynced to ensure durability regardless of the
+     * log segment fsync configuration.
+     */
+    private void writeAtomicDoneMarker(long raftIndex) {
+        if (raftIndex < 0) {
+            return;
+        }
+        Path markerFile = Paths.get(config.getDataDir()).resolve(".atomic-done-" + raftIndex);
+        try {
+            Files.createFile(markerFile);
+            try (java.nio.channels.FileChannel channel = java.nio.channels.FileChannel.open(
+                    markerFile.getParent(), java.nio.file.StandardOpenOption.READ)) {
+                channel.force(true);
+            } catch (IOException e) {
+                logger.warn("Failed to fsync directory after writing completion marker for raftIndex {}", raftIndex, e);
+            }
+        } catch (IOException e) {
+            logger.error("Failed to write atomic completion marker for raftIndex {}", raftIndex, e);
+        }
+    }
+
+
+    private void cleanupAtomicDoneMarkers(long currentRaftIndex) {
+        Path dataPath = Paths.get(config.getDataDir());
+        try (java.util.stream.Stream<Path> files = Files.list(dataPath)) {
+            files.filter(p -> p.getFileName().toString().startsWith(".atomic-done-"))
+                 .forEach(p -> {
+                     try {
+                         String name = p.getFileName().toString();
+                         long markerIndex = Long.parseLong(name.substring(".atomic-done-".length()));
+                         if (markerIndex < currentRaftIndex) {
+                             Files.deleteIfExists(p);
+                         }
+                     } catch (NumberFormatException | IOException e) {
+                         logger.warn("Failed to clean up marker file: {}", p.getFileName(), e);
+                     }
+                 });
+        } catch (IOException e) {
+            logger.warn("Failed to list marker files for cleanup", e);
+        }
+    }
+
+    /**
+     * Clean up all .atomic-done-* marker files. Called during recovery after
+     * partial apply detection is complete.
+     */
+    private void cleanupAllAtomicDoneMarkers() {
+        Path dataPath = Paths.get(config.getDataDir());
+        try (java.util.stream.Stream<Path> files = Files.list(dataPath)) {
+            files.filter(p -> p.getFileName().toString().startsWith(".atomic-done-"))
+                 .forEach(p -> {
+                     try {
+                         Files.deleteIfExists(p);
+                     } catch (IOException e) {
+                         logger.warn("Failed to delete marker file: {}", p.getFileName(), e);
+                     }
+                 });
+        } catch (IOException e) {
+            logger.warn("Failed to list marker files for cleanup", e);
+        }
     }
 
     /**
@@ -506,26 +680,6 @@ public class MessageStore implements Closeable {
             }
         }
 
-        Path intentFile = Paths.get(config.getDataDir()).resolve(".atomic-intent");
-        try (java.io.FileOutputStream fos = new java.io.FileOutputStream(intentFile.toFile());
-             java.io.DataOutputStream dos = new java.io.DataOutputStream(fos)) {
-            dos.writeInt(topicMessages.size());
-            for (var entry : topicMessages.entrySet()) {
-                dos.writeUTF(entry.getKey());
-                List<StoredMessage> msgs = entry.getValue();
-                dos.writeInt(msgs.size());
-                for (StoredMessage msg : msgs) {
-                    byte[] msgBytes = msg.toByteArray();
-                    dos.writeInt(msgBytes.length);
-                    dos.write(msgBytes);
-                }
-            }
-            dos.flush();
-            fos.getFD().sync();
-        } catch (IOException e) {
-            logger.error("Failed to write atomic intent file", e);
-            throw new RuntimeException("Failed to write atomic intent file", e);
-        }
         List<String> sortedTopics = new ArrayList<>(topicMessages.keySet());
         Collections.sort(sortedTopics);
         List<java.util.concurrent.locks.ReentrantLock> acquiredLocks = new ArrayList<>();
@@ -547,16 +701,9 @@ public class MessageStore implements Closeable {
                 }
                 positions = segment.appendBatch(messages);
 
-                AtomicLong counter = topicMessageCounts.computeIfAbsent(topic, k -> new AtomicLong());
-                AtomicLong head = topicHeadOffsets.computeIfAbsent(topic, k -> new AtomicLong(-1));
                 for (int i = 0; i < messages.size(); i++) {
                     StoredMessage msg = messages.get(i);
                     indexMessage(topic, msg.getOffset(), positions.get(i));
-                    addToCache(topic, msg);
-                    counter.incrementAndGet();
-                    if (msg.getOffset() > head.get()) {
-                        head.set(msg.getOffset());
-                    }
                 }
                 logger.debug("Atomic batch slice persisted: topic={}, baseOffset={}, count={}", topic, topicBaseOffsets.get(topic), messages.size());
             }
@@ -568,11 +715,31 @@ public class MessageStore implements Closeable {
                 acquiredLocks.get(i).unlock();
             }
         }
-        try {
-            Files.deleteIfExists(intentFile);
-        } catch (IOException e) {
-            logger.warn("Failed to delete atomic intent file", e);
+
+        // Write completion marker AFTER all segments are durably written.
+        // Its presence on recovery confirms the atomic batch was fully applied.
+        writeAtomicDoneMarker(raftIndex);
+
+        // NOW make the messages visible to consumers
+        for (var entry : topicMessages.entrySet()) {
+            String topic = entry.getKey();
+            List<StoredMessage> messages = entry.getValue();
+            AtomicLong counter = topicMessageCounts.computeIfAbsent(topic, k -> new AtomicLong());
+            AtomicLong head = topicHeadOffsets.computeIfAbsent(topic, k -> new AtomicLong(-1));
+            
+            for (StoredMessage msg : messages) {
+                addToCache(topic, msg);
+            }
+            counter.addAndGet(messages.size());
+            
+            if (!messages.isEmpty()) {
+                long maxOffset = messages.get(messages.size() - 1).getOffset();
+                head.updateAndGet(current -> Math.max(current, maxOffset));
+            }
         }
+
+        // Clean up old markers from previous atomic batches
+        cleanupAtomicDoneMarkers(raftIndex);
 
         synchronized (messageMonitor) {
             messageSignal.incrementAndGet();
@@ -627,6 +794,12 @@ public class MessageStore implements Closeable {
      * Get a message by topic and offset.
      */
     public StoredMessage getMessage(String topic, long offset) {
+        AtomicLong headRef = topicHeadOffsets.get(topic);
+        long head = headRef != null ? headRef.get() : -1L;
+        if (offset > head) {
+            return null;
+        }
+
         BoundedMessageCache cache = messageCache.get(topic);
         if (cache != null) {
             StoredMessage msg = cache.get(offset);
@@ -675,11 +848,18 @@ public class MessageStore implements Closeable {
         if (maxCount <= 0) {
             return Collections.emptyList();
         }
+
+        AtomicLong headRef = topicHeadOffsets.get(topic);
+        long head = headRef != null ? headRef.get() : -1L;
+        if (fromOffset > head) {
+            return Collections.emptyList();
+        }
         
         List<StoredMessage> cachedMessages = Collections.emptyList();
         BoundedMessageCache cache = messageCache.get(topic);
         if (cache != null) {
             cachedMessages = cache.getMessagesFrom(fromOffset, maxCount);
+            cachedMessages.removeIf(m -> m.getOffset() > head);
             if (cachedMessages.size() >= maxCount) {
                 return cachedMessages;
             }
@@ -733,6 +913,9 @@ public class MessageStore implements Closeable {
                 
                 while (position < segmentSize && diskResult.size() < maxCount) {
                     StoredMessage message = segment.read(position);
+                    if (message.getOffset() > head) {
+                        break; // Stop reading beyond head
+                    }
                     if (message.getOffset() >= currentOffset) {
                         diskResult.add(message);
                         currentOffset = message.getOffset() + 1;

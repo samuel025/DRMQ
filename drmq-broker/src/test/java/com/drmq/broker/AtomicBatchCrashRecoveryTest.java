@@ -16,20 +16,27 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Integration tests for atomic batch crash-recovery.
+ * Integration tests for atomic batch crash-recovery using completion markers.
  *
- * Two distinct recovery paths are tested:
+ * The recovery mechanism uses post-write .atomic-done-{raftIndex} marker files.
+ * After all topic segments in an atomic batch are durably written, a marker file
+ * is created. On recovery, if the highest raftIndex in the segments does NOT
+ * have a corresponding marker, the apply was partial and must be truncated so
+ * Raft re-applies the entry.
  *
- *  Scenario A — Crashed node (e.g. old leader) restarts:
- *    The .atomic-intent file exists on disk because the node crashed after
- *    writing the intent file but before finishing all topic-log writes.
- *    MessageStore.recover() must complete the partial write idempotently.
+ * Two distinct recovery scenarios are tested:
+ *
+ *  Scenario A — Crashed node (partial apply):
+ *    The node crashed after writing some (but not all) topic segments for an
+ *    atomic batch. No .atomic-done marker exists because the marker is written
+ *    after all segments. Recovery detects the missing marker, truncates the
+ *    partially-written messages, and decrements lastAppliedRaftIndex so Raft
+ *    will re-apply the entry.
  *
  *  Scenario B — New leader re-applies from Raft log:
  *    The new leader has the committed ATOMIC_BATCH entry in its Raft log but
- *    has never seen the intent file (it lives only on the crashed node).
- *    It must be able to apply the entry cleanly via appendAtomicBatch(), as
- *    though it is the first time, arriving at the same result as Scenario A.
+ *    has never applied it locally. It must be able to apply the entry cleanly
+ *    via appendAtomicBatch(), which writes all segments and then the marker.
  */
 class AtomicBatchCrashRecoveryTest {
 
@@ -75,108 +82,26 @@ class AtomicBatchCrashRecoveryTest {
         return new MessageStore(logManager, new BrokerConfig(9092, dir.toString()));
     }
 
-    /**
-     * Write a .atomic-intent file for the given slices at baseOffset,
-     * mirroring the exact binary format used by appendAtomicBatch().
-     * This simulates what is on disk after a crash between writing the intent
-     * file and finishing the topic-log writes.
-     */
-    private void writeIntentFile(Path dataDir, List<AtomicBatchTopicSlice> slices, long baseOffset)
-            throws IOException {
-        long currentOffset = baseOffset;
-        java.util.Map<String, List<StoredMessage>> topicMessages = new java.util.LinkedHashMap<>();
-        for (AtomicBatchTopicSlice slice : slices) {
-            List<StoredMessage> msgs = topicMessages.computeIfAbsent(slice.getTopic(),
-                    k -> new java.util.ArrayList<>());
-            for (ProduceBatchRequest.BatchEntry entry : slice.getEntriesList()) {
-                msgs.add(StoredMessage.newBuilder()
-                        .setOffset(currentOffset++)
-                        .setTopic(slice.getTopic())
-                        .setPayload(entry.getPayload())
-                        .setTimestamp(entry.getClientTimestamp())
-                        .setStoredAt(System.currentTimeMillis())
-                        .setRaftIndex(42L)
-                        .build());
-            }
-        }
-
-        Path intentFile = dataDir.resolve(".atomic-intent");
-        try (FileOutputStream fos = new FileOutputStream(intentFile.toFile());
-             DataOutputStream dos = new DataOutputStream(fos)) {
-            dos.writeInt(topicMessages.size());
-            for (var entry : topicMessages.entrySet()) {
-                dos.writeUTF(entry.getKey());
-                List<StoredMessage> msgList = entry.getValue();
-                dos.writeInt(msgList.size());
-                for (StoredMessage msg : msgList) {
-                    byte[] bytes = msg.toByteArray();
-                    dos.writeInt(bytes.length);
-                    dos.write(bytes);
-                }
-            }
-            dos.flush();
-            fos.getFD().sync();
-        }
-    }
-
     // ---------------------------------------------------------------------------
-    // Scenario A: Crashed node recovers from its own intent file
+    // Scenario A: Crashed node — partial apply detected by missing marker
     // ---------------------------------------------------------------------------
 
     /**
-     * Simulates a crash immediately after the intent file was written but
-     * before any topic log was touched. All messages must be recovered.
+     * Simulates a crash after only one topic was written. The "orders" topic
+     * has messages with raftIndex=42, but "payments" does not. No .atomic-done-42
+     * marker exists. Recovery must:
+     *   1. Detect the missing marker for raftIndex 42
+     *   2. Truncate "orders" segments to remove the partial batch messages
+     *   3. Set lastAppliedRaftIndex below 42 so Raft re-applies the entry
      */
     @Test
-    void scenarioA_crashBeforeAnyTopicWrite_recoversAllMessages() throws IOException {
+    void scenarioA_crashAfterFirstTopicWrite_truncatesPartialApply() throws IOException {
         List<AtomicBatchTopicSlice> slices = buildSlices();
         long baseOffset = 0L;
+        long raftIndex = 42L;
 
-        // Simulate crash: write the intent file but write nothing to the topic logs.
-        writeIntentFile(tempDir, slices, baseOffset);
-        assertTrue(Files.exists(tempDir.resolve(".atomic-intent")),
-                "Pre-condition: intent file must be on disk before recovery");
-
-        // Node restarts — MessageStore.recover() runs.
-        MessageStore store = openStore(tempDir);
-        store.recover();
-
-        // Intent file must be deleted after successful recovery.
-        assertFalse(Files.exists(tempDir.resolve(".atomic-intent")),
-                "Intent file must be deleted after successful recovery");
-
-        // All messages must be visible.
-        assertEquals(3L, store.getCurrentOffset(), "All 3 messages must have been recovered");
-        assertEquals(2L, store.getMessageCount("orders"));
-        assertEquals(1L, store.getMessageCount("payments"));
-
-        StoredMessage order1 = store.getMessage("orders", 0);
-        assertNotNull(order1);
-        assertEquals("order-1", order1.getPayload().toStringUtf8());
-
-        StoredMessage order2 = store.getMessage("orders", 1);
-        assertNotNull(order2);
-        assertEquals("order-2", order2.getPayload().toStringUtf8());
-
-        StoredMessage payment1 = store.getMessage("payments", 2);
-        assertNotNull(payment1);
-        assertEquals("payment-1", payment1.getPayload().toStringUtf8());
-    }
-
-    /**
-     * Simulates a crash mid-write: the first topic ("orders") was fully
-     * written to disk but the second topic ("payments") was not started.
-     * Recovery must write only the missing messages, not duplicate "orders".
-     */
-    @Test
-    void scenarioA_crashAfterFirstTopicWrite_recoversOnlyMissingMessages() throws IOException {
-        List<AtomicBatchTopicSlice> slices = buildSlices();
-        long baseOffset = 0L;
-
-        // Write the intent file first (as appendAtomicBatch does).
-        writeIntentFile(tempDir, slices, baseOffset);
-
-        // Partially apply: write "orders" to the topic log, but not "payments".
+        // Partially apply: write only "orders" to the topic log, skip "payments".
+        // No completion marker is written.
         MessageStore partialStore = openStore(tempDir);
         partialStore.appendBatch("orders",
                 List.of(
@@ -187,8 +112,17 @@ class AtomicBatchCrashRecoveryTest {
                                 .setPayload(com.google.protobuf.ByteString.copyFromUtf8("order-2"))
                                 .setClientTimestamp(2000L).build()
                 ),
-                42L, baseOffset);
-        // Close without writing "payments" or deleting the intent file — simulate crash.
+                raftIndex, baseOffset);
+
+        // Verify the partial state before crash
+        assertEquals(2L, partialStore.getMessageCount("orders"));
+        assertEquals(0L, partialStore.getMessageCount("payments"));
+
+        // No marker file should exist
+        assertFalse(Files.exists(tempDir.resolve(".atomic-done-42")),
+                "No completion marker should exist for the partial apply");
+
+        // Close to simulate crash
         logManager.close();
         logManager = null;
 
@@ -196,41 +130,37 @@ class AtomicBatchCrashRecoveryTest {
         MessageStore store = openStore(tempDir);
         store.recover();
 
-        assertFalse(Files.exists(tempDir.resolve(".atomic-intent")),
-                "Intent file must be deleted after recovery");
+        // After recovery, the partial batch should be truncated.
+        // lastAppliedRaftIndex should be decremented below 42 so Raft re-applies.
+        assertTrue(store.getLastAppliedRaftIndex() < raftIndex,
+                "lastAppliedRaftIndex must be decremented below " + raftIndex +
+                        " for Raft re-apply, but was " + store.getLastAppliedRaftIndex());
 
-        // "orders" must not be duplicated.
-        assertEquals(2L, store.getMessageCount("orders"),
-                "orders must have exactly 2 messages — no duplicates");
-
-        // "payments" must now be present.
-        assertEquals(1L, store.getMessageCount("payments"),
-                "payments must have been recovered");
-
-        // Offsets must be consistent.
-        assertEquals(3L, store.getCurrentOffset());
-        assertEquals("payment-1", store.getMessage("payments", 2).getPayload().toStringUtf8());
+        // "orders" messages from the partial batch should be removed.
+        assertEquals(0L, store.getMessageCount("orders"),
+                "orders must have 0 messages after truncation of partial batch");
+        assertEquals(0L, store.getMessageCount("payments"),
+                "payments must still have 0 messages");
     }
 
     /**
-     * If the node crashed after all topic logs were written but before the
-     * intent file was deleted, recovery must be a no-op (all offsets already
-     * present) and still clean up the intent file.
+     * If the node crashed after all topic logs were written AND the completion
+     * marker was also written, recovery must be a no-op — all data is intact.
      */
     @Test
-    void scenarioA_crashAfterAllTopicWrites_noopRecoveryDeletesIntentFile() throws IOException {
+    void scenarioA_crashAfterAllWritesAndMarker_noopRecovery() throws IOException {
         List<AtomicBatchTopicSlice> slices = buildSlices();
         long baseOffset = 0L;
+        long raftIndex = 42L;
 
-        // Write the intent file.
-        writeIntentFile(tempDir, slices, baseOffset);
-
-        // Fully apply all slices to the topic logs.
+        // Fully apply all slices — this writes segments AND the marker.
         MessageStore preStore = openStore(tempDir);
-        preStore.appendAtomicBatch(slices, 42L, baseOffset);
-        // appendAtomicBatch deletes the intent file on success — re-create it
-        // to simulate a crash between the last segment fsync and the delete.
-        writeIntentFile(tempDir, slices, baseOffset);
+        preStore.appendAtomicBatch(slices, raftIndex, baseOffset);
+
+        // Verify marker exists
+        assertTrue(Files.exists(tempDir.resolve(".atomic-done-42")),
+                "Completion marker must exist after successful apply");
+
         logManager.close();
         logManager = null;
 
@@ -238,13 +168,93 @@ class AtomicBatchCrashRecoveryTest {
         MessageStore store = openStore(tempDir);
         store.recover();
 
-        assertFalse(Files.exists(tempDir.resolve(".atomic-intent")),
-                "Intent file must be deleted even when recovery is a no-op");
-
-        // Exactly the original 3 messages, no duplicates.
+        // Exactly the original 3 messages, no duplicates, no truncation.
         assertEquals(3L, store.getCurrentOffset());
         assertEquals(2L, store.getMessageCount("orders"));
         assertEquals(1L, store.getMessageCount("payments"));
+        assertEquals("order-1", store.getMessage("orders", 0).getPayload().toStringUtf8());
+        assertEquals("order-2", store.getMessage("orders", 1).getPayload().toStringUtf8());
+        assertEquals("payment-1", store.getMessage("payments", 2).getPayload().toStringUtf8());
+    }
+
+    /**
+     * Simulates a crash after all segments were written but before the completion
+     * marker was created. Recovery should truncate and Raft will re-apply.
+     */
+    @Test
+    void scenarioA_crashAfterAllWritesButBeforeMarker_truncatesForReapply() throws IOException {
+        List<AtomicBatchTopicSlice> slices = buildSlices();
+        long baseOffset = 0L;
+        long raftIndex = 42L;
+
+        // Fully apply, then delete the marker to simulate crash before marker write.
+        MessageStore preStore = openStore(tempDir);
+        preStore.appendAtomicBatch(slices, raftIndex, baseOffset);
+        // Delete the marker to simulate the crash happening before marker was written
+        Files.deleteIfExists(tempDir.resolve(".atomic-done-42"));
+
+        logManager.close();
+        logManager = null;
+
+        // Restart and recover.
+        MessageStore store = openStore(tempDir);
+        store.recover();
+
+        // Without the marker, recovery must treat this as a partial apply.
+        // It truncates all messages with raftIndex=42 so Raft can re-apply cleanly.
+        assertTrue(store.getLastAppliedRaftIndex() < raftIndex,
+                "lastAppliedRaftIndex must be decremented for Raft re-apply");
+        assertEquals(0L, store.getMessageCount("orders"),
+                "orders must be truncated");
+        assertEquals(0L, store.getMessageCount("payments"),
+                "payments must be truncated");
+    }
+
+    /**
+     * When prior messages exist from earlier Raft entries, only the partial batch
+     * at the highest raftIndex should be truncated. Earlier messages must survive.
+     */
+    @Test
+    void scenarioA_partialApplyWithPriorMessages_onlyTruncatesLatestBatch() throws IOException {
+        long priorRaftIndex = 40L;
+        long atomicRaftIndex = 42L;
+
+        MessageStore store = openStore(tempDir);
+
+        // Write some prior single-topic messages at raftIndex=40
+        store.appendBatch("orders",
+                List.of(
+                        ProduceBatchRequest.BatchEntry.newBuilder()
+                                .setPayload(com.google.protobuf.ByteString.copyFromUtf8("prior-order"))
+                                .setClientTimestamp(500L).build()
+                ),
+                priorRaftIndex, 0L);
+
+        // Now simulate a partial atomic batch at raftIndex=42 — only "orders" written
+        store.appendBatch("orders",
+                List.of(
+                        ProduceBatchRequest.BatchEntry.newBuilder()
+                                .setPayload(com.google.protobuf.ByteString.copyFromUtf8("atomic-order"))
+                                .setClientTimestamp(1000L).build()
+                ),
+                atomicRaftIndex, 1L);
+        // "payments" not written — simulating crash
+
+        logManager.close();
+        logManager = null;
+
+        // Restart and recover
+        store = openStore(tempDir);
+        store.recover();
+
+        // The prior message at raftIndex=40 must survive
+        assertEquals(1L, store.getMessageCount("orders"),
+                "Prior orders message at raftIndex=40 must survive");
+        assertEquals("prior-order", store.getMessage("orders", 0).getPayload().toStringUtf8());
+
+        // lastAppliedRaftIndex should be 40 (the prior entry), not 42
+        assertEquals(priorRaftIndex, store.getLastAppliedRaftIndex(),
+                "lastAppliedRaftIndex must be decremented to the prior entry");
     }
 
     // ---------------------------------------------------------------------------
@@ -252,28 +262,24 @@ class AtomicBatchCrashRecoveryTest {
     // ---------------------------------------------------------------------------
 
     /**
-     * The new leader never had an intent file. It holds the committed
-     * ATOMIC_BATCH entry in its own Raft log and calls appendAtomicBatch()
+     * The new leader never had any partial state. It holds the committed
+     * ATOMIC_BATCH entry in its Raft log and calls appendAtomicBatch()
      * directly, as RaftNode.applyCommitted() does. This must produce the
-     * same result as Scenario A without requiring the intent file at all.
+     * correct result and write a completion marker.
      */
     @Test
-    void scenarioB_newLeaderAppliesFromRaftLog_noIntentFileRequired() throws IOException {
+    void scenarioB_newLeaderAppliesFromRaftLog_writesMarker() throws IOException {
         List<AtomicBatchTopicSlice> slices = buildSlices();
         long baseOffset = 0L;
         long raftIndex = 42L;
-
-        // No intent file exists on this node — it was never the writer.
-        assertFalse(Files.exists(tempDir.resolve(".atomic-intent")),
-                "Pre-condition: new leader must not have an intent file");
 
         // New leader opens its store and applies the committed Raft entry.
         MessageStore store = openStore(tempDir);
         Map<String, Long> offsets = store.appendAtomicBatch(slices, raftIndex, baseOffset);
 
-        // The intent file is created then immediately deleted by appendAtomicBatch on success.
-        assertFalse(Files.exists(tempDir.resolve(".atomic-intent")),
-                "Intent file must be cleaned up after successful apply");
+        // Completion marker must exist after successful apply.
+        assertTrue(Files.exists(tempDir.resolve(".atomic-done-42")),
+                "Completion marker must be written after successful apply");
 
         // All messages present with correct offsets.
         assertEquals(2, offsets.size());
@@ -286,9 +292,8 @@ class AtomicBatchCrashRecoveryTest {
     }
 
     /**
-     * Proves that Scenario A (crashed node) and Scenario B (new leader) converge
-     * on the exact same durable state for the same Raft-committed operation,
-     * even though they took completely different code paths to get there.
+     * Proves that Scenario A (crashed node with marker) and Scenario B (new leader)
+     * converge on the exact same durable state for the same Raft-committed operation.
      */
     @Test
     void scenarioAandB_produceIdenticalDurableState() throws IOException {
@@ -296,13 +301,12 @@ class AtomicBatchCrashRecoveryTest {
         long baseOffset = 0L;
         long raftIndex = 42L;
 
-        // --- Scenario A: crashed node path ---
-        Path dirA = tempDir.resolve("node-crashed");
+        // --- Scenario A: fully applied with marker, then restart ---
+        Path dirA = tempDir.resolve("node-with-marker");
         Files.createDirectories(dirA);
-        writeIntentFile(dirA, slices, baseOffset);
         LogManager lmA = new LogManager(dirA.toString());
         MessageStore storeA = new MessageStore(lmA, new BrokerConfig(9092, dirA.toString()));
-        storeA.recover();
+        storeA.appendAtomicBatch(slices, raftIndex, baseOffset);
         lmA.close();
 
         // --- Scenario B: new leader path ---
@@ -328,15 +332,14 @@ class AtomicBatchCrashRecoveryTest {
             assertEquals(recoveredA.getMessageCount("orders"),  recoveredB.getMessageCount("orders"));
             assertEquals(recoveredA.getMessageCount("payments"), recoveredB.getMessageCount("payments"));
 
-            long[][] topicOffsets = {{0, 1}, {2}};   // orders: 0,1  payments: 2
             String[] topics = {"orders", "orders", "payments"};
             long[] offsets  = {0, 1, 2};
 
             for (int i = 0; i < offsets.length; i++) {
                 StoredMessage mA = recoveredA.getMessage(topics[i], offsets[i]);
                 StoredMessage mB = recoveredB.getMessage(topics[i], offsets[i]);
-                assertNotNull(mA, "Crashed node must have message at offset " + offsets[i]);
-                assertNotNull(mB, "New leader must have message at offset " + offsets[i]);
+                assertNotNull(mA, "Node A must have message at offset " + offsets[i]);
+                assertNotNull(mB, "Node B must have message at offset " + offsets[i]);
                 assertEquals(mA.getPayload(), mB.getPayload(),
                         "Payload at offset " + offsets[i] + " must be identical on both nodes");
                 assertEquals(mA.getOffset(), mB.getOffset(),
@@ -346,5 +349,52 @@ class AtomicBatchCrashRecoveryTest {
             lmA2.close();
             lmB2.close();
         }
+    }
+
+    /**
+     * Verifies that old completion markers are cleaned up after a new atomic
+     * batch is applied, preventing marker file accumulation.
+     */
+    @Test
+    void markerCleanup_oldMarkersRemovedAfterNewBatch() throws IOException {
+        List<AtomicBatchTopicSlice> slices = buildSlices();
+
+        MessageStore store = openStore(tempDir);
+
+        // Apply first atomic batch at raftIndex=10
+        store.appendAtomicBatch(slices, 10L, 0L);
+        assertTrue(Files.exists(tempDir.resolve(".atomic-done-10")),
+                "Marker for raftIndex 10 must exist");
+
+        // Apply second atomic batch at raftIndex=20
+        store.appendAtomicBatch(slices, 20L, 3L);
+        assertTrue(Files.exists(tempDir.resolve(".atomic-done-20")),
+                "Marker for raftIndex 20 must exist");
+        assertFalse(Files.exists(tempDir.resolve(".atomic-done-10")),
+                "Old marker for raftIndex 10 must be cleaned up");
+    }
+
+    /**
+     * In no-raft mode (raftIndex = -1), no completion markers should be written.
+     */
+    @Test
+    void noRaftMode_noMarkerWritten() throws IOException {
+        List<AtomicBatchTopicSlice> slices = buildSlices();
+
+        MessageStore store = openStore(tempDir);
+        store.appendAtomicBatch(slices, -1L);
+
+        // No marker files should exist
+        try (var files = Files.list(tempDir)) {
+            long markerCount = files
+                    .filter(p -> p.getFileName().toString().startsWith(".atomic-done-"))
+                    .count();
+            assertEquals(0L, markerCount, "No markers should be written in no-raft mode");
+        }
+
+        // Messages should still be written correctly
+        assertEquals(3L, store.getCurrentOffset());
+        assertEquals(2L, store.getMessageCount("orders"));
+        assertEquals(1L, store.getMessageCount("payments"));
     }
 }
