@@ -1,0 +1,171 @@
+syntax = "proto3";
+
+package com.drmq.protocol;
+
+option go_package = "github.com/drmq/drmq-go-client/protocol";
+
+message ProduceRequest {
+    string topic = 1;
+    bytes payload = 2;
+    optional string key = 3;
+    int64 timestamp = 4;
+}
+
+message ProduceResponse {
+    bool success = 1;
+    int64 offset = 2;          
+    string error_message = 3;
+    ErrorCode error_code = 4;
+}
+message ProduceBatchRequest {
+    string topic = 1;
+
+    message BatchEntry {
+        bytes payload = 1;
+        optional string key = 2;
+        int64 client_timestamp = 3;
+    }
+
+    repeated BatchEntry entries = 2;
+}
+
+message ProduceBatchResponse {
+    bool success = 1;
+    int64 base_offset = 2;  
+    int32 count = 3;          
+    string error_message = 4; 
+    ErrorCode error_code = 5;
+}
+
+message AtomicBatchTopicSlice {
+    string topic = 1;
+    repeated ProduceBatchRequest.BatchEntry entries = 2;
+}
+message AtomicBatchRequest {
+    repeated AtomicBatchTopicSlice slices = 1;
+}
+message AtomicProduceRequest {
+    repeated AtomicBatchTopicSlice slices = 1;
+}
+message AtomicProduceResponse {
+    bool success = 1;
+    map<string, int64> base_offsets = 2; 
+    string error_message = 3;
+    ErrorCode error_code = 4;
+}
+
+message StoredMessage {
+    int64 offset = 1;
+    string topic = 2;
+    bytes payload = 3;
+    optional string key = 4;
+    int64 timestamp = 5;     
+    int64 stored_at = 6;     
+    int64 raft_index = 7;
+}
+
+message ConsumeRequest {
+    string topic = 1;
+    int64 from_offset = 2;  
+    int32 max_messages = 3;   
+    int64 timeout_ms = 4;    
+    optional string consumer_group = 5; 
+    optional string consumer_id = 6; 
+}
+
+message ConsumeResponse {
+    bool success = 1;
+    repeated StoredMessage messages = 2; 
+    string error_message = 3;           
+}
+
+message CommitOffsetRequest {
+    string consumer_group = 1;
+    string topic = 2;
+    int64 offset = 3;   
+    optional string consumer_id = 4;  
+}
+
+message CommitOffsetResponse {
+    bool success = 1;
+    string error_message = 2;
+}
+message FetchOffsetRequest {
+    string consumer_group = 1;
+    string topic = 2;
+}
+
+message FetchOffsetResponse {
+    bool success = 1;
+    int64 offset = 2;         
+    string error_message = 3;
+}
+
+message SearchOffsetByTimeRequest {
+    string topic = 1;
+    int64 timestamp = 2;      
+}
+
+message SearchOffsetByTimeResponse {
+    bool success = 1;
+    int64 offset = 2;         
+    string error_message = 3;
+}
+
+message NackRequest {
+    string consumer_group = 1;
+    string topic = 2;
+    int64 offset = 3;                  
+    optional string consumer_id = 4;   
+}
+
+message NackResponse {
+    bool success = 1;
+    bool routed_to_dlq = 2;            
+    string error_message = 3;
+}
+
+message MessageEnvelope {
+    MessageType type = 1;
+    bytes payload = 2; 
+    int64 correlation_id = 3;
+}
+
+enum MessageType {
+    UNKNOWN = 0;
+    PRODUCE_REQUEST = 1;
+    PRODUCE_RESPONSE = 2;
+    CONSUME_REQUEST = 3;
+    CONSUME_RESPONSE = 4;
+    HEARTBEAT = 5;
+    COMMIT_OFFSET_REQUEST = 6;
+    COMMIT_OFFSET_RESPONSE = 7;
+    FETCH_OFFSET_REQUEST = 8;
+    FETCH_OFFSET_RESPONSE = 9;
+    REQUEST_VOTE_REQUEST = 10;
+    REQUEST_VOTE_RESPONSE = 11;
+    APPEND_ENTRIES_REQUEST = 12;
+    APPEND_ENTRIES_RESPONSE = 13;
+    PRE_VOTE_REQUEST = 14;
+    PRE_VOTE_RESPONSE = 15;
+    NACK_REQUEST = 18;
+    NACK_RESPONSE = 19;
+    PRODUCE_BATCH_REQUEST = 20;
+    PRODUCE_BATCH_RESPONSE = 21;
+    SEARCH_OFFSET_BY_TIME_REQUEST = 22;
+    SEARCH_OFFSET_BY_TIME_RESPONSE = 23;
+    ATOMIC_PRODUCE_REQUEST = 24;
+    ATOMIC_PRODUCE_RESPONSE = 25;
+    REQUEST_TOPIC_OFFSETS_REQUEST = 26;
+    REQUEST_TOPIC_OFFSETS_RESPONSE = 27;
+    INCREMENTAL_SNAPSHOT_CHUNK = 28;
+    INCREMENTAL_SNAPSHOT_CHUNK_RESPONSE = 29;
+    INCREMENTAL_SNAPSHOT_DONE_REQUEST = 30;
+    INCREMENTAL_SNAPSHOT_DONE_RESPONSE = 31;
+}
+
+enum ErrorCode {
+    NONE = 0;
+    NOT_LEADER = 1;
+    UNKNOWN_ERROR = 99;
+}

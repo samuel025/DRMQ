@@ -59,7 +59,7 @@ public class MessageStore implements Closeable {
     private final ConcurrentHashMap<String, BoundedMessageCache> messageCache = new ConcurrentHashMap<>();
     
     // Per-topic locks for append synchronization
-    private final ConcurrentHashMap<String, java.util.concurrent.locks.ReentrantLock> topicLocks = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, ReentrantLock> topicLocks = new ConcurrentHashMap<>();
     
     private static final int MAX_CACHE_SIZE_PER_TOPIC = 1000;
     private static final int INDEX_INTERVAL = 1000;
@@ -152,12 +152,6 @@ public class MessageStore implements Closeable {
                 }
             }
         }
-
-        // --- Atomic batch partial-apply detection via completion markers ---
-        // Each successful appendAtomicBatch() writes a .atomic-done-{raftIndex} marker
-        // after all topic segments are durably written. If the highest raftIndex seen
-        // in the segments does NOT have a corresponding marker, the apply was partial
-        // and we must truncate back so Raft re-applies the entry cleanly.
         recoverPartialAtomicBatch(maxOffset);
 
         globalOffset.set(maxOffset + 1);
@@ -166,25 +160,11 @@ public class MessageStore implements Closeable {
 
     /**
      * Detect and recover from a partially-applied atomic batch.
-     *
-     * After scanning all segments during recovery, the highest raftIndex found in
-     * stored messages may belong to an atomic batch that was only partially written
-     * (e.g. Topic A written, crash before Topic B). We detect this by checking for
-     * a corresponding .atomic-done-{raftIndex} completion marker.
-     *
-     * If the marker is missing:
-     *   1. Truncate all topic segments that contain messages with that raftIndex.
-     *   2. Decrement lastAppliedRaftIndex so Raft will re-apply the entry.
-     *   3. Recalculate maxOffset from the remaining messages.
-     *
-     * If the marker is present, the batch was fully applied — clean up old markers.
-     *
      * @param maxOffset the highest offset discovered during segment scanning
      */
     private void recoverPartialAtomicBatch(long maxOffset) {
         long highestRaftIndex = lastAppliedRaftIndex.get();
         if (highestRaftIndex < 0) {
-            // No messages found during recovery — nothing to check.
             cleanupAllAtomicDoneMarkers();
             return;
         }
@@ -193,14 +173,9 @@ public class MessageStore implements Closeable {
         Path markerFile = dataPath.resolve(".atomic-done-" + highestRaftIndex);
 
         if (Files.exists(markerFile)) {
-            // The atomic batch (if any) at this raftIndex was fully applied.
-            // Clean up all markers and proceed normally.
             cleanupAllAtomicDoneMarkers();
             return;
         }
-
-        // No completion marker for the highest raftIndex. Check if any topics
-        // have messages at this raftIndex — if so, the apply was partial.
         Map<String, ConcurrentSkipListMap<Long, LogSegment>> allSegments = logManager.getAllSegments();
         boolean foundPartial = false;
         List<String> affectedTopics = new ArrayList<>();
@@ -227,19 +202,12 @@ public class MessageStore implements Closeable {
                 }
             }
         }
-
         if (!foundPartial) {
-            // No messages with this raftIndex exist — the raftIndex was derived from
-            // a non-atomic write (single or batch), which doesn't need a marker.
             cleanupAllAtomicDoneMarkers();
             return;
         }
-
-        // Partial atomic batch detected. Truncate messages with this raftIndex
-        // from all affected topics.
         logger.warn("Partial atomic batch detected at raftIndex {}. Truncating affected topics: {}",
                 highestRaftIndex, affectedTopics);
-
         long newMaxOffset = -1;
         long newMaxRaftIndex = -1;
 
@@ -254,12 +222,9 @@ public class MessageStore implements Closeable {
                     while (position < segmentSize) {
                         StoredMessage message = segment.read(position);
                         if (message.getRaftIndex() == highestRaftIndex) {
-                            // Found the first message belonging to the partial batch —
-                            // truncate from here.
                             truncateAt = position;
                             break;
                         }
-                        // Track the highest offset/raftIndex of messages we're keeping
                         if (message.getOffset() > newMaxOffset) {
                             newMaxOffset = message.getOffset();
                         }
@@ -274,7 +239,6 @@ public class MessageStore implements Closeable {
                                 segment.getFilePath().getFileName(), topic, truncateAt, highestRaftIndex);
                         segment.truncate(truncateAt);
                     } else {
-                        // Segment doesn't contain the partial batch — scan for maxOffset tracking
                         position = 0;
                         segmentSize = segment.getSize();
                         while (position < segmentSize) {
@@ -293,15 +257,11 @@ public class MessageStore implements Closeable {
                 }
             }
         }
-
-        // Reset in-memory state to reflect the truncation.
-        // Clear and rebuild indexes, caches, and counters from the now-truncated segments.
         topicIndex.clear();
         topicMessageCounts.clear();
         topicHeadOffsets.clear();
         messageCache.clear();
 
-        // Re-scan segments to rebuild indexes after truncation
         for (Map.Entry<String, ConcurrentSkipListMap<Long, LogSegment>> entry : allSegments.entrySet()) {
             String topic = entry.getKey();
             for (LogSegment segment : entry.getValue().values()) {
@@ -336,11 +296,6 @@ public class MessageStore implements Closeable {
 
     /**
      * Write a completion marker file for a successfully applied atomic batch.
-     * The marker is an empty file named .atomic-done-{raftIndex}. Its presence
-     * on recovery confirms that the atomic batch was fully applied to all topics.
-     *
-     * The marker file is always fsynced to ensure durability regardless of the
-     * log segment fsync configuration.
      */
     private void writeAtomicDoneMarker(long raftIndex) {
         if (raftIndex < 0) {
@@ -381,10 +336,6 @@ public class MessageStore implements Closeable {
         }
     }
 
-    /**
-     * Clean up all .atomic-done-* marker files. Called during recovery after
-     * partial apply detection is complete.
-     */
     private void cleanupAllAtomicDoneMarkers() {
         Path dataPath = Paths.get(config.getDataDir());
         try (java.util.stream.Stream<Path> files = Files.list(dataPath)) {
@@ -682,9 +633,9 @@ public class MessageStore implements Closeable {
 
         List<String> sortedTopics = new ArrayList<>(topicMessages.keySet());
         Collections.sort(sortedTopics);
-        List<java.util.concurrent.locks.ReentrantLock> acquiredLocks = new ArrayList<>();
+        List<ReentrantLock> acquiredLocks = new ArrayList<>();
         for (String t : sortedTopics) {
-            java.util.concurrent.locks.ReentrantLock tLock = topicLocks.computeIfAbsent(t, k -> new java.util.concurrent.locks.ReentrantLock());
+            ReentrantLock tLock = topicLocks.computeIfAbsent(t, k -> new ReentrantLock());
             tLock.lock();
             acquiredLocks.add(tLock);
         }
@@ -715,12 +666,7 @@ public class MessageStore implements Closeable {
                 acquiredLocks.get(i).unlock();
             }
         }
-
-        // Write completion marker AFTER all segments are durably written.
-        // Its presence on recovery confirms the atomic batch was fully applied.
         writeAtomicDoneMarker(raftIndex);
-
-        // NOW make the messages visible to consumers
         for (var entry : topicMessages.entrySet()) {
             String topic = entry.getKey();
             List<StoredMessage> messages = entry.getValue();
@@ -738,7 +684,6 @@ public class MessageStore implements Closeable {
             }
         }
 
-        // Clean up old markers from previous atomic batches
         cleanupAtomicDoneMarkers(raftIndex);
 
         synchronized (messageMonitor) {
@@ -760,9 +705,9 @@ public class MessageStore implements Closeable {
         List<String> sortedTopics = new ArrayList<>(topicLocks.keySet());
         Collections.sort(sortedTopics);
         
-        List<java.util.concurrent.locks.ReentrantLock> acquired = new ArrayList<>();
+        List<ReentrantLock> acquired = new ArrayList<>();
         for (String t : sortedTopics) {
-            java.util.concurrent.locks.ReentrantLock lock = topicLocks.get(t);
+            ReentrantLock lock = topicLocks.get(t);
             if (lock != null) {
                 lock.lock();
                 acquired.add(lock);
@@ -1044,7 +989,6 @@ public class MessageStore implements Closeable {
                 paths.add(seg.getFilePath());
             }
         } else {
-            // followerOffset is before the oldest segment we have, so send all
             for (LogSegment seg : segments.values()) {
                 paths.add(seg.getFilePath());
             }
@@ -1102,7 +1046,6 @@ public class MessageStore implements Closeable {
             String topic = entry.getKey();
             ConcurrentSkipListMap<Long, LogSegment> segments = entry.getValue();
             
-            // Never delete the currently active (last) segment
             if (segments.size() <= 1) continue;
             
             Long activeBaseOffset = segments.lastKey();
@@ -1110,8 +1053,7 @@ public class MessageStore implements Closeable {
             List<Long> toDelete = new ArrayList<>();
             for (Map.Entry<Long, LogSegment> segEntry : segments.entrySet()) {
                 long baseOffset = segEntry.getKey();
-                if (baseOffset == activeBaseOffset) continue; // Skip active
-                
+                if (baseOffset == activeBaseOffset) continue; 
                 LogSegment segment = segEntry.getValue();
                 try {
                     if (segment.getLastModified() < cutoffTime) {
