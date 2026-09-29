@@ -32,7 +32,7 @@ The project is structured as a multi-module Maven build, separating the core bro
 ## Key Features
 
 - **Scalable Consumer Groups:** Scale your consumers dynamically without the complexity of partitions. Simply start multiple consumers with the same group name, and the broker will automatically distribute messages among them. Messages are load-balanced across consumers in a group with at-least-once delivery; a lease-based protocol ensures that uncommitted messages are redelivered if a consumer fails. Need to replay or read specific messages? Switch to single mode for full manual offset control.
-- **Cross-Topic Atomic Transactions:** Produce messages to multiple distinct topics in a single, atomic operation. Guaranteed to commit or fail as a single unit at the Raft consensus level, avoiding the overhead of external two-phase commit coordinators (like Kafka's transaction API). Supported natively in Java, Python, and TypeScript clients.
+- **Cross-Topic Atomic Transactions:** Produce messages to multiple distinct topics in a single, atomic operation. Guaranteed to commit or fail as a single unit at the Raft consensus level, avoiding the overhead of external two-phase commit coordinators (like Kafka's transaction API). Supported natively in Java, Go, Python, and TypeScript clients.
 - **Advanced Raft Consensus:** Full implementation of the Raft protocol with robust stability extensions:
   - **Pre-Vote:** Prevents returning partitioned followers with artificially inflated terms from disrupting a healthy leader.
   - **Quorum-Loss Stepdown:** Detects network partitions and immediately demotes isolated leaders, preventing split-brain scenarios and ensuring clients aren't writing to dead-end nodes.
@@ -45,7 +45,7 @@ The project is structured as a multi-module Maven build, separating the core bro
   - **Client-Side Batching:** Producers feature high-throughput, latency-optimized message batching via a configurable `linger.ms` window. This groups thousands of messages into a single network round-trip and Raft log flush.
   - **Configurable Disk Durability:** By default, DRMQ guarantees strict flush-before-ack durability (`fsync`). However, administrators can explicitly disable this for extreme throughput scenarios where hardware page-cache flushing is acceptable.
   - **Follower-based Reads:** Scalable read operations allowing consumers to fetch messages from follower nodes, distributing the load across the cluster.
-- **Robust Client Ecosystem:** Includes Java, Python, and TypeScript SDKs featuring automatic reconnects, randomized bootstrap load balancing, typed Error Code handling, and seamless leader failovers.
+- **Robust Client Ecosystem:** Includes Java, Go, Python, and TypeScript SDKs featuring automatic reconnects, randomized bootstrap load balancing, typed Error Code handling, and seamless leader failovers.
 - **Real-Time Telemetry Dashboard:** Integrated React/Vite dashboard connecting to the broker via WebSockets, providing real-time metrics on Raft status, throughput, offset lag, and system health.
 
 ## Architecture & Modules
@@ -309,6 +309,70 @@ await consumer.subscribe("ts-topic");
 const messages = await consumer.poll(10, 5000);
 for (const msg of messages) {
   console.log(`Received: ${Buffer.from(msg.payload).toString('utf-8')}`);
+}
+```
+
+### Go Client (SDK)
+
+A native Go client (`github.com/drmq/drmq-go-client`) featuring goroutine-safe asynchronous batching, cluster failovers, consumer groups, and cross-topic atomicity.
+
+**Producer & Atomic Example:**
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+    "time"
+
+    drmq "github.com/drmq/drmq-go-client"
+)
+
+producer, err := drmq.NewProducer(drmq.ProducerConfig{
+    BootstrapServers: "localhost:9092,localhost:9093",
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer producer.Close()
+producer.Connect()
+
+// Standard (Async future)
+future := producer.SendString("go-topic", "Hello from Go!")
+res, _ := future.GetWithTimeout(5 * time.Second)
+fmt.Printf("Sent at offset: %d\n", res.Offset)
+
+// Cross-Topic Atomic Batch
+atomicFuture := producer.SendAtomic(map[string][]byte{
+    "topic-A": []byte("Event A"),
+    "topic-B": []byte("Event B"),
+})
+offsets, _ := atomicFuture.GetWithTimeout(5 * time.Second)
+fmt.Println("Atomic commit offsets:", offsets)
+```
+
+**Consumer Example:**
+```go
+consumer, err := drmq.NewConsumer(drmq.ConsumerConfig{
+    BootstrapServers: "localhost:9092,localhost:9093",
+    ConsumerGroup:    "go-workers",
+    AutoCommit:       true,
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer consumer.Close()
+consumer.Connect()
+consumer.Subscribe("go-topic")
+
+for {
+    messages, err := consumer.PollWithOptions(10, 5000)
+    if err != nil {
+        continue
+    }
+    for _, msg := range messages {
+        fmt.Printf("Received: %s\n", msg.PayloadAsString())
+    }
 }
 ```
 
