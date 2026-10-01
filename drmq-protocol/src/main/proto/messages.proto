@@ -4,45 +4,269 @@ package com.drmq.protocol;
 
 option java_package = "com.drmq.protocol";
 option java_outer_classname = "DRMQProtocol";
-option java_multiple_files = false;
+option java_multiple_files = true;
 
-// Request to produce a message to a topic
 message ProduceRequest {
     string topic = 1;
     bytes payload = 2;
-    optional string key = 3;  // Optional message key for partitioning (future use)
-    int64 timestamp = 4;      // Client-side timestamp
+    optional string key = 3;
+    int64 timestamp = 4;
 }
 
-// Response after producing a message
 message ProduceResponse {
     bool success = 1;
-    int64 offset = 2;         // Assigned offset if successful
-    string error_message = 3; // Error details if failed
+    int64 offset = 2;          
+    string error_message = 3;
+    ErrorCode error_code = 4;
+}
+message ProduceBatchRequest {
+    string topic = 1;
+
+    message BatchEntry {
+        bytes payload = 1;
+        optional string key = 2;
+        int64 client_timestamp = 3;
+    }
+
+    repeated BatchEntry entries = 2;
 }
 
-// Internal message representation stored in the broker
+message ProduceBatchResponse {
+    bool success = 1;
+    int64 base_offset = 2;  
+    int32 count = 3;          
+    string error_message = 4; 
+    ErrorCode error_code = 5;
+}
+
+message AtomicBatchTopicSlice {
+    string topic = 1;
+    repeated ProduceBatchRequest.BatchEntry entries = 2;
+}
+message AtomicBatchRequest {
+    repeated AtomicBatchTopicSlice slices = 1;
+}
+message AtomicProduceRequest {
+    repeated AtomicBatchTopicSlice slices = 1;
+}
+message AtomicProduceResponse {
+    bool success = 1;
+    map<string, int64> base_offsets = 2; 
+    string error_message = 3;
+    ErrorCode error_code = 4;
+}
+
 message StoredMessage {
     int64 offset = 1;
     string topic = 2;
     bytes payload = 3;
     optional string key = 4;
-    int64 timestamp = 5;      // Original client timestamp
-    int64 stored_at = 6;      // Broker storage timestamp
+    int64 timestamp = 5;     
+    int64 stored_at = 6;     
+    int64 raft_index = 7;
 }
 
-// Envelope for TCP framing - wraps all messages with type info
+message ConsumeRequest {
+    string topic = 1;
+    int64 from_offset = 2;  
+    int32 max_messages = 3;   
+    int64 timeout_ms = 4;    
+    optional string consumer_group = 5; 
+    optional string consumer_id = 6; 
+}
+
+message ConsumeResponse {
+    bool success = 1;
+    repeated StoredMessage messages = 2; 
+    string error_message = 3;           
+}
+
+message CommitOffsetRequest {
+    string consumer_group = 1;
+    string topic = 2;
+    int64 offset = 3;   
+    optional string consumer_id = 4;  
+}
+
+message CommitOffsetResponse {
+    bool success = 1;
+    string error_message = 2;
+}
+message FetchOffsetRequest {
+    string consumer_group = 1;
+    string topic = 2;
+}
+
+message FetchOffsetResponse {
+    bool success = 1;
+    int64 offset = 2;         
+    string error_message = 3;
+}
+
+message SearchOffsetByTimeRequest {
+    string topic = 1;
+    int64 timestamp = 2;      
+}
+
+message SearchOffsetByTimeResponse {
+    bool success = 1;
+    int64 offset = 2;         
+    string error_message = 3;
+}
+
+message NackRequest {
+    string consumer_group = 1;
+    string topic = 2;
+    int64 offset = 3;                  
+    optional string consumer_id = 4;   
+}
+
+message NackResponse {
+    bool success = 1;
+    bool routed_to_dlq = 2;            
+    string error_message = 3;
+}
+
 message MessageEnvelope {
     MessageType type = 1;
-    bytes payload = 2;  // Serialized inner message
+    bytes payload = 2; 
+    int64 correlation_id = 3;  // Client-assigned ID to match requests with responses in pipelined mode
+}
+
+enum RaftCommandType {
+    MESSAGE = 0;       
+    OFFSET_COMMIT = 1; 
+    BATCH_MESSAGE = 2; 
+    ATOMIC_BATCH = 3;  
+}
+
+message RaftEntry {
+    int64 term = 1;           
+    int64 index = 2;          
+    string topic = 3;         
+    bytes payload = 4;        
+    optional string key = 5;  
+    int64 timestamp = 6;      
+    RaftCommandType command_type = 7;        
+    optional string consumer_group = 8;      
+    optional int64 offset_value = 9;         
+    int64 base_offset = 10;
+}
+
+message RequestVoteRequest {
+    int64 term = 1;              
+    string candidate_id = 2;    
+    int64 last_log_index = 3;   
+    int64 last_log_term = 4;    
+}
+
+message RequestVoteResponse {
+    int64 term = 1;           
+    bool vote_granted = 2;   
+}
+
+message PreVoteRequest {
+    int64 term = 1;           
+    string candidate_id = 2;    
+    int64 last_log_index = 3;   
+    int64 last_log_term = 4;   
+}
+
+message PreVoteResponse {
+    int64 term = 1;           
+    bool vote_granted = 2;   
+}
+
+message AppendEntriesRequest {
+    int64 term = 1;                  
+    string leader_id = 2;            
+    int64 prev_log_index = 3;       
+    int64 prev_log_term = 4;         
+    repeated RaftEntry entries = 5;  
+    int64 leader_commit = 6;         
+}
+
+message AppendEntriesResponse {
+    int64 term = 1;           
+    bool success = 2;         
+    int64 match_index = 3;   
+}
+
+message RequestTopicOffsetsRequest {
+    int64 term = 1;
+    string leader_id = 2;
+}
+
+message RequestTopicOffsetsResponse {
+    int64 term = 1;
+    map<string, int64> topic_offsets = 2; 
+}
+
+message IncrementalSnapshotChunk {
+    int64 term = 1;
+    string leader_id = 2;
+    string topic = 3;
+    string file_name = 4;        
+    int64 file_offset = 5;       
+    bytes data = 6;
+    bool is_last_chunk_for_file = 7;
+}
+
+message IncrementalSnapshotChunkResponse {
+    int64 term = 1;
+    bool success = 2;
+}
+
+message IncrementalSnapshotDoneRequest {
+    int64 term = 1;
+    string leader_id = 2;
+    int64 last_included_index = 3; 
+    int64 last_included_term = 4;
+    map<string, int64> offset_manager_state = 5;
+    map<string, int64> file_manifest = 6; // Key: topic/filename, Value: exact byte size
+}
+
+message IncrementalSnapshotDoneResponse {
+    int64 term = 1;
+    bool success = 2;
 }
 
 enum MessageType {
     UNKNOWN = 0;
     PRODUCE_REQUEST = 1;
     PRODUCE_RESPONSE = 2;
-    // Future message types
     CONSUME_REQUEST = 3;
     CONSUME_RESPONSE = 4;
     HEARTBEAT = 5;
+    COMMIT_OFFSET_REQUEST = 6;
+    COMMIT_OFFSET_RESPONSE = 7;
+    FETCH_OFFSET_REQUEST = 8;
+    FETCH_OFFSET_RESPONSE = 9;
+    REQUEST_VOTE_REQUEST = 10;
+    REQUEST_VOTE_RESPONSE = 11;
+    APPEND_ENTRIES_REQUEST = 12;
+    APPEND_ENTRIES_RESPONSE = 13;
+    PRE_VOTE_REQUEST = 14;
+    PRE_VOTE_RESPONSE = 15;
+    NACK_REQUEST = 18;
+    NACK_RESPONSE = 19;
+    PRODUCE_BATCH_REQUEST = 20;
+    PRODUCE_BATCH_RESPONSE = 21;
+    SEARCH_OFFSET_BY_TIME_REQUEST = 22;
+    SEARCH_OFFSET_BY_TIME_RESPONSE = 23;
+    ATOMIC_PRODUCE_REQUEST = 24;
+    ATOMIC_PRODUCE_RESPONSE = 25;
+    REQUEST_TOPIC_OFFSETS_REQUEST = 26;
+    REQUEST_TOPIC_OFFSETS_RESPONSE = 27;
+    INCREMENTAL_SNAPSHOT_CHUNK = 28;
+    INCREMENTAL_SNAPSHOT_CHUNK_RESPONSE = 29;
+    INCREMENTAL_SNAPSHOT_DONE_REQUEST = 30;
+    INCREMENTAL_SNAPSHOT_DONE_RESPONSE = 31;
+}
+
+// --- Standard Error Codes ---
+enum ErrorCode {
+    NONE = 0;
+    NOT_LEADER = 1;
+    UNKNOWN_ERROR = 99;
 }

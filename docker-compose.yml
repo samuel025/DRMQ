@@ -1,0 +1,50 @@
+services:
+  # DRMQ Standalone Broker
+  drmq:
+    image: ${DRMQ_IMAGE:-0xuell/drmq:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: drmq
+    restart: unless-stopped
+    ports:
+      - "9092:9092"   # Broker TCP (Client connection)
+      - "9096:9096"   # Prometheus Metrics HTTP
+      - "9292:9292"   # Telemetry WebSocket (PORT + 200)
+      - "9392:9392"   # Admin HTTP Server (PORT + 300)
+    environment:
+      NODE_ID: "standalone"
+      PORT: "9092"
+      DATA_DIR: "/data"
+      METRICS_ENABLED: "true"
+      METRICS_PORT: "9096"
+      METRICS_PATH: "/metrics"
+      LOG_SEGMENT_FSYNC: "false"
+      RAFT_FSYNC_ENABLED: "true"
+      JAVA_OPTS: "-Xms256m -Xmx1g -XX:+UseG1GC"
+    volumes:
+      - drmq-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9096/metrics/summary || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Optional Real-Time Telemetry Dashboard
+  dashboard:
+    image: ${DASHBOARD_IMAGE:-0xuell/drmq-dashboard:latest}
+    build:
+      context: ./drmq-dashboard
+      dockerfile: Dockerfile
+    container_name: drmq-dashboard
+    restart: unless-stopped
+    ports:
+      - "${DASHBOARD_PORT:-8088}:80"
+    depends_on:
+      drmq:
+        condition: service_healthy
+
+volumes:
+  drmq-data:
+    driver: local

@@ -1,89 +1,215 @@
 package com.drmq.broker;
 
+import com.drmq.broker.persistence.LogManager;
+import com.drmq.broker.raft.RaftNode;
+import com.drmq.broker.raft.RaftPeer;
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.channel.*;
+import io.netty.channel.group.ChannelGroup;
+import io.netty.channel.group.DefaultChannelGroup;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
+import io.netty.handler.codec.LengthFieldPrepender;
+import io.netty.util.concurrent.DefaultEventExecutorGroup;
+import io.netty.util.concurrent.EventExecutorGroup;
+import io.netty.util.concurrent.GlobalEventExecutor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.net.ServerSocket;
-import java.net.Socket;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
-/**
- * DRMQ Broker Server - TCP server accepting producer connections.
- * 
- * Uses a thread pool to handle concurrent client connections.
- * Each connection is managed by a ClientHandler.
- */
+
 public class BrokerServer {
     private static final Logger logger = LoggerFactory.getLogger(BrokerServer.class);
 
     public static final int DEFAULT_PORT = 9092;
-    public static final int DEFAULT_THREAD_POOL_SIZE = 10;
+    public static final int DEFAULT_THREAD_POOL_SIZE = 100;
+    public static final String DEFAULT_DATA_DIR = "./data";
 
-    private final int port;
-    private final ExecutorService executor;
+    private final BrokerConfig config;
     private final MessageStore messageStore;
-    private final List<ClientHandler> activeHandlers = new ArrayList<>();
+    private final LogManager logManager;
+    private final OffsetManager offsetManager;
+    private final ConsumerGroupCoordinator groupCoordinator;
+    private final RaftNode raftNode;       
+    private final List<RaftPeer> raftPeers; 
+    private final BrokerMetrics metrics;
+    private TelemetryWebSocketServer telemetryServer;
+    private AdminHttpServer adminHttpServer;
 
-    private ServerSocket serverSocket;
     private volatile boolean running = false;
+    
+    private EventLoopGroup bossGroup;
+    private EventLoopGroup workerGroup;
+    private EventExecutorGroup businessGroup;
+    private Channel serverChannel;
+    private final ChannelGroup activeChannels = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
+    private final ThreadPoolExecutor rpcExecutor;
 
-    public BrokerServer(int port, int threadPoolSize) {
-        this.port = port;
-        this.executor = Executors.newFixedThreadPool(threadPoolSize);
-        this.messageStore = new MessageStore();
+    public BrokerServer(BrokerConfig config) throws IOException {
+        this.config = config;
+
+        // Automatically recover and activate any pending Tier-2 snapshots if the broker crashed during activation
+        com.drmq.broker.raft.SnapshotManager.activateSnapshot(Paths.get(config.getDataDir()));
+
+        this.logManager = new LogManager(config);
+        this.messageStore = new MessageStore(logManager, config);
+        this.offsetManager = new OffsetManager(config.getDataDir());
+        this.raftPeers = new ArrayList<>();
+        this.metrics = BrokerMetrics.init(config);
+        
+        int rpcThreadCount = Math.max(4, Runtime.getRuntime().availableProcessors());
+        AtomicInteger rpcThreadId = new AtomicInteger(1);
+        this.rpcExecutor = new ThreadPoolExecutor(
+                rpcThreadCount,
+                rpcThreadCount,
+                0L,
+                TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(1000),
+                r -> {
+                    Thread t = new Thread(r, "raft-rpc-handler-" + config.getPort() + "-" + rpcThreadId.getAndIncrement());
+                    t.setDaemon(true);
+                    return t;
+                },
+                new ThreadPoolExecutor.AbortPolicy());
+
+        if (config.isClusterMode()) {
+            this.raftNode = new RaftNode(
+                    config.getNodeId(),
+                    config.getAdvertisedHost(),
+                    config.getPort(),
+                    config.getPeers(),
+                    messageStore,
+                    offsetManager,
+                    Paths.get(config.getDataDir()),
+                    config.getRaftCompactThreshold(),
+                    config.isRaftFsyncEnabled()
+            );
+
+            // Pipeline connection pool size — must match RaftNode.MAX_INFLIGHT_RPCS
+            final int APPEND_POOL_SIZE = 4;
+
+            for (BrokerConfig.PeerAddress peer : config.getPeers()) {
+                RaftPeer raftPeer = new RaftPeer(peer);
+                raftPeers.add(raftPeer);
+                raftNode.registerVoteHandler(peer.id(), raftPeer::sendRequestVote);
+                raftNode.registerPreVoteHandler(peer.id(), raftPeer::sendPreVote);
+                raftNode.registerRequestTopicOffsetsHandler(peer.id(), raftPeer::sendRequestTopicOffsets);
+                raftNode.registerIncrementalSnapshotChunkHandler(peer.id(), raftPeer::sendIncrementalSnapshotChunk);
+                raftNode.registerIncrementalSnapshotDoneHandler(peer.id(), raftPeer::sendIncrementalSnapshotDone);
+                raftNode.registerHeartbeatHandler(peer.id(), raftPeer::sendAppendEntries);
+                for (int i = 0; i < APPEND_POOL_SIZE; i++) {
+                    RaftPeer appendPeer = new RaftPeer(peer);
+                    raftPeers.add(appendPeer); 
+                    raftNode.registerAppendHandler(peer.id(), appendPeer::sendAppendEntries);
+                }
+            }
+
+            logger.info("Cluster mode: nodeId={}, peers={}", config.getNodeId(), config.getPeers());
+        } else {
+            this.raftNode = null;
+            logger.info("Single-node mode (no Raft)");
+        }
+
+        this.groupCoordinator = new ConsumerGroupCoordinator(messageStore, offsetManager,
+                raftNode, ConsumerGroupCoordinator.DEFAULT_LEASE_TIMEOUT_MS,
+                config.getMaxDeliveries(), config.getDlqTopicPrefix());
+
+        metrics.registerBroker(activeChannels::size, messageStore, offsetManager, logManager, raftNode);
     }
 
-    public BrokerServer() {
+    public BrokerServer(int port, int threadPoolSize, String dataDir) throws IOException {
+        this(new BrokerConfig(port, dataDir));
+    }
+
+    public BrokerServer(int port, int threadPoolSize) throws IOException {
+        this(port, threadPoolSize, DEFAULT_DATA_DIR);
+    }
+
+    public BrokerServer() throws IOException {
         this(DEFAULT_PORT, DEFAULT_THREAD_POOL_SIZE);
     }
 
-    /**
-     * Start the broker server. Blocks until shutdown.
-     */
+    public int getActiveChannelsCount() {
+        return activeChannels != null ? activeChannels.size() : 0;
+    }
+
     public void start() throws IOException {
-        serverSocket = new ServerSocket(port);
-        running = true;
+        try {
+            messageStore.recover();
+        } catch (IOException e) {
+            logger.error("Failed to recover message store: {}", e.getMessage());
+            throw e;
+        }
 
-        logger.info("DRMQ Broker started on port {}", port);
+        metrics.start();
 
-        while (running) {
-            try {
-                Socket clientSocket = serverSocket.accept();
-                ClientHandler handler = new ClientHandler(clientSocket, messageStore);
-                
-                synchronized (activeHandlers) {
-                    activeHandlers.add(handler);
-                }
-                
-                executor.submit(handler);
-            } catch (IOException e) {
-                if (running) {
-                    logger.error("Error accepting connection", e);
-                }
+        bossGroup = new NioEventLoopGroup(1);
+        workerGroup = new NioEventLoopGroup();
+        businessGroup = new DefaultEventExecutorGroup(DEFAULT_THREAD_POOL_SIZE);
+
+        try {
+            ServerBootstrap b = new ServerBootstrap();
+            b.group(bossGroup, workerGroup)
+             .channel(NioServerSocketChannel.class)
+             .childOption(ChannelOption.SO_KEEPALIVE, true)
+             .childOption(ChannelOption.TCP_NODELAY, true)
+             .childHandler(new ChannelInitializer<SocketChannel>() {
+                 @Override
+                 public void initChannel(SocketChannel ch) {
+                     ChannelPipeline p = ch.pipeline();
+                     p.addLast(new LengthFieldBasedFrameDecoder(256 * 1024 * 1024, 0, 4, 0, 4));
+                     p.addLast(new LengthFieldPrepender(4));
+                     p.addLast(businessGroup, "clientHandler", new ClientHandler(messageStore, offsetManager, raftNode, activeChannels, groupCoordinator, rpcExecutor));
+                 }
+             });
+
+            ChannelFuture f = b.bind(config.getPort()).sync();
+            serverChannel = f.channel();
+            running = true;
+
+            if (raftNode != null) {
+                raftNode.start();
             }
+            int wsPort = config.getWsPort();
+            telemetryServer = new TelemetryWebSocketServer(wsPort, this);
+            telemetryServer.start();
+
+            int adminPort = config.getPort() + 300;
+            adminHttpServer = new AdminHttpServer(adminPort, messageStore, offsetManager, groupCoordinator);
+            adminHttpServer.start();
+
+            logger.info("DRMQ Broker started on port {} with data directory {}",
+                    config.getPort(), config.getDataDir());
+
+            serverChannel.closeFuture().sync();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            shutdown();
         }
     }
 
-    /**
-     * Start the broker in a background thread.
-     */
     public void startAsync() {
         Thread serverThread = new Thread(() -> {
             try {
                 start();
-            } catch (IOException e) {
+            } catch (Exception e) {
                 logger.error("Broker server error", e);
             }
         }, "broker-server");
         serverThread.setDaemon(true);
         serverThread.start();
 
-        // Wait for server to be ready
         while (!running && serverThread.isAlive()) {
             try {
                 Thread.sleep(10);
@@ -94,85 +220,94 @@ public class BrokerServer {
         }
     }
 
-    /**
-     * Gracefully shutdown the broker.
-     */
+    private final java.util.concurrent.atomic.AtomicBoolean shutdownStarted = new java.util.concurrent.atomic.AtomicBoolean(false);
+
     public void shutdown() {
-        logger.info("Shutting down broker...");
-        running = false;
-
-        // Close server socket to stop accepting new connections
-        try {
-            if (serverSocket != null && !serverSocket.isClosed()) {
-                serverSocket.close();
-            }
-        } catch (IOException e) {
-            logger.debug("Error closing server socket", e);
+        if (!shutdownStarted.compareAndSet(false, true)) return;
+        logger.info("Shutting down Netty broker...");
+        if (raftNode != null) {
+            raftNode.stop();
+        }
+        if (telemetryServer != null) {
+            telemetryServer.shutdown();
+        }
+        if (adminHttpServer != null) {
+            adminHttpServer.stop();
         }
 
-        // Stop all active handlers
-        synchronized (activeHandlers) {
-            for (ClientHandler handler : activeHandlers) {
-                handler.stop();
-            }
-            activeHandlers.clear();
+        if (activeChannels != null) {
+            activeChannels.close().awaitUninterruptibly();
         }
 
-        // Shutdown executor
-        executor.shutdown();
+        if (serverChannel != null) {
+            serverChannel.close().awaitUninterruptibly();
+        }
+
+        if (bossGroup != null) bossGroup.shutdownGracefully();
+        if (workerGroup != null) workerGroup.shutdownGracefully();
+        if (businessGroup != null) businessGroup.shutdownGracefully();
+
         try {
-            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
-                executor.shutdownNow();
-            }
+            if (bossGroup != null) bossGroup.terminationFuture().await();
+            if (workerGroup != null) workerGroup.terminationFuture().await();
+            if (businessGroup != null) businessGroup.terminationFuture().await();
         } catch (InterruptedException e) {
-            executor.shutdownNow();
             Thread.currentThread().interrupt();
         }
 
-        logger.info("Broker shutdown complete");
-    }
-
-    /**
-     * Check if the broker is running.
-     */
-    public boolean isRunning() {
-        return running;
-    }
-
-    /**
-     * Get the message store (for testing).
-     */
-    public MessageStore getMessageStore() {
-        return messageStore;
-    }
-
-    /**
-     * Get the port the broker is listening on.
-     */
-    public int getPort() {
-        return port;
-    }
-
-    /**
-     * Main entry point.
-     */
-    public static void main(String[] args) {
-        int port = DEFAULT_PORT;
-        if (args.length > 0) {
+        if (rpcExecutor != null) {
+            rpcExecutor.shutdown();
             try {
-                port = Integer.parseInt(args[0]);
-            } catch (NumberFormatException e) {
-                System.err.println("Invalid port number: " + args[0]);
-                System.exit(1);
+                if (!rpcExecutor.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                    rpcExecutor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                rpcExecutor.shutdownNow();
+                Thread.currentThread().interrupt();
             }
         }
 
-        BrokerServer broker = new BrokerServer(port, DEFAULT_THREAD_POOL_SIZE);
-
-        // Add shutdown hook for graceful shutdown
-        Runtime.getRuntime().addShutdownHook(new Thread(broker::shutdown));
+        if (raftPeers != null) {
+            for (RaftPeer peer : raftPeers) {
+                peer.close();
+            }
+        }
 
         try {
+            if (logManager != null) logManager.close();
+        } catch (IOException e) {
+            logger.error("Error closing log manager", e);
+        }
+
+        try {
+            if (offsetManager != null) offsetManager.close();
+        } catch (IOException e) {
+            logger.error("Error closing offset manager", e);
+        }
+
+        if (groupCoordinator != null) {
+            groupCoordinator.close();
+        }
+
+        logger.info("Broker shutdown complete");
+        if (metrics != null) {
+            metrics.close();
+        }
+        running = false;
+    }
+
+    public boolean isRunning() { return running; }
+    public BrokerConfig getConfig() { return config; }
+    public MessageStore getMessageStore() { return messageStore; }
+    public int getPort() { return config.getPort(); }
+    public int getWsPort() { return config.getWsPort(); }
+    public RaftNode getRaftNode() { return raftNode; }
+
+    public static void main(String[] args) {
+        BrokerConfig config = BrokerConfig.fromArgs(args);
+        try {
+            BrokerServer broker = new BrokerServer(config);
+            Runtime.getRuntime().addShutdownHook(new Thread(broker::shutdown));
             broker.start();
         } catch (IOException e) {
             logger.error("Failed to start broker", e);

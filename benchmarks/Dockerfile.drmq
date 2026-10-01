@@ -1,0 +1,9 @@
+FROM maven:3.9-eclipse-temurin-21-alpine
+
+# Maven + deps only — compilation happens on host
+WORKDIR /app
+
+COPY benchmarks/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+ENTRYPOINT ["docker-entrypoint.sh"]

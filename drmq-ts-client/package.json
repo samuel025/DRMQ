@@ -1,0 +1,17 @@
+{
+  "name": "drmq-ts-client",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@types/node": "^25.9.3",
+    "ts-proto": "^2.11.8",
+    "typescript": "^6.0.3"
+  }
+}

@@ -1,0 +1,103 @@
+services:
+  drmq-1:
+    image: ${DRMQ_IMAGE:-0xuell/drmq:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: drmq-1
+    restart: unless-stopped
+    ports:
+      - "9092:9092"   # Broker TCP & Raft
+      - "9096:9096"   # Prometheus Metrics
+      - "9292:9292"   # Telemetry WebSocket
+      - "9392:9392"   # Admin HTTP
+    environment:
+      NODE_ID: "1"
+      PORT: "9092"
+      DATA_DIR: "/data"
+      PEERS: "2:drmq-2:9092,3:drmq-3:9092"
+      METRICS_ENABLED: "true"
+      METRICS_PORT: "9096"
+      RAFT_FSYNC_ENABLED: "true"
+      JAVA_OPTS: "-Xms256m -Xmx1g -XX:+UseG1GC"
+    volumes:
+      - drmq-data-1:/data
+    networks:
+      - drmq-net
+
+  drmq-2:
+    image: ${DRMQ_IMAGE:-0xuell/drmq:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: drmq-2
+    restart: unless-stopped
+    ports:
+      - "9093:9092"   # Broker TCP & Raft
+      - "9097:9096"   # Prometheus Metrics
+      - "9293:9292"   # Telemetry WebSocket
+      - "9393:9392"   # Admin HTTP
+    environment:
+      NODE_ID: "2"
+      PORT: "9092"
+      DATA_DIR: "/data"
+      PEERS: "1:drmq-1:9092,3:drmq-3:9092"
+      METRICS_ENABLED: "true"
+      METRICS_PORT: "9096"
+      RAFT_FSYNC_ENABLED: "true"
+      JAVA_OPTS: "-Xms256m -Xmx1g -XX:+UseG1GC"
+    volumes:
+      - drmq-data-2:/data
+    networks:
+      - drmq-net
+
+  drmq-3:
+    image: ${DRMQ_IMAGE:-0xuell/drmq:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: drmq-3
+    restart: unless-stopped
+    ports:
+      - "9094:9092"   # Broker TCP & Raft
+      - "9098:9096"   # Prometheus Metrics
+      - "9294:9292"   # Telemetry WebSocket
+      - "9394:9392"   # Admin HTTP
+    environment:
+      NODE_ID: "3"
+      PORT: "9092"
+      DATA_DIR: "/data"
+      PEERS: "1:drmq-1:9092,2:drmq-2:9092"
+      METRICS_ENABLED: "true"
+      METRICS_PORT: "9096"
+      RAFT_FSYNC_ENABLED: "true"
+      JAVA_OPTS: "-Xms256m -Xmx1g -XX:+UseG1GC"
+    volumes:
+      - drmq-data-3:/data
+    networks:
+      - drmq-net
+
+  dashboard:
+    image: ${DASHBOARD_IMAGE:-0xuell/drmq-dashboard:latest}
+    build:
+      context: ./drmq-dashboard
+      dockerfile: Dockerfile
+    container_name: drmq-cluster-dashboard
+    restart: unless-stopped
+    ports:
+      - "${DASHBOARD_PORT:-8088}:80"
+    networks:
+      - drmq-net
+    depends_on:
+      - drmq-1
+      - drmq-2
+      - drmq-3
+
+networks:
+  drmq-net:
+    driver: bridge
+
+volumes:
+  drmq-data-1:
+  drmq-data-2:
+  drmq-data-3:
