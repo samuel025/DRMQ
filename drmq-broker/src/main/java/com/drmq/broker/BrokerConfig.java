@@ -27,6 +27,8 @@ public class BrokerConfig {
     private final long raftCompactThreshold;
     private final int maxDeliveries;
     private final String dlqTopicPrefix;
+    private final String advertisedHost;
+    private final int wsPort;
     private final boolean logSegmentFsync;
     private final boolean raftFsyncEnabled;
     private final String s3ArchiveBucket;
@@ -37,7 +39,7 @@ public class BrokerConfig {
                         boolean metricsEnabled, int metricsPort, String metricsPath,
                         long logSegmentBytes, long logRetentionMs, long raftCompactThreshold,
                         int maxDeliveries, String dlqTopicPrefix) {
-        this(nodeId, port, dataDir, peers, metricsEnabled, metricsPort, metricsPath,
+        this(nodeId, "localhost", port, (port > 0 ? port + 200 : 9292), dataDir, peers, metricsEnabled, metricsPort, metricsPath,
              logSegmentBytes, logRetentionMs, raftCompactThreshold, maxDeliveries, dlqTopicPrefix, false, true, null, null, null);
     }
 
@@ -46,8 +48,20 @@ public class BrokerConfig {
                         long logSegmentBytes, long logRetentionMs, long raftCompactThreshold,
                         int maxDeliveries, String dlqTopicPrefix, boolean logSegmentFsync, boolean raftFsyncEnabled,
                         String s3ArchiveBucket, String s3ArchiveRegion, String s3ArchiveEndpoint) {
+        this(nodeId, "localhost", port, (port > 0 ? port + 200 : 9292), dataDir, peers, metricsEnabled, metricsPort, metricsPath,
+             logSegmentBytes, logRetentionMs, raftCompactThreshold, maxDeliveries, dlqTopicPrefix, logSegmentFsync, raftFsyncEnabled,
+             s3ArchiveBucket, s3ArchiveRegion, s3ArchiveEndpoint);
+    }
+
+    public BrokerConfig(String nodeId, String advertisedHost, int port, int wsPort, String dataDir, List<PeerAddress> peers,
+                        boolean metricsEnabled, int metricsPort, String metricsPath,
+                        long logSegmentBytes, long logRetentionMs, long raftCompactThreshold,
+                        int maxDeliveries, String dlqTopicPrefix, boolean logSegmentFsync, boolean raftFsyncEnabled,
+                        String s3ArchiveBucket, String s3ArchiveRegion, String s3ArchiveEndpoint) {
         this.nodeId = nodeId;
+        this.advertisedHost = (advertisedHost != null && !advertisedHost.isBlank()) ? advertisedHost.trim() : "localhost";
         this.port = port;
+        this.wsPort = wsPort > 0 ? wsPort : (port > 0 ? port + 200 : 9292);
         this.dataDir = dataDir;
         this.peers = peers != null ? peers : List.of();
         this.metricsEnabled = metricsEnabled;
@@ -66,18 +80,20 @@ public class BrokerConfig {
     }
 
     public BrokerConfig(String nodeId, int port, String dataDir, List<PeerAddress> peers) {
-        this(nodeId, port, dataDir, peers, true, 9096, "/metrics", 
+        this(nodeId, "localhost", port, (port > 0 ? port + 200 : 9292), dataDir, peers, true, 9096, "/metrics", 
              100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.", false, true, null, null, null);
     }
 
     /** Single-node config (backward compatible) */
     public BrokerConfig(int port, String dataDir) {
-        this("standalone", port, dataDir, List.of(), true, 9096, "/metrics",
+        this("standalone", "localhost", port, (port > 0 ? port + 200 : 9292), dataDir, List.of(), true, 9096, "/metrics",
              100 * 1024 * 1024L, 7L * 24 * 60 * 60 * 1000, 1000L, 5, "dlq.", false, true, null, null, null);
     }
 
     public String getNodeId() { return nodeId; }
+    public String getAdvertisedHost() { return advertisedHost; }
     public int getPort() { return port; }
+    public int getWsPort() { return wsPort; }
     public String getDataDir() { return dataDir; }
     public List<PeerAddress> getPeers() { return peers; }
     public boolean isMetricsEnabled() { return metricsEnabled; }
@@ -136,7 +152,9 @@ public class BrokerConfig {
      */
     public static BrokerConfig fromArgs(String[] args) {
         String nodeId = "standalone";
+        String advertisedHost = "localhost";
         int port = BrokerServer.DEFAULT_PORT;
+        int wsPort = 0;
         String dataDir = BrokerServer.DEFAULT_DATA_DIR;
         List<PeerAddress> peers = new ArrayList<>();
         boolean metricsEnabled = true;
@@ -169,7 +187,10 @@ public class BrokerConfig {
                 throw new RuntimeException("Failed to load config file: " + configFilePath, e);
             }
             if (props.containsKey("node.id")) nodeId = props.getProperty("node.id");
+            if (props.containsKey("host")) advertisedHost = props.getProperty("host");
+            if (props.containsKey("advertised.host")) advertisedHost = props.getProperty("advertised.host");
             if (props.containsKey("port")) port = Integer.parseInt(props.getProperty("port"));
+            if (props.containsKey("ws.port")) wsPort = Integer.parseInt(props.getProperty("ws.port"));
             if (props.containsKey("data.dir")) dataDir = props.getProperty("data.dir");
             if (props.containsKey("peers")) {
                 for (String peerStr : props.getProperty("peers").split(",")) {
@@ -195,7 +216,9 @@ public class BrokerConfig {
             switch (args[i]) {
                 case "--config" -> i++; 
                 case "--id", "--node-id" -> nodeId = args[++i];
+                case "--host", "--advertised-host" -> advertisedHost = requireValue(args, ++i, args[i - 1]);
                 case "--port" -> port = Integer.parseInt(args[++i]);
+                case "--ws-port" -> wsPort = parsePortArg(args, ++i, "--ws-port");
                 case "--data-dir" -> dataDir = args[++i];
                 case "--peers" -> {
                     peers.clear(); 
@@ -232,7 +255,7 @@ public class BrokerConfig {
             }
         }
 
-        return new BrokerConfig(nodeId, port, dataDir, peers, metricsEnabled, metricsPort, metricsPath,
+        return new BrokerConfig(nodeId, advertisedHost, port, wsPort, dataDir, peers, metricsEnabled, metricsPort, metricsPath,
                                 logSegmentBytes, logRetentionMs, raftCompactThreshold,
                                 maxDeliveries, dlqTopicPrefix, logSegmentFsync, raftFsyncEnabled, s3ArchiveBucket, s3ArchiveRegion, s3ArchiveEndpoint);
     }

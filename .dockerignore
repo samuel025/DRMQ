@@ -1,0 +1,15 @@
+.git
+.agents
+.agent
+.idea
+.vscode
+**/target
+data-*
+test-run-data
+benchmarks/run.log
+benchmarks/stress_test.log
+drmq-dashboard/node_modules
+drmq-dashboard/dist
+drmq-go-client/bin
+drmq-python-client/__pycache__
+drmq-python-client/*.egg-info

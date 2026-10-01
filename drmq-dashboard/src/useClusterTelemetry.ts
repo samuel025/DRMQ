@@ -16,11 +16,22 @@ export function useClusterTelemetry() {
     onDataRef.current = onData;
     onErrorRef.current = onError;
 
-    const useWebSocket = import.meta.env.VITE_USE_WEBSOCKET === 'true';
-    if (useWebSocket) {
-      const defaultUrls = 'ws://localhost:9292,ws://localhost:9293,ws://localhost:9294';
-      const wsUrlsString = import.meta.env.VITE_WEBSOCKET_URLS || defaultUrls;
-      const wsUrls = wsUrlsString.split(',').map((u: string) => u.trim());
+    const searchParams = new URLSearchParams(window.location.search);
+    const queryWs = searchParams.get('ws');
+    const storedWs = typeof localStorage !== 'undefined' ? localStorage.getItem('drmq_ws_urls') : null;
+
+    // Save custom ws URL to localStorage if provided via ?ws=
+    if (queryWs && typeof localStorage !== 'undefined') {
+      localStorage.setItem('drmq_ws_urls', queryWs);
+    }
+
+    // Default to true for WebSocket unless explicitly mock
+    const useMock = import.meta.env.VITE_USE_MOCK === 'true' || import.meta.env.VITE_USE_WEBSOCKET === 'false';
+    if (!useMock) {
+      const host = window.location.hostname || 'localhost';
+      const defaultUrls = `ws://${host}:9292,ws://${host}:9293,ws://${host}:9294`;
+      const wsUrlsString = queryWs || storedWs || import.meta.env.VITE_WEBSOCKET_URLS || defaultUrls;
+      const wsUrls = wsUrlsString.split(',').map((u: string) => u.trim()).filter(Boolean);
       providerRef.current = new WebSocketTelemetryProvider(wsUrls);
     } else {
       providerRef.current = new MockTelemetryProvider();

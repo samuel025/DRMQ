@@ -100,6 +100,28 @@ export class WebSocketTelemetryProvider implements TelemetryProvider {
         try {
           const frame = JSON.parse(event.data) as TelemetryState;
           this.latestFrames.set(url, frame);
+
+          // Auto-discover any cluster peers reported in the telemetry frame
+          if (frame.nodes && Array.isArray(frame.nodes) && !this.stopped) {
+            for (const node of frame.nodes) {
+              const peerWsUrl = (node as any).wsUrl;
+              if (peerWsUrl && !this.sockets.has(peerWsUrl)) {
+                let targetUrl = peerWsUrl;
+                try {
+                  const parsed = new URL(peerWsUrl);
+                  if (parsed.hostname === 'localhost' && typeof window !== 'undefined' && window.location.hostname && window.location.hostname !== 'localhost') {
+                    parsed.hostname = window.location.hostname;
+                    targetUrl = parsed.toString();
+                  }
+                } catch (_) {}
+                if (!this.sockets.has(targetUrl)) {
+                  console.log(`[DRMQ] Auto-discovered peer at ${targetUrl}, connecting...`);
+                  this.openSocket(targetUrl);
+                }
+              }
+            }
+          }
+
           this.onDataCallback(this.merge());
         } catch (e) {
           console.error('[DRMQ] Failed to parse telemetry', e);

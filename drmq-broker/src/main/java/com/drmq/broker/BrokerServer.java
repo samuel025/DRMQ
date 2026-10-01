@@ -85,6 +85,7 @@ public class BrokerServer {
         if (config.isClusterMode()) {
             this.raftNode = new RaftNode(
                     config.getNodeId(),
+                    config.getAdvertisedHost(),
                     config.getPort(),
                     config.getPeers(),
                     messageStore,
@@ -179,7 +180,7 @@ public class BrokerServer {
             if (raftNode != null) {
                 raftNode.start();
             }
-            int wsPort = config.getPort() + 200;
+            int wsPort = config.getWsPort();
             telemetryServer = new TelemetryWebSocketServer(wsPort, this);
             telemetryServer.start();
 
@@ -296,8 +297,10 @@ public class BrokerServer {
     }
 
     public boolean isRunning() { return running; }
+    public BrokerConfig getConfig() { return config; }
     public MessageStore getMessageStore() { return messageStore; }
     public int getPort() { return config.getPort(); }
+    public int getWsPort() { return config.getWsPort(); }
     public RaftNode getRaftNode() { return raftNode; }
 
     public static void main(String[] args) {

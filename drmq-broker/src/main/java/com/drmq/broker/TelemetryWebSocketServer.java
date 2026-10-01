@@ -317,10 +317,18 @@ public class TelemetryWebSocketServer extends WebSocketServer {
         String localId = raftNode != null ? raftNode.getNodeId() : "local";
         String localStatus = raftNode != null ? raftNode.getState().name() : "LEADER";
 
+        String localHost = brokerServer.getConfig() != null ? brokerServer.getConfig().getAdvertisedHost() : "localhost";
+        int localPort = brokerServer.getPort();
+        int localWsPort = getPort();
+
         JsonObject localNode = new JsonObject();
         localNode.addProperty("id",         localId);
         localNode.addProperty("name",       "Broker-" + localId.toUpperCase());
         localNode.addProperty("status",     localStatus);
+        localNode.addProperty("host",       localHost);
+        localNode.addProperty("port",       localPort);
+        localNode.addProperty("wsPort",     localWsPort);
+        localNode.addProperty("wsUrl",      "ws://" + localHost + ":" + localWsPort);
         // throughput in bytes/s for this node (real produce traffic it handled)
         localNode.addProperty("throughputMBps", round4(currentProduceMBps + currentConsumeMBps));
         localNode.addProperty("produceRate",    Math.round(currentProduceRecordRate));
@@ -374,9 +382,18 @@ public class TelemetryWebSocketServer extends WebSocketServer {
                     }
                 }
 
+                BrokerConfig.PeerAddress peerAddr = raftNode.getPeerAddress(peerId);
+                String peerHost = peerAddr != null ? peerAddr.host() : "localhost";
+                int peerPort = peerAddr != null ? peerAddr.port() : 9092;
+                int peerWsPort = peerPort + 200;
+
                 peerNode.addProperty("id",              peerId);
                 peerNode.addProperty("name",            "Broker-" + peerId.toUpperCase());
                 peerNode.addProperty("status",          peerStatus);
+                peerNode.addProperty("host",            peerHost);
+                peerNode.addProperty("port",            peerPort);
+                peerNode.addProperty("wsPort",          peerWsPort);
+                peerNode.addProperty("wsUrl",           "ws://" + peerHost + ":" + peerWsPort);
                 peerNode.addProperty("throughputMBps",  0.0); // peers don't share their own traffic
                 peerNode.addProperty("produceRate",     0L);
                 peerNode.addProperty("consumeRate",     0L);

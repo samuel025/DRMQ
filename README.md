@@ -1,4 +1,4 @@
-# DRMQ - Distributed Reliable Message Queue
+# DRMQ — Distributed Reliable Message Queue
 
 **Official Documentation:** [https://drmq.vercel.app](https://drmq.vercel.app)
 
@@ -58,32 +58,192 @@ The repository is divided into several Maven modules:
 - `drmq-integration-tests`: Rigorous end-to-end benchmark and latency testing suites.
 - `drmq-dashboard`: React/Vite web application for real-time cluster telemetry visualization.
 
-## Prerequisites
+---
+
+## Docker (Recommended)
+
+The easiest way to run DRMQ is via Docker. Official images are published to Docker Hub:
+
+| Image | Description |
+| :--- | :--- |
+| `0xuell/drmq:latest` | The broker (JRE 21 Alpine, ~120 MB) |
+| `0xuell/drmq-dashboard:latest` | The telemetry dashboard (Nginx Alpine, ~30 MB) |
+
+### Port Reference
+
+Each broker exposes four ports derived from a single base `PORT`:
+
+| Port | Formula | Default | Purpose |
+| :--- | :--- | :--- | :--- |
+| `PORT` | base | `9092` | Client TCP connections & inter-broker Raft RPC |
+| `PORT + 200` | `wsPort` | `9292` | WebSocket telemetry (dashboard) |
+| `PORT + 300` | `adminPort` | `9392` | Admin HTTP API |
+| `METRICS_PORT` | independent | `9096` | Prometheus `/metrics` endpoint |
+
+> In cluster mode each node uses the **same internal ports** (`9092`, `9292`, etc.) and Docker maps them to different host ports (`9092`, `9093`, `9094` …). Inter-broker Raft traffic always uses the **container-internal hostname** (e.g. `drmq-1`, `drmq-2`) so peer addresses never depend on host port offsets.
+
+### Quick Start — Standalone Broker
+
+```bash
+docker run -d \
+  --name drmq \
+  -p 9092:9092 \
+  -p 9096:9096 \
+  -p 9292:9292 \
+  -p 9392:9392 \
+  -v drmq-data:/data \
+  -e NODE_ID=standalone \
+  -e PORT=9092 \
+  0xuell/drmq:latest
+```
+
+### Quick Start — Docker Compose (Standalone + Dashboard)
+
+```bash
+docker compose up -d
+```
+
+The included [`docker-compose.yml`](docker-compose.yml) starts one broker and the telemetry dashboard. Dashboard opens at **http://localhost:8088** and auto-connects to the broker's WebSocket telemetry port.
+
+### Quick Start — 3-Node Raft Cluster
+
+```bash
+docker compose -f docker-compose.cluster.yml up -d
+```
+
+The included [`docker-compose.cluster.yml`](docker-compose.cluster.yml) starts a fault-tolerant 3-node Raft cluster. Clients connect to any of the exposed broker ports and are automatically redirected to the current leader:
+
+| Node | Client Port | Metrics Port | Dashboard WS Port |
+| :--- | :--- | :--- | :--- |
+| `drmq-1` | `9092` | `9096` | `9292` |
+| `drmq-2` | `9093` | `9097` | `9293` |
+| `drmq-3` | `9094` | `9098` | `9294` |
+
+Dashboard opens at **http://localhost:8088** and fans out to all three broker WebSocket endpoints simultaneously, merging their telemetry into a single cluster view.
+
+### Broker Environment Variables
+
+All broker settings are configured via environment variables, which the `docker-entrypoint.sh` translates to CLI flags:
+
+| Variable | CLI Flag | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `NODE_ID` | `--node-id` | `standalone` | Unique node identifier |
+| `PORT` | `--port` | `9092` | Base TCP port for client connections & Raft |
+| `ADVERTISED_HOST` | `--host` | container hostname | Hostname advertised to peers (set for multi-host deployments) |
+| `WS_PORT` | `--ws-port` | `PORT + 200` | Override WebSocket telemetry port |
+| `DATA_DIR` | `--data-dir` | `/data` | Persistent data directory |
+| `PEERS` | `--peers` | _(none)_ | Peer list: `id:host:port,...` — e.g. `2:drmq-2:9092,3:drmq-3:9092` |
+| `METRICS_ENABLED` | `--metrics-enabled` | `true` | Enable Prometheus metrics endpoint |
+| `METRICS_PORT` | `--metrics-port` | `9096` | Prometheus metrics port |
+| `METRICS_PATH` | `--metrics-path` | `/metrics` | Prometheus metrics path |
+| `RAFT_FSYNC_ENABLED` | `--raft-fsync-enabled` | `true` | Fsync Raft WAL before acknowledging |
+| `LOG_SEGMENT_FSYNC` | `--log-segment-fsync` | `false` | Fsync message log segments |
+| `RAFT_COMPACT_THRESHOLD` | `--raft-compact-threshold` | `1000` | Log compaction threshold (entries) |
+| `MAX_DELIVERIES` | `--max-deliveries` | `5` | Max delivery attempts before DLQ routing |
+| `DLQ_TOPIC_PREFIX` | `--dlq-topic-prefix` | `dlq.` | Dead-letter queue topic prefix |
+| `S3_ARCHIVE_BUCKET` | `--s3-archive-bucket` | _(none)_ | S3/MinIO bucket for tiered storage |
+| `S3_ARCHIVE_REGION` | `--s3-archive-region` | `us-east-1` | AWS region for tiered storage |
+| `S3_ARCHIVE_ENDPOINT` | `--s3-archive-endpoint` | _(none)_ | Custom endpoint URL (for MinIO) |
+| `JAVA_OPTS` | _(JVM flags)_ | `-Xms256m -Xmx2g -XX:+UseG1GC` | JVM tuning flags |
+
+### Dashboard — Broker URL Configuration
+
+The dashboard resolves broker WebSocket URLs in this priority order (highest first):
+
+1. **`?ws=` query parameter** — `http://localhost:8088?ws=ws://broker1:9292,ws://broker2:9293`  
+   Persisted to `localStorage` for subsequent page loads.
+2. **`localStorage`** — Automatically populated from the last `?ws=` value.
+3. **`VITE_WEBSOCKET_URLS` build env var** — Baked in at image build time.
+4. **Auto-detect** — Falls back to `ws://{page hostname}:9292,ws://{page hostname}:9293,ws://{page hostname}:9294`.
+
+To bake in a broker URL at build time:
+
+```bash
+docker build \
+  --build-arg VITE_WEBSOCKET_URLS=ws://my-broker:9292 \
+  -t my-org/drmq-dashboard:latest \
+  ./drmq-dashboard
+```
+
+Or point the running dashboard at a custom broker at runtime:
+
+```
+http://localhost:8088?ws=ws://my-broker-host:9292
+```
+
+### Multi-Host Deployment
+
+For brokers running on different physical servers, set `ADVERTISED_HOST` to each node's externally reachable hostname or IP, and list the external addresses in `PEERS`:
+
+```yaml
+services:
+  drmq-1:
+    image: 0xuell/drmq:latest
+    ports:
+      - "9092:9092"
+      - "9096:9096"
+      - "9292:9292"
+    environment:
+      NODE_ID: "1"
+      PORT: "9092"
+      ADVERTISED_HOST: "10.0.1.10"          # this machine's IP
+      PEERS: "2:10.0.1.11:9092,3:10.0.1.12:9092"
+```
+
+Then point the dashboard at all three hosts:
+
+```
+http://dashboard-host:8088?ws=ws://10.0.1.10:9292,ws://10.0.1.11:9292,ws://10.0.1.12:9292
+```
+
+### Building & Publishing Images
+
+```bash
+# Broker — multi-arch (amd64 + arm64)
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t youruser/drmq:latest \
+  --push .
+
+# Dashboard
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t youruser/drmq-dashboard:latest \
+  --push ./drmq-dashboard
+```
+
+Set `DRMQ_IMAGE` and `DASHBOARD_IMAGE` env vars to point the compose files at your registry:
+
+```bash
+DRMQ_IMAGE=youruser/drmq:latest \
+DASHBOARD_IMAGE=youruser/drmq-dashboard:latest \
+docker compose up -d
+```
+
+---
+
+## Building From Source
+
+### Prerequisites
 
 - Java 17 or higher
 - Maven 3.8.x or higher
 
-## Building the Project
-
-To compile the project, generate the protobuf classes, and build the artifacts, run the following command from the root directory:
+To compile the project, generate the protobuf classes, and build the artifacts:
 
 ```bash
 mvn clean install
 ```
 
-## Running the Broker
+## Running the Broker (Without Docker)
 
 ### Single-Node Mode
-
-To run a standalone broker (useful for testing and development):
 
 ```bash
 ./mvnw -pl drmq-broker exec:java -Dexec.args="--port 9092 --data-dir ./data-1"
 ```
 
 ### Cluster Mode
-
-To run a fault-tolerant cluster, you must start multiple broker instances and provide them with the addresses of their peers.
 
 **Node 1:**
 ```bash
@@ -127,7 +287,9 @@ Then run the broker:
 ./mvnw -pl drmq-broker exec:java -Dexec.args="--config server.properties"
 ```
 
-## Usage Example
+---
+
+## Usage Examples
 
 ### Java Producer (Standard & Atomic Batch)
 
@@ -177,17 +339,16 @@ while (true) {
 }
 ```
 
-#### 2. Single Consumer Mode (Manual Offset Control & Replay)
+#### Single Consumer Mode (Manual Offset Control & Replay)
 
-If you need strict control over what messages you read—for example, if you want to replay messages from the beginning or start from a specific offset—you can disable group mode. In this mode, the client tells the broker exactly which offset to fetch.
+If you need strict control over what messages you read—for example, if you want to replay messages from the beginning or start from a specific offset—you can disable group mode.
 
 ```java
 try (DRMQConsumer consumer = new DRMQConsumer("localhost:9092", "my-group")) {
     consumer.setGroupMode(false); // Disable broker coordination
     consumer.connect();
     
-    // Subscribe and explicitly tell the broker to start from offset 0 (replay from the start)
-    consumer.subscribe("my-topic", 0);
+    consumer.subscribe("my-topic", 0); // Start from offset 0
 
     // Alternatively, seek by time (timestamp in milliseconds)
     // consumer.seekByTime("my-topic", System.currentTimeMillis() - 3600000); // Replay last hour
@@ -197,8 +358,6 @@ try (DRMQConsumer consumer = new DRMQConsumer("localhost:9092", "my-group")) {
         for (DRMQConsumer.ConsumedMessage msg : messages) {
             System.out.printf("Replaying (offset %d): %s\n", msg.offset(), msg.payloadAsString());
         }
-        
-        // In Single consumer mode, you must manually commit the offset if you want the broker to remember where you stopped
         if (!messages.isEmpty()) {
             long lastOffset = messages.get(messages.size() - 1).offset();
             consumer.commit("my-topic", lastOffset + 1);
@@ -209,9 +368,9 @@ try (DRMQConsumer consumer = new DRMQConsumer("localhost:9092", "my-group")) {
 }
 ```
 
-#### 3. Dead-Letter Queues (DLQ) & Explicit NACK
+#### Dead-Letter Queues (DLQ) & Explicit NACK
 
-If a consumer encounters a "poison pill" (a message that always causes a crash or fails validation), it can explicitly reject it using `nack()`. If a message fails too many times (default 5), the broker will automatically route it to a DLQ topic (e.g., `dlq.my-group.my-topic`) so it doesn't block the rest of the queue.
+If a consumer encounters a "poison pill", it can explicitly reject it using `nack()`. After a configurable threshold of delivery failures (default 5), the broker automatically routes the message to a DLQ topic (e.g., `dlq.my-group.my-topic`).
 
 ```java
 try (DRMQConsumer consumer = new DRMQConsumer("localhost:9092", "order-processors")) {
@@ -222,10 +381,9 @@ try (DRMQConsumer consumer = new DRMQConsumer("localhost:9092", "order-processor
         List<DRMQConsumer.ConsumedMessage> messages = consumer.poll();
         for (DRMQConsumer.ConsumedMessage msg : messages) {
             try {
-                processOrder(msg); // Your business logic
+                processOrder(msg);
                 consumer.commit("orders", msg.offset() + 1); 
             } catch (Exception e) {
-                // Explicitly reject the message on failure
                 boolean routedToDlq = consumer.nack("orders", msg.offset());
                 if (routedToDlq) {
                     System.err.println("Poison pill routed to DLQ: " + msg.offset());
@@ -240,31 +398,20 @@ try (DRMQConsumer consumer = new DRMQConsumer("localhost:9092", "order-processor
 
 ### Python Client (SDK)
 
-The Python client features automatic leader failover, pipelined batching, cross-topic atomicity, and offset auto-commit functionality.
-
-**Producer & Atomic Example:**
 ```python
-from drmq_client import DRMQProducer
+from drmq_client import DRMQProducer, DRMQConsumer
 
+# Producer
 producer = DRMQProducer("localhost:9092,localhost:9093")
 producer.connect()
 
-# Standard
 res = producer.send("python-topic", b"Hello from Python!").result()
 
 # Cross-Topic Atomic
-batch = {
-    "topic-A": b"Event A",
-    "topic-B": b"Event B"
-}
-offsets = producer.send_atomic(batch).result()
+offsets = producer.send_atomic({"topic-A": b"Event A", "topic-B": b"Event B"}).result()
 print(f"Atomic commit successful: {offsets}")
-```
 
-**Consumer Example:**
-```python
-from drmq_client import DRMQConsumer
-
+# Consumer
 consumer = DRMQConsumer("localhost:9092,localhost:9093", group_id="python-workers")
 consumer.auto_commit = True
 consumer.connect()
@@ -277,30 +424,22 @@ for msg in messages:
 
 ### TypeScript Client (SDK)
 
-A native Node.js/TypeScript client natively supporting cluster failovers and leader redirects.
-
-**Producer & Atomic Example:**
 ```typescript
-import { DRMQProducer } from './client';
+import { DRMQProducer, DRMQConsumer } from './client';
 
+// Producer
 const producer = new DRMQProducer("localhost:9092,localhost:9093");
 await producer.connect();
 
-// Standard
 await producer.send("ts-topic", Buffer.from("Hello from TypeScript!"));
 
-// Cross-Topic Atomic
 const offsets = await producer.sendAtomic({
   "topic-A": Buffer.from("Event A"),
   "topic-B": Buffer.from("Event B")
 });
 console.log("Atomic success:", offsets);
-```
 
-**Consumer Example:**
-```typescript
-import { DRMQConsumer } from './client';
-
+// Consumer
 const consumer = new DRMQConsumer("localhost:9092,localhost:9093", "ts-workers");
 consumer.autoCommit = true;
 await consumer.connect();
@@ -314,9 +453,6 @@ for (const msg of messages) {
 
 ### Go Client (SDK)
 
-A native Go client (`github.com/drmq/drmq-go-client`) featuring goroutine-safe asynchronous batching, cluster failovers, consumer groups, and cross-topic atomicity.
-
-**Producer & Atomic Example:**
 ```go
 package main
 
@@ -324,61 +460,53 @@ import (
     "fmt"
     "log"
     "time"
-
     drmq "github.com/drmq/drmq-go-client"
 )
 
+// Producer
 producer, err := drmq.NewProducer(drmq.ProducerConfig{
     BootstrapServers: "localhost:9092,localhost:9093",
 })
-if err != nil {
-    log.Fatal(err)
-}
+if err != nil { log.Fatal(err) }
 defer producer.Close()
 producer.Connect()
 
-// Standard (Async future)
 future := producer.SendString("go-topic", "Hello from Go!")
 res, _ := future.GetWithTimeout(5 * time.Second)
 fmt.Printf("Sent at offset: %d\n", res.Offset)
 
-// Cross-Topic Atomic Batch
 atomicFuture := producer.SendAtomic(map[string][]byte{
     "topic-A": []byte("Event A"),
     "topic-B": []byte("Event B"),
 })
 offsets, _ := atomicFuture.GetWithTimeout(5 * time.Second)
 fmt.Println("Atomic commit offsets:", offsets)
-```
 
-**Consumer Example:**
-```go
+// Consumer
 consumer, err := drmq.NewConsumer(drmq.ConsumerConfig{
     BootstrapServers: "localhost:9092,localhost:9093",
     ConsumerGroup:    "go-workers",
     AutoCommit:       true,
 })
-if err != nil {
-    log.Fatal(err)
-}
+if err != nil { log.Fatal(err) }
 defer consumer.Close()
 consumer.Connect()
 consumer.Subscribe("go-topic")
 
 for {
     messages, err := consumer.PollWithOptions(10, 5000)
-    if err != nil {
-        continue
-    }
+    if err != nil { continue }
     for _, msg := range messages {
         fmt.Printf("Received: %s\n", msg.PayloadAsString())
     }
 }
 ```
 
+---
+
 ## Interactive CLI
 
-DRMQ provides an interactive command-line interface for both the producer and consumer. This is great for testing and debugging.
+DRMQ provides an interactive command-line interface for both the producer and consumer.
 
 **Run the Producer CLI:**
 ```bash
@@ -394,17 +522,26 @@ mvn exec:java -Dexec.mainClass="com.drmq.client.commandLineExample.ConsumerApp" 
 ```
 _Commands:_ `subscribe <topic> [offset]`, `seek <topic> <timestamp>`, `poll`, `stream`, `commit`, `mode group|single`, `status`
 
+---
+
 ## Monitoring
 
-The broker exposes Prometheus metrics and real-time WebSocket telemetry. When integrated with a Prometheus server, you can monitor key metrics such as:
+The broker exposes Prometheus metrics and real-time WebSocket telemetry at:
+
+- **Metrics HTTP**: `http://<host>:<METRICS_PORT><METRICS_PATH>` (default: `http://localhost:9096/metrics`)
+- **WebSocket Telemetry**: `ws://<host>:<PORT+200>` (default: `ws://localhost:9292`)
+
+Key Prometheus metrics:
 
 - `drmq_messages_produced_total`
 - `drmq_messages_consumed_total`
 - `drmq_raft_state` (Leader/Follower/Candidate)
 - `drmq_log_size_bytes`
 
+---
+
 ## Benchmarks Reproducibility
 
-DRMQ was designed to aggressively optimize atomic multi-topic transactions by bypassing the traditional Two-Phase Commit (2PC) coordinator. 
+DRMQ was designed to aggressively optimize atomic multi-topic transactions by bypassing the traditional Two-Phase Commit (2PC) coordinator.
 
 To view the raw performance data, load-testing methodology, and instructions on how to perfectly replicate the comparative experiments (DRMQ vs. Apache Kafka), please see the exact [Figures Reproducibility Guide](benchmarks/THESIS_REPRODUCIBILITY.md).

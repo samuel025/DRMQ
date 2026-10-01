@@ -65,6 +65,7 @@ public class RaftNode {
     private final Map<String, Boolean> snapshotInProgress = new ConcurrentHashMap<>();
 
     private final String nodeId;
+    private final String host;
     private final int port;
     private final List<PeerAddress> peers;
     private final MessageStore messageStore;
@@ -218,10 +219,11 @@ public class RaftNode {
             new LinkedBlockingQueue<>(MAX_PENDING_PROPOSALS);
     private volatile Thread atomicAggregatorThread;
 
-    public RaftNode(String nodeId, int port, List<PeerAddress> peers,
+    public RaftNode(String nodeId, String host, int port, List<PeerAddress> peers,
                     MessageStore messageStore, OffsetManager offsetManager, Path dataDir,
                     long raftCompactThreshold, boolean raftFsyncEnabled) throws IOException {
         this.nodeId = nodeId;
+        this.host = (host != null && !host.isBlank()) ? host.trim() : "localhost";
         this.port = port;
         this.peers = peers;
         this.messageStore = messageStore;
@@ -263,8 +265,14 @@ public class RaftNode {
     }
 
     public RaftNode(String nodeId, int port, List<PeerAddress> peers,
+                    MessageStore messageStore, OffsetManager offsetManager, Path dataDir,
+                    long raftCompactThreshold, boolean raftFsyncEnabled) throws IOException {
+        this(nodeId, "localhost", port, peers, messageStore, offsetManager, dataDir, raftCompactThreshold, raftFsyncEnabled);
+    }
+
+    public RaftNode(String nodeId, int port, List<PeerAddress> peers,
                     MessageStore messageStore, OffsetManager offsetManager, Path dataDir) throws IOException {
-        this(nodeId, port, peers, messageStore, offsetManager, dataDir, 1000L, true);
+        this(nodeId, "localhost", port, peers, messageStore, offsetManager, dataDir, 1000L, true);
     }
 
   
@@ -2478,13 +2486,24 @@ public class RaftNode {
     public long getLastLogIndex() { return raftLog.getLastIndex(); }
     public Map<String, Long> getMatchIndexMap() { return Collections.unmodifiableMap(matchIndex); }
     public List<String> getPeerIds() { return peers.stream().map(PeerAddress::id).toList(); }
+    public String getHost() { return host; }
+
+    public PeerAddress getPeerAddress(String peerId) {
+        if (peerId == null) return null;
+        for (PeerAddress peer : peers) {
+            if (peer.id().equals(peerId)) {
+                return peer;
+            }
+        }
+        return null;
+    }
 
     /**
      * Get the leader's address as "host:port" for client redirection.
      */
     public String getLeaderAddress() {
         if (leaderId == null) return null;
-        if (leaderId.equals(nodeId)) return "localhost:" + port;
+        if (leaderId.equals(nodeId)) return (host != null && !host.isBlank() ? host : "localhost") + ":" + port;
         for (PeerAddress peer : peers) {
             if (peer.id().equals(leaderId)) {
                 return peer.address();
