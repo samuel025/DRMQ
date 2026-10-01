@@ -26,3 +26,5 @@ drmq-ts-client/build/
 drmq-docs/
 .reports/
 drmq-remotion/
+**/dependency-reduced-pom.xml
+test-run-data/
