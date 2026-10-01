@@ -63,6 +63,7 @@
     </dependencies>
 
     <build>
+        <finalName>drmq-broker</finalName>
         <plugins>
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>

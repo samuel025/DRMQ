@@ -44,7 +44,7 @@ RUN addgroup -S drmq && adduser -S drmq -G drmq \
 WORKDIR /app
 
 # Copy the shaded jar and entrypoint
-COPY --from=builder /build/drmq-broker/target/drmq-broker-1.0.0-SNAPSHOT.jar /app/drmq-broker.jar
+COPY --from=builder /build/drmq-broker/target/drmq-broker.jar /app/drmq-broker.jar
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
