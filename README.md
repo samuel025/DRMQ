@@ -460,7 +460,7 @@ import (
     "fmt"
     "log"
     "time"
-    drmq "github.com/drmq/drmq-go-client"
+    drmq "github.com/samuel025/DRMQ/drmq-go-client"
 )
 
 // Producer

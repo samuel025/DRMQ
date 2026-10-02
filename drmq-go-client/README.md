@@ -5,7 +5,7 @@ Go client library for the DRMQ (Distributed Reliable Message Queue) broker.
 ## Installation
 
 ```bash
-go get github.com/drmq/drmq-go-client
+go get github.com/samuel025/DRMQ/drmq-go-client
 ```
 
 ## Quick Start
@@ -20,7 +20,7 @@ import (
     "log"
     "time"
 
-    drmq "github.com/drmq/drmq-go-client"
+    drmq "github.com/samuel025/DRMQ/drmq-go-client"
 )
 
 func main() {

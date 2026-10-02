@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	pb "github.com/drmq/drmq-go-client/protocol"
+	pb "github.com/samuel025/DRMQ/drmq-go-client/protocol"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -439,7 +439,7 @@ func (c *Consumer) doPoll(maxMessages int, timeoutMs int64) ([]ConsumedMessage, 
 }
 
 func (c *Consumer) fetchMessages(topic string, fromOffset int64, maxMessages int, timeoutMs int64) ([]ConsumedMessage, error) {
-	return c.executeWithRetry("fetch messages", func() ([]ConsumedMessage, error) {
+	return executeWithRetry(c, "fetch messages", func() ([]ConsumedMessage, error) {
 		return c.fetchMessagesInternal(topic, fromOffset, int32(maxMessages), timeoutMs)
 	})
 }
@@ -512,7 +512,7 @@ func (c *Consumer) fetchMessagesInternal(topic string, fromOffset int64, maxMess
 
 
 func (c *Consumer) commitOffsetInternal(topic string, offset int64) error {
-	_, err := c.executeWithRetry("commit offset", func() (any, error) {
+	_, err := executeWithRetry(c, "commit offset", func() (any, error) {
 		return nil, c.commitOffsetDirect(topic, offset)
 	})
 	return err
@@ -569,7 +569,7 @@ func (c *Consumer) commitOffsetDirect(topic string, offset int64) error {
 }
 
 func (c *Consumer) nackWithRetry(topic string, offset int64) (bool, error) {
-	return c.executeWithRetry("nack offset", func() (bool, error) {
+	return executeWithRetry(c, "nack offset", func() (bool, error) {
 		return c.nackInternal(topic, offset)
 	})
 }
@@ -625,7 +625,7 @@ func (c *Consumer) nackInternal(topic string, offset int64) (bool, error) {
 
 
 func (c *Consumer) doSearchOffsetByTime(topic string, timestamp int64) (int64, error) {
-	return c.executeWithRetry("search offset by time", func() (int64, error) {
+	return executeWithRetry(c, "search offset by time", func() (int64, error) {
 		return c.sendSearchOffsetRequest(topic, timestamp)
 	})
 }
@@ -682,7 +682,7 @@ func (c *Consumer) sendSearchOffsetRequest(topic string, timestamp int64) (int64
 }
 
 
-func (c *Consumer) executeWithRetry[T any](opName string, op func() (T, error)) (T, error) {
+func executeWithRetry[T any](c *Consumer, opName string, op func() (T, error)) (T, error) {
 	var lastErr error
 	var zero T
 

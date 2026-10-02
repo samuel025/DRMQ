@@ -1,5 +1,5 @@
-module github.com/drmq/drmq-go-client
+module github.com/samuel025/DRMQ/drmq-go-client
 
-go 1.27.1
+go 1.23
 
-require google.golang.org/protobuf v1.36.12 // indirect
+require google.golang.org/protobuf v1.36.12

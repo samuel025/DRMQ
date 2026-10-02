@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package com.drmq.protocol;
 
-option go_package = "github.com/drmq/drmq-go-client/protocol";
+option go_package = "github.com/samuel025/DRMQ/drmq-go-client/protocol";
 
 message ProduceRequest {
     string topic = 1;

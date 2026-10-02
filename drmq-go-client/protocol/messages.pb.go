@@ -1651,7 +1651,7 @@ const file_messages_proto_rawDesc = "" +
 	"\x04NONE\x10\x00\x12\x0e\n" +
 	"\n" +
 	"NOT_LEADER\x10\x01\x12\x11\n" +
-	"\rUNKNOWN_ERROR\x10cB)Z'github.com/drmq/drmq-go-client/protocolb\x06proto3"
+	"\rUNKNOWN_ERROR\x10cB3Z1github.com/samuel025/DRMQ/drmq-go-client/protocolb\x06proto3"
 
 var (
 	file_messages_proto_rawDescOnce sync.Once

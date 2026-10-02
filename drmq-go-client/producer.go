@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	pb "github.com/drmq/drmq-go-client/protocol"
+	pb "github.com/samuel025/DRMQ/drmq-go-client/protocol"
 	"google.golang.org/protobuf/proto"
 )
 
